@@ -1,0 +1,24 @@
+{
+  "id": "rb-reboot-required",
+  "name": "System Reboot Required",
+  "description": "System requires restart for updates or stability",
+  "priority": "low",
+  "requiresApproval": true,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 1074,
+      "level": "Information",
+      "messagePattern": "restart"
+    }
+  ],
+  "steps": [
+    {
+      "type": "diagnostic",
+      "action": "system",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

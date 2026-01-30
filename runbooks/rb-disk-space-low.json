@@ -1,0 +1,39 @@
+{
+  "id": "rb-disk-space-low",
+  "name": "Low Disk Space",
+  "description": "Clean up temporary files when disk space is low",
+  "priority": "medium",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 2013,
+      "level": "Warning",
+      "messagePattern": "low on disk space"
+    }
+  ],
+  "steps": [
+    {
+      "type": "diagnostic",
+      "action": "disk",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "Remove-Item \"$env:TEMP\\*\" -Recurse -Force -ErrorAction SilentlyContinue",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "Remove-Item \"C:\\Windows\\Temp\\*\" -Recurse -Force -ErrorAction SilentlyContinue",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "cleanmgr.exe /sagerun:1",
+      "params": {}
+    }
+  ],
+  "risk_class": "C",
+  "auto_execute_threshold": 95
+}

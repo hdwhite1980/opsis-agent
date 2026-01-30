@@ -1,0 +1,9 @@
+OPSIS Agent - License Agreement
+
+Copyright (c) 2024 OPSIS
+
+This software is proprietary and confidential.
+Unauthorized copying or distribution is prohibited.
+
+For licensing inquiries: contact@opsis.io
+

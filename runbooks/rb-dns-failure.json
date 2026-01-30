@@ -1,0 +1,41 @@
+{
+  "id": "rb-dns-failure",
+  "name": "DNS Resolution Failure",
+  "description": "Fix DNS resolution issues",
+  "priority": "high",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 1014,
+      "level": "Warning",
+      "source": "DNS Client Events"
+    },
+    {
+      "logName": "Application",
+      "eventId": 1000,
+      "messagePattern": "DNS.*failed"
+    }
+  ],
+  "steps": [
+    {
+      "type": "powershell",
+      "action": "ipconfig /flushdns",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "Clear-DnsClientCache",
+      "params": {}
+    },
+    {
+      "type": "service",
+      "action": "restart",
+      "params": {
+        "serviceName": "Dnscache"
+      }
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

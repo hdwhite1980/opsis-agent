@@ -1,0 +1,34 @@
+{
+  "id": "rb-memory-high",
+  "name": "High Memory Usage",
+  "description": "Identify and handle high memory usage",
+  "priority": "high",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 2004,
+      "level": "Warning",
+      "messagePattern": "resource exhaustion"
+    },
+    {
+      "logName": "System",
+      "eventId": 333,
+      "level": "Warning"
+    }
+  ],
+  "steps": [
+    {
+      "type": "powershell",
+      "action": "Get-Process | Sort-Object -Property WS -Descending | Select-Object -First 10",
+      "params": {}
+    },
+    {
+      "type": "diagnostic",
+      "action": "system",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

@@ -1,0 +1,41 @@
+{
+  "id": "rb-disk-error",
+  "name": "Disk Error Detected",
+  "description": "Run disk diagnostics and attempt repair when disk errors occur",
+  "priority": "critical",
+  "requiresApproval": true,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 7,
+      "level": "Error",
+      "source": "disk"
+    },
+    {
+      "logName": "System",
+      "eventId": 11,
+      "level": "Warning",
+      "source": "disk"
+    },
+    {
+      "logName": "System",
+      "eventId": 15,
+      "level": "Warning",
+      "messagePattern": "bad block"
+    }
+  ],
+  "steps": [
+    {
+      "type": "diagnostic",
+      "action": "disk",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "Get-PhysicalDisk | Get-StorageReliabilityCounter",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

@@ -1,0 +1,44 @@
+{
+  "id": "rb-windows-update-failed",
+  "name": "Windows Update Failed",
+  "description": "Troubleshoot failed Windows updates",
+  "priority": "medium",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 20,
+      "level": "Error",
+      "source": "Microsoft-Windows-WindowsUpdateClient"
+    },
+    {
+      "logName": "System",
+      "eventId": 44,
+      "level": "Error",
+      "source": "Microsoft-Windows-WindowsUpdateClient"
+    }
+  ],
+  "steps": [
+    {
+      "type": "service",
+      "action": "stop",
+      "params": {
+        "serviceName": "wuauserv"
+      }
+    },
+    {
+      "type": "powershell",
+      "action": "Remove-Item \"C:\\Windows\\SoftwareDistribution\\Download\\*\" -Recurse -Force -ErrorAction SilentlyContinue",
+      "params": {}
+    },
+    {
+      "type": "service",
+      "action": "start",
+      "params": {
+        "serviceName": "wuauserv"
+      }
+    }
+  ],
+  "risk_class": "C",
+  "auto_execute_threshold": 95
+}

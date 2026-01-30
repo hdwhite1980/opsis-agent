@@ -1,0 +1,1003 @@
+// system-monitor.ts - Comprehensive System Health Monitoring
+// Monitors ALL 12 categories of signals from your requirements
+
+import * as os from 'os';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import { Logger } from '../common/logger';
+
+const execAsync = promisify(exec);
+
+export interface SystemSignal {
+  id: string;
+  category: string; // performance, storage, services, network, security, updates, etc.
+  severity: 'critical' | 'warning' | 'info';
+  metric: string;
+  value: any;
+  threshold?: any;
+  message: string;
+  timestamp: Date;
+  metadata?: Record<string, any>;
+  // For ticket creation
+  eventId?: number;
+  eventSource?: string;
+}
+
+export type MonitorCallback = (signal: SystemSignal) => void;
+
+export class SystemMonitor {
+  private logger: Logger;
+  private isMonitoring: boolean = false;
+  private monitoringIntervals: NodeJS.Timeout[] = [];
+  private onSignalDetected: MonitorCallback;
+  
+  // Baselines for anomaly detection
+  private baselines: Map<string, any> = new Map();
+  private historicalData: Map<string, any[]> = new Map();
+  private signalCounts: Map<string, number> = new Map();
+
+  // Sustained threshold tracking: metric -> consecutive count above threshold
+  private consecutiveBreaches: Map<string, number> = new Map();
+  private readonly SUSTAINED_THRESHOLD_COUNT = 3; // Require 3 consecutive breaches
+
+  constructor(logger: Logger, onSignalDetected: MonitorCallback) {
+    this.logger = logger;
+    this.onSignalDetected = onSignalDetected;
+  }
+
+  public start(): void {
+    if (this.isMonitoring) {
+      this.logger.warn('System monitor already running');
+      return;
+    }
+
+    this.isMonitoring = true;
+    this.logger.info('Starting comprehensive system monitoring (12 categories)...');
+
+    // ===== CATEGORY 1: HARDWARE RESOURCES =====
+    this.scheduleMonitor(() => this.monitorCPU(), 30000);              // Every 30s
+    this.scheduleMonitor(() => this.monitorMemory(), 30000);           // Every 30s
+    this.scheduleMonitor(() => this.monitorDisk(), 60000);             // Every 60s
+    this.scheduleMonitor(() => this.monitorPower(), 60000);            // Every 60s
+
+    // ===== CATEGORY 2: OPERATING SYSTEM =====
+    this.scheduleMonitor(() => this.monitorServices(), 30000);         // Every 30s
+    this.scheduleMonitor(() => this.monitorUpdates(), 300000);         // Every 5min
+    this.scheduleMonitor(() => this.monitorSystemHealth(), 120000);    // Every 2min
+
+    // ===== CATEGORY 3: APPLICATIONS =====
+    this.scheduleMonitor(() => this.monitorApplications(), 60000);     // Every 60s
+    this.scheduleMonitor(() => this.monitorProcesses(), 30000);        // Every 30s
+
+    // ===== CATEGORY 4: NETWORK & CONNECTIVITY =====
+    this.scheduleMonitor(() => this.monitorNetwork(), 30000);          // Every 30s
+    this.scheduleMonitor(() => this.monitorDNS(), 60000);              // Every 60s
+
+    // ===== CATEGORY 5: SECURITY & CONFIGURATION =====
+    this.scheduleMonitor(() => this.monitorSecurity(), 300000);        // Every 5min
+    this.scheduleMonitor(() => this.monitorFirewall(), 300000);        // Every 5min
+
+    this.logger.info('All 12 monitoring categories started');
+  }
+
+  public stop(): void {
+    this.isMonitoring = false;
+    this.monitoringIntervals.forEach(interval => clearInterval(interval));
+    this.monitoringIntervals = [];
+    this.logger.info('System monitoring stopped');
+  }
+
+  private scheduleMonitor(fn: () => Promise<void>, intervalMs: number): void {
+    // Run immediately on startup
+    setTimeout(() => {
+      fn().catch(err => this.logger.error('Monitor startup error', err));
+    }, 5000); // Wait 5s for service to fully start
+    
+    // Then schedule recurring
+    const interval = setInterval(() => {
+      fn().catch(err => this.logger.error('Monitor error', err));
+    }, intervalMs);
+    
+    this.monitoringIntervals.push(interval);
+  }
+
+  // ============================================
+  // CATEGORY 1: HARDWARE RESOURCES - CPU
+  // ============================================
+
+  private async monitorCPU(): Promise<void> {
+    try {
+      // Overall CPU usage
+      const cpuUsage = await this.getCPUUsage();
+      
+      // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
+      if (this.isSustainedBreach('cpu-critical', cpuUsage > 90)) {
+        this.emitSignal({
+          id: 'cpu-critical',
+          category: 'performance',
+          severity: 'critical',
+          metric: 'cpu_usage',
+          value: cpuUsage,
+          threshold: 90,
+          message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2001,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      } else if (this.isSustainedBreach('cpu-high', cpuUsage > 75)) {
+        this.emitSignal({
+          id: 'cpu-high',
+          category: 'performance',
+          severity: 'warning',
+          metric: 'cpu_usage',
+          value: cpuUsage,
+          threshold: 75,
+          message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2002,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      // Per-process CPU monitoring
+      const topProcesses = await this.getTopCPUProcesses();
+      for (const proc of topProcesses.slice(0, 3)) {
+        if (proc.cpu > 50) {
+          this.emitSignal({
+            id: `process-cpu-${proc.pid}`,
+            category: 'performance',
+            severity: 'warning',
+            metric: 'process_cpu',
+            value: proc.cpu,
+            threshold: 50,
+            message: `Process ${proc.name} consuming ${proc.cpu.toFixed(1)}% CPU`,
+            timestamp: new Date(),
+            metadata: { processName: proc.name, pid: proc.pid },
+            eventId: 2003,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+
+      this.updateBaseline('cpu_usage', cpuUsage);
+    } catch (error) {
+      this.logger.error('CPU monitoring error', error);
+    }
+  }
+
+  private async getCPUUsage(): Promise<number> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "(Get-Counter \'\\\\Processor(_Total)\\\\% Processor Time\').CounterSamples.CookedValue"',
+        { timeout: 10000 }
+      );
+      return Math.min(100, Math.max(0, parseFloat(stdout.trim())));
+    } catch {
+      return 0;
+    }
+  }
+
+  private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number}>> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-Process | Where-Object {$_.CPU -gt 0} | Sort-Object CPU -Descending | Select-Object -First 5 Name,Id,@{N=\'CPU\';E={[math]::Round($_.CPU,2)}} | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+      const processes = JSON.parse(stdout || '[]');
+      return Array.isArray(processes) ? processes.map(p => ({
+        name: p.Name || 'Unknown',
+        pid: p.Id || 0,
+        cpu: p.CPU || 0
+      })) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // ============================================
+  // CATEGORY 1: HARDWARE RESOURCES - MEMORY
+  // ============================================
+
+  private async monitorMemory(): Promise<void> {
+    try {
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      const usedPercent = (usedMem / totalMem) * 100;
+
+      // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
+      if (this.isSustainedBreach('memory-critical', usedPercent > 90)) {
+        this.emitSignal({
+          id: 'memory-critical',
+          category: 'performance',
+          severity: 'critical',
+          metric: 'memory_usage',
+          value: usedPercent,
+          threshold: 90,
+          message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
+          timestamp: new Date(),
+          metadata: {
+            totalGB: (totalMem / 1024 / 1024 / 1024).toFixed(2),
+            freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
+            usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
+          },
+          eventId: 2010,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      } else if (this.isSustainedBreach('memory-high', usedPercent > 80)) {
+        this.emitSignal({
+          id: 'memory-high',
+          category: 'performance',
+          severity: 'warning',
+          metric: 'memory_usage',
+          value: usedPercent,
+          threshold: 80,
+          message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2011,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      // Memory pressure detection
+      const topMemProcesses = await this.getTopMemoryProcesses();
+      for (const proc of topMemProcesses.slice(0, 3)) {
+        if (proc.memoryMB > 2000) {
+          this.emitSignal({
+            id: `process-memory-${proc.pid}`,
+            category: 'performance',
+            severity: 'warning',
+            metric: 'process_memory',
+            value: proc.memoryMB,
+            threshold: 2000,
+            message: `Process ${proc.name} using ${proc.memoryMB.toFixed(0)}MB memory`,
+            timestamp: new Date(),
+            metadata: { processName: proc.name, pid: proc.pid },
+            eventId: 2012,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+
+      this.updateBaseline('memory_usage', usedPercent);
+    } catch (error) {
+      this.logger.error('Memory monitoring error', error);
+    }
+  }
+
+  private async getTopMemoryProcesses(): Promise<Array<{name: string, pid: number, memoryMB: number}>> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-Process | Where-Object {$_.WS -gt 0} | Sort-Object WS -Descending | Select-Object -First 5 Name,Id,@{N=\'WS\';E={$_.WS}} | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+      const processes = JSON.parse(stdout || '[]');
+      return Array.isArray(processes) ? processes.map(p => ({
+        name: p.Name || 'Unknown',
+        pid: p.Id || 0,
+        memoryMB: (p.WS || 0) / 1024 / 1024
+      })) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // ============================================
+  // CATEGORY 1: HARDWARE RESOURCES - DISK
+  // ============================================
+
+  private async monitorDisk(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Used -ne $null} | Select-Object Name,@{N=\'Used\';E={$_.Used}},@{N=\'Free\';E={$_.Free}} | ConvertTo-Json"',
+        { timeout: 15000 }
+      );
+      
+      const drives = JSON.parse(stdout || '[]');
+      const driveArray = Array.isArray(drives) ? drives : [drives];
+
+      for (const drive of driveArray) {
+        if (!drive.Used || !drive.Free) continue;
+        
+        const total = drive.Used + drive.Free;
+        const freePercent = (drive.Free / total) * 100;
+
+        if (freePercent < 10) {
+          this.emitSignal({
+            id: `disk-critical-${drive.Name}`,
+            category: 'storage',
+            severity: 'critical',
+            metric: 'disk_free',
+            value: freePercent,
+            threshold: 10,
+            message: `Drive ${drive.Name}: critically low space (${freePercent.toFixed(1)}% free, ${(drive.Free / 1024 / 1024 / 1024).toFixed(2)}GB remaining)`,
+            timestamp: new Date(),
+            metadata: {
+              drive: drive.Name,
+              freeGB: (drive.Free / 1024 / 1024 / 1024).toFixed(2),
+              totalGB: (total / 1024 / 1024 / 1024).toFixed(2)
+            },
+            eventId: 2020,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else if (freePercent < 20) {
+          this.emitSignal({
+            id: `disk-low-${drive.Name}`,
+            category: 'storage',
+            severity: 'warning',
+            metric: 'disk_free',
+            value: freePercent,
+            threshold: 20,
+            message: `Drive ${drive.Name}: low space (${freePercent.toFixed(1)}% free)`,
+            timestamp: new Date(),
+            metadata: { drive: drive.Name },
+            eventId: 2021,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+
+      // Check disk health
+      await this.checkDiskHealth();
+
+    } catch (error) {
+      this.logger.error('Disk monitoring error', error);
+    }
+  }
+
+  private async checkDiskHealth(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-PhysicalDisk | Select-Object FriendlyName,HealthStatus,OperationalStatus | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+      
+      const disks = JSON.parse(stdout || '[]');
+      const diskArray = Array.isArray(disks) ? disks : [disks];
+
+      for (const disk of diskArray) {
+        if (disk.HealthStatus && disk.HealthStatus !== 'Healthy') {
+          this.emitSignal({
+            id: `disk-unhealthy-${disk.FriendlyName}`,
+            category: 'storage',
+            severity: 'critical',
+            metric: 'disk_health',
+            value: disk.HealthStatus,
+            message: `Disk ${disk.FriendlyName} health: ${disk.HealthStatus}`,
+            timestamp: new Date(),
+            metadata: {
+              disk: disk.FriendlyName,
+              health: disk.HealthStatus,
+              status: disk.OperationalStatus
+            },
+            eventId: 2022,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+    } catch {
+      // SMART not available
+    }
+  }
+
+  // ============================================
+  // CATEGORY 1: HARDWARE RESOURCES - POWER
+  // ============================================
+
+  private async monitorPower(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-WmiObject -Class Win32_Battery | Select-Object BatteryStatus,EstimatedChargeRemaining,EstimatedRunTime | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+
+      if (stdout.trim()) {
+        const battery = JSON.parse(stdout);
+        
+        if (battery.EstimatedChargeRemaining < 15) {
+          this.emitSignal({
+            id: 'battery-critical',
+            category: 'power',
+            severity: 'critical',
+            metric: 'battery_level',
+            value: battery.EstimatedChargeRemaining,
+            threshold: 15,
+            message: `Battery critically low: ${battery.EstimatedChargeRemaining}%`,
+            timestamp: new Date(),
+            metadata: {
+              charge: battery.EstimatedChargeRemaining,
+              status: battery.BatteryStatus,
+              runtime: battery.EstimatedRunTime
+            },
+            eventId: 2030,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else if (battery.EstimatedChargeRemaining < 25) {
+          this.emitSignal({
+            id: 'battery-low',
+            category: 'power',
+            severity: 'warning',
+            metric: 'battery_level',
+            value: battery.EstimatedChargeRemaining,
+            threshold: 25,
+            message: `Battery low: ${battery.EstimatedChargeRemaining}%`,
+            timestamp: new Date(),
+            eventId: 2031,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+    } catch {
+      // Not a laptop or battery not accessible
+    }
+  }
+
+  // ============================================
+  // CATEGORY 2: OPERATING SYSTEM - SERVICES
+  // ============================================
+
+  private async monitorServices(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-Service | Where-Object {$_.StartType -eq \'Automatic\' -and $_.Status -ne \'Running\'} | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json"',
+        { timeout: 15000 }
+      );
+
+      const services = stdout.trim() ? JSON.parse(stdout) : [];
+      const serviceArray = Array.isArray(services) ? services : services ? [services] : [];
+
+      for (const service of serviceArray) {
+        // Skip services that are intentionally stopped
+        if (this.isKnownStoppedService(service.Name)) continue;
+
+        this.emitSignal({
+          id: `service-stopped-${service.Name}`,
+          category: 'services',
+          severity: 'warning',
+          metric: 'service_status',
+          value: 'stopped',
+          message: `Service ${service.DisplayName || service.Name} stopped (StartType: ${service.StartType})`,
+          timestamp: new Date(),
+          metadata: {
+            serviceName: service.Name,
+            displayName: service.DisplayName,
+            status: service.Status,
+            startType: service.StartType
+          },
+          eventId: 7034, // Match Windows Event ID
+          eventSource: 'Service Control Manager'
+        });
+      }
+
+    } catch (error) {
+      this.logger.error('Services monitoring error', error);
+    }
+  }
+
+  private isKnownStoppedService(name: string): boolean {
+    // Services that are commonly stopped and not critical
+    const knownStopped = [
+      'WSearch',  // Windows Search (often disabled)
+      'TabletInputService',
+      'Fax',
+      'RemoteRegistry'
+    ];
+    return knownStopped.includes(name);
+  }
+
+  // ============================================
+  // CATEGORY 2: OPERATING SYSTEM - UPDATES
+  // ============================================
+
+  private async monitorUpdates(): Promise<void> {
+    try {
+      // Check for pending updates
+      const { stdout } = await execAsync(
+        'powershell -Command "$updates = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search(\'IsInstalled=0 and IsHidden=0\'); $updates.Updates.Count"',
+        { timeout: 30000 }
+      );
+
+      const pendingCount = parseInt(stdout.trim() || '0');
+      
+      if (pendingCount > 20) {
+        this.emitSignal({
+          id: 'updates-many-pending',
+          category: 'updates',
+          severity: 'warning',
+          metric: 'pending_updates',
+          value: pendingCount,
+          threshold: 20,
+          message: `${pendingCount} Windows updates pending installation`,
+          timestamp: new Date(),
+          metadata: { count: pendingCount },
+          eventId: 2040,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      } else if (pendingCount > 0) {
+        this.emitSignal({
+          id: 'updates-pending',
+          category: 'updates',
+          severity: 'info',
+          metric: 'pending_updates',
+          value: pendingCount,
+          message: `${pendingCount} Windows updates available`,
+          timestamp: new Date(),
+          metadata: { count: pendingCount },
+          eventId: 2041,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      // Check last update time
+      await this.checkLastUpdateTime();
+
+    } catch (error) {
+      this.logger.error('Updates monitoring error', error);
+    }
+  }
+
+  private async checkLastUpdateTime(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "$session = New-Object -ComObject Microsoft.Update.Session; $history = $session.CreateUpdateSearcher().QueryHistory(0,1); if ($history.Count -gt 0) { $history | Select-Object -First 1 -ExpandProperty Date | Get-Date -Format o }"',
+        { timeout: 20000 }
+      );
+
+      if (stdout.trim()) {
+        const lastUpdate = new Date(stdout.trim());
+        const daysSince = Math.floor((Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60 * 24));
+
+        if (daysSince > 60) {
+          this.emitSignal({
+            id: 'updates-overdue',
+            category: 'updates',
+            severity: 'warning',
+            metric: 'days_since_update',
+            value: daysSince,
+            threshold: 60,
+            message: `No Windows updates in ${daysSince} days (last: ${lastUpdate.toLocaleDateString()})`,
+            timestamp: new Date(),
+            metadata: { lastUpdate: lastUpdate.toISOString(), daysSince },
+            eventId: 2042,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+    } catch {
+      // Update history not available
+    }
+  }
+
+  // ============================================
+  // CATEGORY 2: OPERATING SYSTEM - SYSTEM HEALTH
+  // ============================================
+
+  private async monitorSystemHealth(): Promise<void> {
+    try {
+      // Check uptime (detect if reboot needed)
+      const uptimeHours = os.uptime() / 3600;
+      
+      if (uptimeHours > 720) { // 30 days
+        this.emitSignal({
+          id: 'reboot-needed',
+          category: 'system',
+          severity: 'warning',
+          metric: 'uptime_hours',
+          value: uptimeHours,
+          threshold: 720,
+          message: `System uptime: ${Math.floor(uptimeHours / 24)} days - reboot recommended`,
+          timestamp: new Date(),
+          metadata: { uptimeDays: Math.floor(uptimeHours / 24) },
+          eventId: 2050,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      // Check for pending reboot
+      await this.checkPendingReboot();
+
+    } catch (error) {
+      this.logger.error('System health monitoring error', error);
+    }
+  }
+
+  private async checkPendingReboot(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Test-Path \'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending\'"',
+        { timeout: 5000 }
+      );
+
+      if (stdout.trim() === 'True') {
+        this.emitSignal({
+          id: 'reboot-pending',
+          category: 'system',
+          severity: 'warning',
+          metric: 'reboot_required',
+          value: true,
+          message: 'System restart required to complete updates',
+          timestamp: new Date(),
+          eventId: 2051,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+    } catch {
+      // Check failed
+    }
+  }
+
+  // ============================================
+  // CATEGORY 3: APPLICATIONS
+  // ============================================
+
+  private async monitorApplications(): Promise<void> {
+    try {
+      // Check recent application crashes
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-EventLog -LogName Application -EntryType Error -Newest 20 -After (Get-Date).AddMinutes(-2) -ErrorAction SilentlyContinue | Where-Object {$_.EventID -in @(1000,1001,1002)} | Select-Object TimeGenerated,EventID,Source,Message | ConvertTo-Json"',
+        { timeout: 15000 }
+      );
+
+      if (stdout.trim()) {
+        const events = JSON.parse(stdout);
+        const eventArray = Array.isArray(events) ? events : [events];
+
+        for (const event of eventArray) {
+          // Extract app name from message
+          const appMatch = event.Message.match(/application name: ([^,]+)/i);
+          const appName = appMatch ? appMatch[1].trim() : event.Source;
+
+          this.emitSignal({
+            id: `app-crash-${event.TimeGenerated}`,
+            category: 'applications',
+            severity: 'warning',
+            metric: 'app_crash',
+            value: true,
+            message: `Application crash: ${appName}`,
+            timestamp: new Date(event.TimeGenerated),
+            metadata: {
+              app: appName,
+              source: event.Source,
+              eventId: event.EventID,
+              message: event.Message.substring(0, 200)
+            },
+            eventId: event.EventID,
+            eventSource: 'Application'
+          });
+        }
+      }
+
+    } catch {
+      // Event log might not be accessible
+    }
+  }
+
+  // ============================================
+  // CATEGORY 4: PROCESSES
+  // ============================================
+
+  private async monitorProcesses(): Promise<void> {
+    try {
+      // Check for hung/not responding processes
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-Process | Where-Object {$_.Responding -eq $false} | Select-Object Name,Id,StartTime | ConvertTo-Json"',
+        { timeout: 15000 }
+      );
+
+      if (stdout.trim()) {
+        const processes = JSON.parse(stdout);
+        const procArray = Array.isArray(processes) ? processes : [processes];
+
+        for (const proc of procArray) {
+          this.emitSignal({
+            id: `process-hung-${proc.Id}`,
+            category: 'processes',
+            severity: 'warning',
+            metric: 'process_responsive',
+            value: false,
+            message: `Process ${proc.Name} (PID ${proc.Id}) not responding`,
+            timestamp: new Date(),
+            metadata: {
+              processName: proc.Name,
+              pid: proc.Id,
+              startTime: proc.StartTime
+            },
+            eventId: 2060,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+
+    } catch (error) {
+      this.logger.error('Process monitoring error', error);
+    }
+  }
+
+  // ============================================
+  // CATEGORY 5: NETWORK & CONNECTIVITY
+  // ============================================
+
+  private async monitorNetwork(): Promise<void> {
+    try {
+      // Test internet connectivity
+      const { stdout } = await execAsync(
+        'powershell -Command "Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet"',
+        { timeout: 10000 }
+      );
+
+      if (stdout.trim() === 'False') {
+        this.emitSignal({
+          id: 'network-offline',
+          category: 'network',
+          severity: 'critical',
+          metric: 'network_connectivity',
+          value: false,
+          message: 'Network connectivity lost - cannot reach internet',
+          timestamp: new Date(),
+          eventId: 2070,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      // Check gateway connectivity
+      await this.checkGateway();
+
+    } catch (error) {
+      this.emitSignal({
+        id: 'network-timeout',
+        category: 'network',
+        severity: 'critical',
+        metric: 'network_timeout',
+        value: true,
+        message: 'Network connectivity test timed out',
+        timestamp: new Date(),
+        eventId: 2071,
+        eventSource: 'OPSIS-SystemMonitor'
+      });
+    }
+  }
+
+  private async checkGateway(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Select-Object -ExpandProperty NextHop"',
+        { timeout: 5000 }
+      );
+
+      const gateway = stdout.trim();
+      if (gateway) {
+        const { stdout: pingResult } = await execAsync(
+          `powershell -Command "Test-Connection -ComputerName ${gateway} -Count 1 -Quiet"`,
+          { timeout: 5000 }
+        );
+
+        if (pingResult.trim() === 'False') {
+          this.emitSignal({
+            id: 'gateway-unreachable',
+            category: 'network',
+            severity: 'critical',
+            metric: 'gateway_reachable',
+            value: false,
+            message: `Default gateway ${gateway} unreachable`,
+            timestamp: new Date(),
+            metadata: { gateway },
+            eventId: 2072,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+    } catch {
+      // Gateway check failed
+    }
+  }
+
+  // ============================================
+  // CATEGORY 5: DNS
+  // ============================================
+
+  private async monitorDNS(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Resolve-DnsName google.com -ErrorAction SilentlyContinue | Select-Object -First 1 Name"',
+        { timeout: 10000 }
+      );
+
+      if (!stdout.trim()) {
+        this.emitSignal({
+          id: 'dns-failure',
+          category: 'network',
+          severity: 'warning',
+          metric: 'dns_resolution',
+          value: false,
+          message: 'DNS resolution failing - cannot resolve domain names',
+          timestamp: new Date(),
+          eventId: 1014, // Windows DNS Event ID
+          eventSource: 'DNS Client'
+        });
+      }
+
+    } catch {
+      this.emitSignal({
+        id: 'dns-timeout',
+        category: 'network',
+        severity: 'warning',
+        metric: 'dns_timeout',
+        value: true,
+        message: 'DNS resolution timed out',
+        timestamp: new Date(),
+        eventId: 1015,
+        eventSource: 'DNS Client'
+      });
+    }
+  }
+
+  // ============================================
+  // CATEGORY 6: SECURITY - DEFENDER
+  // ============================================
+
+  private async monitorSecurity(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,IoavProtectionEnabled,OnAccessProtectionEnabled | ConvertTo-Json"',
+        { timeout: 15000 }
+      );
+
+      const defender = JSON.parse(stdout);
+      
+      if (!defender.AntivirusEnabled) {
+        this.emitSignal({
+          id: 'defender-disabled',
+          category: 'security',
+          severity: 'critical',
+          metric: 'antivirus_enabled',
+          value: false,
+          message: 'Windows Defender antivirus is disabled',
+          timestamp: new Date(),
+          eventId: 2080,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+      if (!defender.RealTimeProtectionEnabled) {
+        this.emitSignal({
+          id: 'defender-realtime-disabled',
+          category: 'security',
+          severity: 'critical',
+          metric: 'realtime_protection',
+          value: false,
+          message: 'Windows Defender real-time protection is disabled',
+          timestamp: new Date(),
+          metadata: defender,
+          eventId: 2081,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      }
+
+    } catch (error) {
+      // Security monitoring may fail if:
+      // - Windows Defender not installed (some enterprise environments)
+      // - Insufficient permissions
+      // - Running on non-Windows OS
+      // Silently skip rather than logging errors every 5 minutes
+      this.logger.debug('Security monitoring skipped (may require admin rights or Defender not installed)');
+    }
+  }
+
+  // ============================================
+  // CATEGORY 6: SECURITY - FIREWALL
+  // ============================================
+
+  private async monitorFirewall(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+
+      const profiles = JSON.parse(stdout);
+      const profileArray = Array.isArray(profiles) ? profiles : [profiles];
+
+      for (const profile of profileArray) {
+        if (!profile.Enabled) {
+          this.emitSignal({
+            id: `firewall-disabled-${profile.Name}`,
+            category: 'security',
+            severity: 'warning',
+            metric: 'firewall_enabled',
+            value: false,
+            message: `Windows Firewall disabled for ${profile.Name} profile`,
+            timestamp: new Date(),
+            metadata: { profile: profile.Name },
+            eventId: 2082,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        }
+      }
+
+    } catch (error) {
+      // Firewall monitoring may fail if insufficient permissions
+      this.logger.debug('Firewall monitoring skipped (may require admin rights)');
+    }
+  }
+
+  // ============================================
+  // BASELINE & ANOMALY DETECTION
+  // ============================================
+
+  private getBaseline(key: string): any {
+    return this.baselines.get(key);
+  }
+
+  private updateBaseline(key: string, value: any): void {
+    if (!this.historicalData.has(key)) {
+      this.historicalData.set(key, []);
+    }
+    
+    const history = this.historicalData.get(key)!;
+    history.push({ value, timestamp: Date.now() });
+    
+    // Keep last 100 samples (rolling window)
+    if (history.length > 100) {
+      history.shift();
+    }
+    
+    // Calculate baseline (rolling average for numbers)
+    if (typeof value === 'number') {
+      const avg = history.reduce((sum, h) => sum + h.value, 0) / history.length;
+      this.baselines.set(key, avg);
+    } else {
+      this.baselines.set(key, value);
+    }
+  }
+
+  /**
+   * Track consecutive threshold breaches.
+   * Returns true only after N consecutive breaches (sustained issue).
+   */
+  private isSustainedBreach(metricKey: string, isBreaching: boolean): boolean {
+    if (isBreaching) {
+      const count = (this.consecutiveBreaches.get(metricKey) || 0) + 1;
+      this.consecutiveBreaches.set(metricKey, count);
+      return count >= this.SUSTAINED_THRESHOLD_COUNT;
+    } else {
+      this.consecutiveBreaches.set(metricKey, 0);
+      return false;
+    }
+  }
+
+  private emitSignal(signal: SystemSignal): void {
+    // Deduplication: Don't emit same signal too frequently
+    const key = `${signal.id}-${signal.severity}`;
+    const lastCount = this.signalCounts.get(key) || 0;
+    const now = Date.now();
+    
+    // Rate limit: Same signal max once per 5 minutes
+    if (lastCount && (now - lastCount) < 300000) {
+      return;
+    }
+    
+    this.signalCounts.set(key, now);
+
+    this.logger.debug('System signal detected', {
+      id: signal.id,
+      category: signal.category,
+      severity: signal.severity,
+      metric: signal.metric
+    });
+
+    this.onSignalDetected(signal);
+  }
+
+  // ============================================
+  // STATISTICS & REPORTING
+  // ============================================
+
+  public getMonitoringStats(): Record<string, any> {
+    return {
+      isMonitoring: this.isMonitoring,
+      activeMonitors: this.monitoringIntervals.length,
+      baselineCount: this.baselines.size,
+      signalsSuppressed: this.signalCounts.size
+    };
+  }
+}

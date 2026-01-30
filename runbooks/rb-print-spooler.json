@@ -1,0 +1,38 @@
+{
+  "id": "rb-print-spooler",
+  "name": "Print Spooler Stopped",
+  "description": "Restart print spooler and clear stuck jobs",
+  "priority": "medium",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 7031,
+      "level": "Error",
+      "messagePattern": "Print Spooler"
+    }
+  ],
+  "steps": [
+    {
+      "type": "service",
+      "action": "stop",
+      "params": {
+        "serviceName": "Spooler"
+      }
+    },
+    {
+      "type": "powershell",
+      "action": "Remove-Item \"C:\\Windows\\System32\\spool\\PRINTERS\\*\" -Force -ErrorAction SilentlyContinue",
+      "params": {}
+    },
+    {
+      "type": "service",
+      "action": "start",
+      "params": {
+        "serviceName": "Spooler"
+      }
+    }
+  ],
+  "risk_class": "C",
+  "auto_execute_threshold": 95
+}

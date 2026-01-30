@@ -1,0 +1,37 @@
+{
+  "id": "rb-time-sync",
+  "name": "Time Synchronization Failed",
+  "description": "Fix Windows Time service synchronization",
+  "priority": "low",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 134,
+      "level": "Warning",
+      "source": "Microsoft-Windows-Time-Service"
+    },
+    {
+      "logName": "System",
+      "eventId": 35,
+      "level": "Error",
+      "source": "Microsoft-Windows-Time-Service"
+    }
+  ],
+  "steps": [
+    {
+      "type": "powershell",
+      "action": "w32tm /resync /force",
+      "params": {}
+    },
+    {
+      "type": "service",
+      "action": "restart",
+      "params": {
+        "serviceName": "W32Time"
+      }
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

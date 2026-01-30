@@ -1,0 +1,42 @@
+{
+  "id": "rb-service-stopped",
+  "name": "Service Stopped Unexpectedly",
+  "description": "Automatically restart services that stop unexpectedly",
+  "priority": "high",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 7034,
+      "level": "Error",
+      "messagePattern": "terminated unexpectedly"
+    },
+    {
+      "logName": "System",
+      "eventId": 7031,
+      "level": "Error"
+    }
+  ],
+  "steps": [
+    {
+      "type": "diagnostic",
+      "action": "get-service-status",
+      "params": {}
+    },
+    {
+      "type": "service",
+      "action": "start",
+      "params": {
+        "serviceName": "{eventData.serviceName}"
+      },
+      "timeout": 30000
+    },
+    {
+      "type": "diagnostic",
+      "action": "verify-service-running",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

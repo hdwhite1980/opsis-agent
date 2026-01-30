@@ -1,0 +1,28 @@
+{
+  "id": "rb-cpu-high",
+  "name": "High CPU Usage",
+  "description": "Identify processes causing high CPU usage",
+  "priority": "medium",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 2020,
+      "level": "Warning"
+    }
+  ],
+  "steps": [
+    {
+      "type": "powershell",
+      "action": "Get-Process | Sort-Object -Property CPU -Descending | Select-Object -First 10 Name, CPU, Id",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "Get-Counter \"\\Processor(_Total)\\% Processor Time\"",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

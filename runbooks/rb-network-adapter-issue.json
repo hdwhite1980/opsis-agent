@@ -1,0 +1,44 @@
+{
+  "id": "rb-network-adapter-issue",
+  "name": "Network Adapter Issue",
+  "description": "Reset network adapter when connectivity issues detected",
+  "priority": "high",
+  "requiresApproval": false,
+  "triggers": [
+    {
+      "logName": "System",
+      "eventId": 4202,
+      "level": "Warning"
+    },
+    {
+      "logName": "System",
+      "eventId": 27,
+      "level": "Error",
+      "source": "e1iexpress"
+    }
+  ],
+  "steps": [
+    {
+      "type": "diagnostic",
+      "action": "network",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "ipconfig /release",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "ipconfig /renew",
+      "params": {}
+    },
+    {
+      "type": "powershell",
+      "action": "ipconfig /flushdns",
+      "params": {}
+    }
+  ],
+  "risk_class": "A",
+  "auto_execute_threshold": 85
+}

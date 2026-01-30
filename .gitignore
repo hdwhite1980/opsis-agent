@@ -1,0 +1,9 @@
+node_modules/
+dist/
+data/
+logs/
+*.log
+.env
+credentials.json
+device.config.json
+agent.config.json

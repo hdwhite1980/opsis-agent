@@ -1,0 +1,1145 @@
+// agent-service.ts - Production OPSIS Agent Service
+import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as https from 'https';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import WebSocket from 'ws';
+import { getServiceLogger, Logger } from '../common/logger';
+import EventMonitor, { EventLogEntry, RunbookMatch, Runbook } from './event-monitor';
+import { TicketDatabase, Ticket } from './ticket-database';
+import { SystemMonitor, SystemSignal } from './system-monitor';
+
+const execAsync = promisify(exec);
+
+// Helper function for HTTP requests
+function httpsRequest(url: string, options: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (err) {
+          resolve(data);
+        }
+      });
+    });
+    req.on('error', reject);
+    if (options.body) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
+interface UpdateCheckResponse {
+  updateAvailable: boolean;
+  version?: string;
+  downloadUrl?: string;
+}
+
+interface PlaybookTask {
+  id: string;
+  name: string;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  source: 'server' | 'admin' | 'local';
+  steps: PlaybookStep[];
+  createdAt: Date;
+}
+
+interface PlaybookStep {
+  type: 'powershell' | 'registry' | 'service' | 'file' | 'wmi' | 'diagnostic';
+  action: string;
+  params: Record<string, any>;
+  timeout?: number;
+  requiresApproval?: boolean;
+}
+
+interface AgentConfig {
+  serverUrl?: string;
+  autoConnect: boolean;
+  autoUpdate: boolean;
+  localAI: boolean;
+  autoRemediation: boolean;
+  confidenceThreshold: number;
+  updateCheckInterval: number; // minutes
+}
+
+class OPSISAgentService {
+  private config: AgentConfig;
+  private ws: WebSocket | null = null;
+  private playbookQueue: PlaybookTask[] = [];
+  private isExecutingPlaybook = false;
+  private updateCheckTimer: NodeJS.Timeout | null = null;
+  private readonly configPath: string;
+  private readonly dataDir: string;
+  private readonly logsDir: string;
+  private readonly runbooksDir: string;
+  private logger: Logger;
+  private eventMonitor: EventMonitor;
+  private systemMonitor: SystemMonitor;
+  private ticketDb: TicketDatabase;
+  private activeTickets: Map<string, string> = new Map(); // playbookId -> ticketId
+
+  constructor() {
+    this.dataDir = path.join(__dirname, '..', '..', 'data');
+    this.logsDir = path.join(__dirname, '..', '..', 'logs');
+    this.runbooksDir = path.join(__dirname, '..', '..', 'runbooks');
+    this.configPath = path.join(this.dataDir, 'agent.config.json');
+    
+    // Ensure directories exist
+    [this.dataDir, this.logsDir, this.runbooksDir].forEach(dir => {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    });
+
+    // Initialize logger
+    this.logger = getServiceLogger(this.logsDir);
+    
+    // Initialize ticket database
+    const dbPath = path.join(this.dataDir, 'tickets.db');
+    this.ticketDb = new TicketDatabase(this.logger, dbPath);
+    
+    this.config = this.loadConfig();
+    this.logger.info('OPSIS Agent Service initializing...', {
+      version: '1.0.0',
+      platform: os.platform(),
+      hostname: os.hostname()
+    });
+
+    // Initialize event monitor
+    this.eventMonitor = new EventMonitor(
+      this.logger,
+      this.runbooksDir,
+      (event, runbook) => this.handleIssueDetected(event, runbook),
+      (event, reason) => this.handleEscalationNeeded(event, reason)
+    );
+
+    // Initialize system monitor
+    this.systemMonitor = new SystemMonitor(
+      this.logger,
+      (issue) => this.handleSystemIssue(issue)
+    );
+  }
+
+  private loadConfig(): AgentConfig {
+    try {
+      if (fs.existsSync(this.configPath)) {
+        const data = fs.readFileSync(this.configPath, 'utf8');
+        return JSON.parse(data);
+      }
+    } catch (err) {
+      if (this.logger) {
+        this.logger.error('Error loading config, using defaults', err);
+      }
+    }
+
+    // Default config
+    return {
+      autoConnect: true,
+      autoUpdate: true,
+      localAI: true,
+      autoRemediation: true,
+      confidenceThreshold: 75,
+      updateCheckInterval: 60 // Check every hour
+    };
+  }
+
+  private saveConfig(): void {
+    try {
+      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2));
+      this.logger.info('Configuration saved');
+    } catch (err) {
+      this.logger.error('Error saving config', err);
+    }
+  }
+
+  private log(message: string, error?: any): void {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}${error ? ` - ${error}` : ''}\n`;
+    
+    console.log(logMessage);
+    
+    try {
+      const logFile = path.join(this.logsDir, 'agent.log');
+      fs.appendFileSync(logFile, logMessage);
+    } catch (err) {
+      console.error('Failed to write log:', err);
+    }
+  }
+
+  public async start(): Promise<void> {
+    this.log('OPSIS Agent Service Starting...');
+
+    // Start event monitoring
+    this.eventMonitor.start();
+    this.log('Event monitoring started');
+
+    // Start system monitoring (every 60 seconds)
+    // Start comprehensive system monitoring (12 categories)
+    this.systemMonitor.start();
+    this.log('System monitoring started (60 second intervals)');
+
+    // Connect to server if configured
+    if (this.config.serverUrl && this.config.autoConnect) {
+      await this.connectToServer();
+    }
+
+    // Start update checker
+    if (this.config.autoUpdate) {
+      this.startUpdateChecker();
+    }
+
+    // Process playbook queue
+    this.processPlaybookQueue();
+
+    this.log('OPSIS Agent Service Started Successfully');
+  }
+
+  public stop(): void {
+    this.log('OPSIS Agent Service Stopping...');
+    
+    // Stop event monitor
+    if (this.eventMonitor) {
+      this.eventMonitor.stop();
+    }
+
+    // Stop system monitor
+    if (this.systemMonitor) {
+      this.systemMonitor.stop();
+    }
+
+    // Close database
+    if (this.ticketDb) {
+      this.ticketDb.close();
+    }
+
+    if (this.ws) {
+      this.ws.close();
+    }
+
+    if (this.updateCheckTimer) {
+      clearInterval(this.updateCheckTimer);
+    }
+
+    this.log('OPSIS Agent Service Stopped');
+  }
+
+  // ============================================
+  // SERVER CONNECTION
+  // ============================================
+
+  private async connectToServer(): Promise<void> {
+    if (!this.config.serverUrl) {
+      this.log('No server URL configured');
+      return;
+    }
+
+    try {
+      this.log(`Connecting to OPSIS server: ${this.config.serverUrl}`);
+      
+      // WebSocket connection for real-time communication
+      const wsUrl = this.config.serverUrl.replace('http', 'ws') + '/agent';
+      
+      this.ws = new WebSocket(wsUrl, {
+        headers: {
+          'X-Agent-Version': '1.0.0',
+          'X-Agent-Machine': os.hostname(),
+          'X-Agent-OS': `${os.platform()} ${os.release()}`
+        },
+        // Client certificate authentication would go here
+        rejectUnauthorized: true
+      });
+
+      this.ws.on('open', () => {
+        this.log('Connected to OPSIS server');
+        this.sendHeartbeat();
+      });
+
+      this.ws.on('message', (data: WebSocket.Data) => {
+        this.handleServerMessage(data.toString());
+      });
+
+      this.ws.on('error', (error) => {
+        this.log('WebSocket error', error);
+      });
+
+      this.ws.on('close', () => {
+        this.log('Disconnected from server, will retry...');
+        // Reconnect after 30 seconds
+        setTimeout(() => this.connectToServer(), 30000);
+      });
+
+    } catch (error) {
+      this.log('Failed to connect to server', error);
+    }
+  }
+
+  private sendHeartbeat(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'heartbeat',
+        timestamp: new Date().toISOString(),
+        stats: this.getSystemStats()
+      }));
+
+      // Send heartbeat every 30 seconds
+      setTimeout(() => this.sendHeartbeat(), 30000);
+    }
+  }
+
+  private handleServerMessage(message: string): void {
+    try {
+      const data = JSON.parse(message);
+
+      switch (data.type) {
+        case 'playbook':
+          this.receivePlaybook(data.playbook, 'server');
+          break;
+        case 'update-available':
+          this.handleUpdateAvailable(data.version, data.downloadUrl);
+          break;
+        case 'force-diagnostic':
+          this.runDiagnostic(data.scenario);
+          break;
+        case 'config-update':
+          this.updateConfig(data.config);
+          break;
+        default:
+          this.log(`Unknown message type: ${data.type}`);
+      }
+    } catch (error) {
+      this.log('Error handling server message', error);
+    }
+  }
+
+  // ============================================
+  // PLAYBOOK SYSTEM
+  // ============================================
+
+  public receivePlaybook(playbook: PlaybookTask, source: 'server' | 'admin' | 'local'): void {
+    playbook.source = source;
+    playbook.createdAt = new Date();
+
+    this.log(`Received playbook: ${playbook.name} (${source} - ${playbook.priority})`);
+
+    // Add to priority queue
+    this.playbookQueue.push(playbook);
+    
+    // Sort by priority: server > admin > local, then critical > high > medium > low
+    this.playbookQueue.sort((a, b) => {
+      const sourceOrder = { server: 0, admin: 1, local: 2 };
+      const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+      
+      if (sourceOrder[a.source] !== sourceOrder[b.source]) {
+        return sourceOrder[a.source] - sourceOrder[b.source];
+      }
+      
+      return priorityOrder[a.priority] - priorityOrder[b.priority];
+    });
+
+    // Start processing if not already running
+    if (!this.isExecutingPlaybook) {
+      this.processPlaybookQueue();
+    }
+  }
+
+  private async processPlaybookQueue(): Promise<void> {
+    if (this.isExecutingPlaybook || this.playbookQueue.length === 0) {
+      return;
+    }
+
+    this.isExecutingPlaybook = true;
+
+    while (this.playbookQueue.length > 0) {
+      const playbook = this.playbookQueue.shift()!;
+      
+      this.log(`Executing playbook: ${playbook.name}`);
+      
+      try {
+        await this.executePlaybook(playbook);
+        this.log(`Playbook completed: ${playbook.name}`);
+        this.reportPlaybookResult(playbook.id, 'success');
+      } catch (error) {
+        this.log(`Playbook failed: ${playbook.name}`, error);
+        this.reportPlaybookResult(playbook.id, 'failed', error);
+      }
+    }
+
+    this.isExecutingPlaybook = false;
+  }
+
+  private async executePlaybook(playbook: PlaybookTask): Promise<void> {
+    for (const step of playbook.steps) {
+      this.log(`  Executing step: ${step.type} - ${step.action}`);
+
+      // Check if step requires approval
+      if (step.requiresApproval && !this.config.autoRemediation) {
+        this.log('  Step requires approval, skipping (auto-remediation disabled)');
+        continue;
+      }
+
+      try {
+        await this.executeStep(step);
+      } catch (error) {
+        this.log(`  Step failed: ${step.action}`, error);
+        throw error;
+      }
+    }
+  }
+
+  private async executeStep(step: PlaybookStep): Promise<void> {
+    const timeout = step.timeout || 60000; // Default 60 seconds
+
+    switch (step.type) {
+      case 'powershell':
+        await this.executePowerShell(step.action, step.params, timeout);
+        break;
+      case 'service':
+        await this.executeServiceAction(step.action, step.params);
+        break;
+      case 'registry':
+        await this.executeRegistryAction(step.action, step.params);
+        break;
+      case 'file':
+        await this.executeFileAction(step.action, step.params);
+        break;
+      case 'wmi':
+        await this.executeWMIQuery(step.action, step.params);
+        break;
+      case 'diagnostic':
+        await this.runDiagnostic(step.action);
+        break;
+      default:
+        throw new Error(`Unknown step type: ${step.type}`);
+    }
+  }
+
+  private async executePowerShell(script: string, params: Record<string, any>, timeout: number): Promise<string> {
+    // Build PowerShell command with parameters
+    let command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${script}"`;
+    
+    if (params && Object.keys(params).length > 0) {
+      const paramString = Object.entries(params)
+        .map(([key, value]) => `-${key} '${value}'`)
+        .join(' ');
+      command += ` ${paramString}`;
+    }
+
+    const { stdout, stderr } = await execAsync(command, { timeout });
+    
+    if (stderr) {
+      this.log(`PowerShell stderr: ${stderr}`);
+    }
+
+    return stdout;
+  }
+
+  private async executeServiceAction(action: string, params: Record<string, any>): Promise<void> {
+    const { serviceName, desiredState } = params;
+
+    if (action === 'restart') {
+      await execAsync(`net stop "${serviceName}"`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      await execAsync(`net start "${serviceName}"`);
+    } else if (action === 'start') {
+      await execAsync(`net start "${serviceName}"`);
+    } else if (action === 'stop') {
+      await execAsync(`net stop "${serviceName}"`);
+    }
+  }
+
+  private async executeRegistryAction(action: string, params: Record<string, any>): Promise<void> {
+    const { key, valueName, valueData, valueType } = params;
+
+    if (action === 'set') {
+      await execAsync(`reg add "${key}" /v "${valueName}" /t ${valueType} /d "${valueData}" /f`);
+    } else if (action === 'delete') {
+      await execAsync(`reg delete "${key}" /v "${valueName}" /f`);
+    }
+  }
+
+  private async executeFileAction(action: string, params: Record<string, any>): Promise<void> {
+    const { path: filePath, content, destination } = params;
+
+    if (action === 'create') {
+      fs.writeFileSync(filePath, content);
+    } else if (action === 'delete') {
+      fs.unlinkSync(filePath);
+    } else if (action === 'copy') {
+      fs.copyFileSync(filePath, destination);
+    }
+  }
+
+  private async executeWMIQuery(query: string, params: Record<string, any>): Promise<void> {
+    const psScript = `Get-WmiObject -Query "${query}"`;
+    await this.executePowerShell(psScript, params, 30000);
+  }
+
+  private reportPlaybookResult(playbookId: string, status: string, error?: any): void {
+    // Update ticket if this playbook is linked to one
+    const ticketId = this.activeTickets.get(playbookId);
+    if (ticketId) {
+      try {
+        if (status === 'success') {
+          this.ticketDb.closeTicket(
+            ticketId,
+            `Auto-resolved by playbook: ${playbookId}`,
+            'success'
+          );
+          this.logger.info('Ticket auto-resolved', { ticketId, playbookId });
+        } else {
+          this.ticketDb.updateTicketStatus(ticketId, 'failed');
+          this.ticketDb.closeTicket(
+            ticketId,
+            `Playbook failed: ${error?.toString() || 'Unknown error'}`,
+            'failure'
+          );
+          this.logger.error('Ticket marked as failed', { ticketId, playbookId, error });
+        }
+
+        // Remove from active tickets
+        this.activeTickets.delete(playbookId);
+      } catch (err) {
+        this.logger.error('Failed to update ticket after playbook', err);
+      }
+    }
+
+    // Report to server if connected
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'playbook-result',
+        playbookId,
+        ticketId,
+        status,
+        error: error ? error.toString() : undefined,
+        timestamp: new Date().toISOString()
+      }));
+    }
+  }
+
+  // ============================================
+  // AUTO-UPDATE SYSTEM
+  // ============================================
+
+  private startUpdateChecker(): void {
+    const checkInterval = this.config.updateCheckInterval * 60 * 1000;
+    
+    this.updateCheckTimer = setInterval(() => {
+      this.checkForUpdates();
+    }, checkInterval);
+
+    // Check immediately on startup
+    setTimeout(() => this.checkForUpdates(), 10000);
+  }
+
+  private async checkForUpdates(): Promise<void> {
+    if (!this.config.serverUrl) {
+      return;
+    }
+
+    try {
+      this.log('Checking for updates...');
+      
+      const updateUrl = `${this.config.serverUrl}/agent/update-check`;
+      const currentVersion = '1.0.0'; // TODO: Load from package.json
+
+      const data = await httpsRequest(updateUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          currentVersion,
+          platform: os.platform(),
+          arch: os.arch()
+        })
+      }) as UpdateCheckResponse;
+
+      if (data.updateAvailable && data.version && data.downloadUrl) {
+        this.log(`Update available: ${data.version}`);
+        await this.downloadAndInstallUpdate(data.downloadUrl, data.version);
+      }
+
+    } catch (error) {
+      this.log('Error checking for updates', error);
+    }
+  }
+
+  private async handleUpdateAvailable(version: string, downloadUrl: string): Promise<void> {
+    this.log(`Server pushed update: ${version}`);
+    await this.downloadAndInstallUpdate(downloadUrl, version);
+  }
+
+  private async downloadAndInstallUpdate(downloadUrl: string, version: string): Promise<void> {
+    try {
+      this.log(`Downloading update ${version}...`);
+
+      const updateDir = path.join(this.dataDir, 'updates');
+      if (!fs.existsSync(updateDir)) {
+        fs.mkdirSync(updateDir, { recursive: true });
+      }
+
+      const installerPath = path.join(updateDir, `opsis-agent-${version}.exe`);
+
+      // Download installer
+      await this.downloadFile(downloadUrl, installerPath);
+
+      this.log('Update downloaded, installing...');
+
+      // Run installer silently
+      await execAsync(`"${installerPath}" /S /UPDATE`);
+
+      this.log('Update installed successfully, service will restart');
+
+    } catch (error) {
+      this.log('Error installing update', error);
+    }
+  }
+
+  private downloadFile(url: string, destination: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(destination);
+      
+      https.get(url, (response) => {
+        response.pipe(file);
+        
+        file.on('finish', () => {
+          file.close();
+          resolve();
+        });
+      }).on('error', (error) => {
+        fs.unlinkSync(destination);
+        reject(error);
+      });
+    });
+  }
+
+  // ============================================
+  // DIAGNOSTICS
+  // ============================================
+
+  private async runDiagnostic(scenario: string): Promise<void> {
+    this.log(`Running diagnostic: ${scenario}`);
+
+    const diagnosticPlaybook: PlaybookTask = {
+      id: `diagnostic-${Date.now()}`,
+      name: `Diagnostic: ${scenario}`,
+      priority: 'high',
+      source: 'server',
+      createdAt: new Date(),
+      steps: this.getDiagnosticSteps(scenario)
+    };
+
+    // Add to front of queue (high priority)
+    this.playbookQueue.unshift(diagnosticPlaybook);
+    
+    if (!this.isExecutingPlaybook) {
+      this.processPlaybookQueue();
+    }
+  }
+
+  private getDiagnosticSteps(scenario: string): PlaybookStep[] {
+    // Predefined diagnostic scenarios
+    const diagnostics: Record<string, PlaybookStep[]> = {
+      'network': [
+        { type: 'powershell', action: 'Test-NetConnection -ComputerName google.com', params: {} },
+        { type: 'powershell', action: 'Get-NetIPConfiguration', params: {} },
+        { type: 'powershell', action: 'Get-DnsClientServerAddress', params: {} }
+      ],
+      'disk': [
+        { type: 'powershell', action: 'Get-PSDrive -PSProvider FileSystem', params: {} },
+        { type: 'powershell', action: 'Get-Volume', params: {} }
+      ],
+      'services': [
+        { type: 'powershell', action: 'Get-Service | Where-Object {$_.Status -eq "Stopped" -and $_.StartType -eq "Automatic"}', params: {} }
+      ],
+      'system': [
+        { type: 'powershell', action: 'Get-ComputerInfo', params: {} },
+        { type: 'powershell', action: 'Get-EventLog -LogName System -Newest 50 -EntryType Error', params: {} }
+      ]
+    };
+
+    return diagnostics[scenario] || [];
+  }
+
+  // ============================================
+  // MONITORING
+  // ============================================
+
+  /**
+   * Called when SystemMonitor detects a system health signal
+   * This monitors 12+ categories: CPU, Memory, Disk, Services, Network, Security, etc.
+   * FLOW:
+   * 1. Create ticket for the signal
+   * 2. Check if auto-remediation is available
+   * 3. Execute remediation or escalate
+   */
+  private handleSystemIssue(signal: SystemSignal): void {
+    this.logger.warn('System signal detected', {
+      id: signal.id,
+      category: signal.category,
+      severity: signal.severity,
+      metric: signal.metric,
+      value: signal.value
+    });
+
+    // CREATE TICKET for system signal
+    const ticketId = `ticket-system-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const ticket: Ticket = {
+      ticket_id: ticketId,
+      timestamp: signal.timestamp.toISOString(),
+      type: signal.category,
+      description: `[${signal.severity.toUpperCase()}] ${signal.message}`,
+      status: 'open',
+      source: 'monitoring',
+      computer_name: os.hostname(),
+      event_id: signal.eventId,
+      event_source: signal.eventSource,
+      escalated: signal.severity === 'critical' ? 1 : 0
+    };
+
+    try {
+      this.ticketDb.createTicket(ticket);
+      this.logger.info('System signal ticket created', { 
+        ticketId, 
+        category: signal.category,
+        severity: signal.severity 
+      });
+    } catch (error) {
+      this.logger.error('Failed to create system signal ticket', error);
+      return;
+    }
+
+    // Try to create auto-remediation playbook
+    const playbook = this.createPlaybookForSystemSignal(signal, ticketId);
+    
+    if (playbook) {
+      // AUTO-REMEDIATION AVAILABLE
+      this.activeTickets.set(playbook.id, ticketId);
+      this.ticketDb.updateTicketStatus(ticketId, 'in-progress', undefined, playbook.id);
+      this.receivePlaybook(playbook, 'local');
+      
+      this.logger.info('Auto-remediation playbook queued for system signal', {
+        playbookId: playbook.id,
+        ticketId,
+        category: signal.category,
+        metric: signal.metric
+      });
+    } else {
+      // NO AUTO-REMEDIATION - ESCALATE
+      this.logger.warn('No auto-remediation available for signal - escalating', {
+        ticketId,
+        category: signal.category,
+        metric: signal.metric
+      });
+
+      this.ticketDb.markAsEscalated(ticketId);
+      
+      // Send to server if connected
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'system-signal-escalation',
+          ticketId,
+          signal: {
+            id: signal.id,
+            category: signal.category,
+            severity: signal.severity,
+            metric: signal.metric,
+            value: signal.value,
+            threshold: signal.threshold,
+            message: signal.message,
+            metadata: signal.metadata
+          },
+          hostname: os.hostname(),
+          timestamp: new Date().toISOString()
+        }));
+        
+        this.logger.info('System signal escalated to server', { ticketId });
+      } else {
+        this.logger.warn('Cannot escalate - no server connection', { ticketId });
+      }
+    }
+
+    // Also escalate critical issues even if remediation exists
+    if (signal.severity === 'critical' && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'critical-system-signal',
+        ticketId,
+        signal,
+        hostname: os.hostname()
+      }));
+    }
+  }
+
+  /**
+   * Create remediation playbook for system signals
+   * Maps specific signals to runbook-style remediation steps
+   */
+  private createPlaybookForSystemSignal(signal: SystemSignal, ticketId: string): PlaybookTask | null {
+    const playbookId = `playbook-system-${Date.now()}`;
+
+    // DISK SPACE REMEDIATION
+    if (signal.category === 'storage' && signal.metric === 'disk_free') {
+      const drive = signal.metadata?.drive || 'C';
+      return {
+        id: playbookId,
+        name: `Disk Cleanup - Drive ${drive}`,
+        priority: signal.severity === 'critical' ? 'critical' : 'high',
+        source: 'local',
+        createdAt: new Date(),
+        steps: [
+          {
+            type: 'powershell',
+            action: `Clear-RecycleBin -DriveLetter ${drive.replace(':', '')} -Force -ErrorAction SilentlyContinue`,
+            params: {}
+          },
+          {
+            type: 'powershell',
+            action: `Remove-Item "$env:TEMP\\*" -Recurse -Force -ErrorAction SilentlyContinue`,
+            params: {}
+          },
+          {
+            type: 'powershell',
+            action: `Remove-Item "C:\\Windows\\Temp\\*" -Recurse -Force -ErrorAction SilentlyContinue`,
+            params: {}
+          },
+          {
+            type: 'powershell',
+            action: `cleanmgr.exe /sagerun:1`,
+            params: {},
+            timeout: 300000 // 5 minutes
+          }
+        ]
+      };
+    }
+
+    // HIGH CPU REMEDIATION
+    if (signal.category === 'performance' && signal.metric === 'cpu_usage' && signal.value > 90) {
+      return {
+        id: playbookId,
+        name: 'High CPU Investigation',
+        priority: 'high',
+        source: 'local',
+        createdAt: new Date(),
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      };
+    }
+
+    // HIGH MEMORY REMEDIATION
+    if (signal.category === 'performance' && signal.metric === 'memory_usage' && signal.value > 90) {
+      return {
+        id: playbookId,
+        name: 'Memory Pressure Mitigation',
+        priority: 'high',
+        source: 'local',
+        createdAt: new Date(),
+        steps: [
+          {
+            type: 'powershell',
+            action: 'Clear-RecycleBin -Force -ErrorAction SilentlyContinue',
+            params: {}
+          },
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      };
+    }
+
+    // SERVICE STOPPED REMEDIATION
+    if (signal.category === 'services' && signal.metric === 'service_status') {
+      const serviceName = signal.metadata?.serviceName;
+      if (serviceName) {
+        return {
+          id: playbookId,
+          name: `Restart Service - ${serviceName}`,
+          priority: 'high',
+          source: 'local',
+          createdAt: new Date(),
+          steps: [
+            {
+              type: 'service',
+              action: 'start',
+              params: { serviceName }
+            }
+          ]
+        };
+      }
+    }
+
+    // DNS FAILURE REMEDIATION
+    if (signal.category === 'network' && signal.metric === 'dns_resolution') {
+      return {
+        id: playbookId,
+        name: 'Fix DNS Issues',
+        priority: 'high',
+        source: 'local',
+        createdAt: new Date(),
+        steps: [
+          {
+            type: 'powershell',
+            action: 'Clear-DnsClientCache',
+            params: {}
+          },
+          {
+            type: 'powershell',
+            action: 'Restart-Service -Name Dnscache -Force',
+            params: {}
+          },
+          {
+            type: 'powershell',
+            action: 'ipconfig /flushdns',
+            params: {}
+          }
+        ]
+      };
+    }
+
+    // HUNG PROCESS REMEDIATION
+    if (signal.category === 'processes' && signal.metric === 'process_responsive') {
+      const pid = signal.metadata?.pid;
+      if (pid) {
+        return {
+          id: playbookId,
+          name: `Terminate Hung Process - PID ${pid}`,
+          priority: 'medium',
+          source: 'local',
+          createdAt: new Date(),
+          steps: [
+            {
+              type: 'powershell',
+              action: `Stop-Process -Id ${pid} -Force`,
+              params: {}
+            }
+          ]
+        };
+      }
+    }
+
+    // No automated remediation available
+    return null;
+  }
+
+  // ============================================
+  // CONFIG MANAGEMENT
+  // ============================================
+
+  private getSystemStats(): Record<string, any> {
+    const metrics = this.systemMonitor.getMonitoringStats();
+    
+    return {
+      hostname: os.hostname(),
+      platform: os.platform(),
+      cpus: os.cpus().length,
+      totalMemory: os.totalmem(),
+      freeMemory: os.freemem(),
+      uptime: os.uptime(),
+      monitoring: metrics
+    };
+  }
+
+  private updateConfig(newConfig: Partial<AgentConfig>): void {
+    this.config = { ...this.config, ...newConfig };
+    this.saveConfig();
+    this.logger.info('Configuration updated');
+  }
+
+  // ============================================
+  // EVENT MONITORING & TICKET MANAGEMENT
+  // ============================================
+
+  /**
+   * Called when EventMonitor detects an issue with a matching runbook
+   * FLOW:
+   * 1. Create ticket in database
+   * 2. Convert runbook to playbook
+   * 3. Queue playbook for execution
+   * 4. Link playbook to ticket for status updates
+   */
+  private handleIssueDetected(event: EventLogEntry, runbook?: RunbookMatch): void {
+    this.logger.info('Issue detected', {
+      eventId: event.id,
+      source: event.source,
+      hasRunbook: !!runbook
+    });
+
+    // Step 1: CREATE TICKET
+    const ticketId = `ticket-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const ticket: Ticket = {
+      ticket_id: ticketId,
+      timestamp: new Date(event.timeCreated).toISOString(),
+      type: this.getTicketType(event),
+      description: `${event.source}: ${event.message.substring(0, 200)}${event.message.length > 200 ? '...' : ''}`,
+      status: runbook ? 'in-progress' : 'open',
+      source: 'event-log',
+      computer_name: os.hostname(),
+      event_id: event.id,
+      event_source: event.source,
+      escalated: 0
+    };
+
+    try {
+      this.ticketDb.createTicket(ticket);
+      this.logger.info('Ticket created', { ticketId, eventId: event.id });
+    } catch (error) {
+      this.logger.error('Failed to create ticket', error);
+    }
+
+    // Step 2 & 3: If runbook exists, convert to playbook and execute
+    if (runbook) {
+      const playbook: PlaybookTask = {
+        id: `playbook-${Date.now()}`,
+        name: runbook.name,
+        priority: this.determinePriority(runbook.confidence),
+        source: 'local',
+        steps: runbook.steps,
+        createdAt: new Date()
+      };
+
+      // Link playbook to ticket
+      this.activeTickets.set(playbook.id, ticketId);
+
+      // Update ticket to in-progress
+      this.ticketDb.updateTicketStatus(ticketId, 'in-progress', undefined, playbook.id);
+
+      // Queue playbook
+      this.logger.info('Queueing auto-remediation playbook', {
+        playbookId: playbook.id,
+        ticketId,
+        confidence: runbook.confidence
+      });
+
+      this.receivePlaybook(playbook, 'local');
+    } else {
+      // No runbook - ticket stays open for manual intervention
+      this.logger.warn('No runbook match for event', {
+        ticketId,
+        eventId: event.id
+      });
+    }
+  }
+
+  /**
+   * Called when EventMonitor needs to escalate to server
+   * This happens when:
+   * - No runbook match found
+   * - Runbook requires approval
+   * - Protected service detected
+   */
+  private handleEscalationNeeded(event: EventLogEntry, reason: string): void {
+    this.logger.warn('Escalation needed', {
+      eventId: event.id,
+      reason
+    });
+
+    // Step 1: CREATE ESCALATED TICKET
+    const ticketId = `ticket-escalated-${Date.now()}`;
+    const ticket: Ticket = {
+      ticket_id: ticketId,
+      timestamp: new Date(event.timeCreated).toISOString(),
+      type: this.getTicketType(event),
+      description: `[ESCALATED] ${reason}: ${event.source} - ${event.message.substring(0, 150)}`,
+      status: 'open',
+      source: 'event-log',
+      computer_name: os.hostname(),
+      event_id: event.id,
+      event_source: event.source,
+      escalated: 1 // MARK AS ESCALATED
+    };
+
+    try {
+      this.ticketDb.createTicket(ticket);
+      this.ticketDb.markAsEscalated(ticketId);
+      this.logger.info('Escalated ticket created', { ticketId, reason });
+    } catch (error) {
+      this.logger.error('Failed to create escalated ticket', error);
+    }
+
+    // Step 2: SEND TO SERVER if connected
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'escalation',
+        ticketId,
+        event: {
+          id: event.id,
+          source: event.source,
+          level: event.level,
+          message: event.message,
+          timeCreated: event.timeCreated
+        },
+        reason,
+        hostname: os.hostname()
+      }));
+      this.logger.info('Escalation sent to server', { ticketId });
+    } else {
+      this.logger.warn('Cannot escalate - no server connection', { ticketId });
+    }
+  }
+
+  /**
+   * Get ticket type from event
+   */
+  private getTicketType(event: EventLogEntry): string {
+    // Map common event IDs to ticket types
+    const eventTypeMap: Record<number, string> = {
+      7034: 'service-crash',
+      7031: 'service-crash',
+      7036: 'service-change',
+      1000: 'application-crash',
+      1001: 'application-hang',
+      7: 'disk-error',
+      11: 'disk-error',
+      15: 'disk-error',
+      2013: 'disk-timeout',
+      1014: 'dns-failure',
+      1015: 'dns-failure'
+    };
+
+    return eventTypeMap[event.id] || 'system-event';
+  }
+
+  /**
+   * Determine playbook priority based on confidence score
+   */
+  private determinePriority(confidence: number): 'critical' | 'high' | 'medium' | 'low' {
+    if (confidence >= 0.9) return 'high';
+    if (confidence >= 0.7) return 'medium';
+    return 'low';
+  }
+}
+
+// ============================================
+// SERVICE ENTRY POINT
+// ============================================
+
+const agent = new OPSISAgentService();
+
+process.on('SIGINT', () => {
+  agent.stop();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  agent.stop();
+  process.exit(0);
+});
+
+agent.start().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
+
+export default OPSISAgentService;
