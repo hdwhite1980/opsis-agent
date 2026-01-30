@@ -40,6 +40,29 @@ export class SystemMonitor {
   private consecutiveBreaches: Map<string, number> = new Map();
   private readonly SUSTAINED_THRESHOLD_COUNT = 3; // Require 3 consecutive breaches
 
+  // Server-configurable thresholds (defaults overridden by welcome message)
+  private thresholds = {
+    cpu_warning: 75,
+    cpu_critical: 90,
+    memory_warning: 80,
+    memory_critical: 90,
+    disk_warning: 20,
+    disk_critical: 10
+  };
+
+  /**
+   * Update thresholds from server configuration.
+   */
+  public updateThresholds(newThresholds: Record<string, number>): void {
+    if (newThresholds.cpu_warning != null) this.thresholds.cpu_warning = newThresholds.cpu_warning;
+    if (newThresholds.cpu_critical != null) this.thresholds.cpu_critical = newThresholds.cpu_critical;
+    if (newThresholds.memory_warning != null) this.thresholds.memory_warning = newThresholds.memory_warning;
+    if (newThresholds.memory_critical != null) this.thresholds.memory_critical = newThresholds.memory_critical;
+    if (newThresholds.disk_warning != null) this.thresholds.disk_warning = newThresholds.disk_warning;
+    if (newThresholds.disk_critical != null) this.thresholds.disk_critical = newThresholds.disk_critical;
+    this.logger.info('Thresholds updated from server', this.thresholds);
+  }
+
   constructor(logger: Logger, onSignalDetected: MonitorCallback) {
     this.logger = logger;
     this.onSignalDetected = onSignalDetected;
@@ -111,27 +134,27 @@ export class SystemMonitor {
       const cpuUsage = await this.getCPUUsage();
       
       // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
-      if (this.isSustainedBreach('cpu-critical', cpuUsage > 90)) {
+      if (this.isSustainedBreach('cpu-critical', cpuUsage > this.thresholds.cpu_critical)) {
         this.emitSignal({
           id: 'cpu-critical',
           category: 'performance',
           severity: 'critical',
           metric: 'cpu_usage',
           value: cpuUsage,
-          threshold: 90,
+          threshold: this.thresholds.cpu_critical,
           message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
           timestamp: new Date(),
           eventId: 2001,
           eventSource: 'OPSIS-SystemMonitor'
         });
-      } else if (this.isSustainedBreach('cpu-high', cpuUsage > 75)) {
+      } else if (this.isSustainedBreach('cpu-high', cpuUsage > this.thresholds.cpu_warning)) {
         this.emitSignal({
           id: 'cpu-high',
           category: 'performance',
           severity: 'warning',
           metric: 'cpu_usage',
           value: cpuUsage,
-          threshold: 75,
+          threshold: this.thresholds.cpu_warning,
           message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
           timestamp: new Date(),
           eventId: 2002,
@@ -179,15 +202,16 @@ export class SystemMonitor {
 
   private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number}>> {
     try {
+      // Use Get-Counter for actual real-time CPU percentage per process (not cumulative CPU time)
       const { stdout } = await execAsync(
-        'powershell -Command "Get-Process | Where-Object {$_.CPU -gt 0} | Sort-Object CPU -Descending | Select-Object -First 5 Name,Id,@{N=\'CPU\';E={[math]::Round($_.CPU,2)}} | ConvertTo-Json"',
-        { timeout: 10000 }
+        `powershell -Command "$cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors; Get-Process | Where-Object {$_.Id -ne 0} | Sort-Object CPU -Descending | Select-Object -First 5 Name,Id,@{N='CPUPercent';E={[math]::Round(($_.CPU / ((Get-Date) - $_.StartTime).TotalSeconds) * 100 / $cpuCores, 2)}} -ErrorAction SilentlyContinue | ConvertTo-Json"`,
+        { timeout: 15000 }
       );
       const processes = JSON.parse(stdout || '[]');
       return Array.isArray(processes) ? processes.map(p => ({
         name: p.Name || 'Unknown',
         pid: p.Id || 0,
-        cpu: p.CPU || 0
+        cpu: p.CPUPercent || 0
       })) : [];
     } catch {
       return [];
@@ -206,14 +230,14 @@ export class SystemMonitor {
       const usedPercent = (usedMem / totalMem) * 100;
 
       // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
-      if (this.isSustainedBreach('memory-critical', usedPercent > 90)) {
+      if (this.isSustainedBreach('memory-critical', usedPercent > this.thresholds.memory_critical)) {
         this.emitSignal({
           id: 'memory-critical',
           category: 'performance',
           severity: 'critical',
           metric: 'memory_usage',
           value: usedPercent,
-          threshold: 90,
+          threshold: this.thresholds.memory_critical,
           message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
           timestamp: new Date(),
           metadata: {
@@ -224,14 +248,14 @@ export class SystemMonitor {
           eventId: 2010,
           eventSource: 'OPSIS-SystemMonitor'
         });
-      } else if (this.isSustainedBreach('memory-high', usedPercent > 80)) {
+      } else if (this.isSustainedBreach('memory-high', usedPercent > this.thresholds.memory_warning)) {
         this.emitSignal({
           id: 'memory-high',
           category: 'performance',
           severity: 'warning',
           metric: 'memory_usage',
           value: usedPercent,
-          threshold: 80,
+          threshold: this.thresholds.memory_warning,
           message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
           timestamp: new Date(),
           eventId: 2011,

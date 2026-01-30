@@ -108,6 +108,28 @@ interface DeviceInfo {
   websocket_url?: string;
 }
 
+interface ServerConfig {
+  monitoring: {
+    heartbeat_interval: number;
+    telemetry_interval: number;
+    health_check_interval: number;
+  };
+  thresholds: {
+    cpu_warning: number;
+    cpu_critical: number;
+    memory_warning: number;
+    memory_critical: number;
+    disk_warning: number;
+    disk_critical: number;
+  };
+  features: {
+    autonomous_remediation: boolean;
+    ai_enabled: boolean;
+    proactive_monitoring: boolean;
+    auto_update: boolean;
+  };
+}
+
 class OPSISAgentService {
   private config: AgentConfig;
   private ws: WebSocket | null = null;
@@ -146,6 +168,11 @@ class OPSISAgentService {
   private readonly RECONNECT_BASE_MS = 1000;
   private readonly RECONNECT_MAX_MS = 5 * 60 * 1000; // 5 minutes
   private sessionValid: boolean = true;
+
+  // Server-provided configuration (received via welcome message)
+  private serverConfig: ServerConfig | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private telemetryTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     this.dataDir = path.join(__dirname, '..', '..', 'data');
@@ -579,6 +606,14 @@ class OPSISAgentService {
       clearInterval(this.updateCheckTimer);
     }
 
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+    }
+
+    if (this.telemetryTimer) {
+      clearInterval(this.telemetryTimer);
+    }
+
     this.log('OPSIS Agent Service Stopped');
   }
 
@@ -592,8 +627,17 @@ class OPSISAgentService {
       return;
     }
 
-    const wsUrl = this.deviceInfo.websocket_url ||
-      (this.config.serverUrl ? this.config.serverUrl.replace('http', 'ws') + '/api/agent/ws/' + this.deviceInfo.device_id : null);
+    let wsUrl = this.deviceInfo.websocket_url || null;
+    if (!wsUrl && this.config.serverUrl) {
+      let base = this.config.serverUrl;
+      // Normalize to ws:// URL
+      if (base.startsWith('http')) {
+        base = base.replace(/^http/, 'ws');
+      } else if (!base.startsWith('ws')) {
+        base = 'ws://' + base;
+      }
+      wsUrl = base.replace(/\/$/, '') + '/api/agent/ws/' + this.deviceInfo.device_id;
+    }
 
     this.logger.debug('Connection attempt', { wsUrl, attempt: this.reconnectAttempts });
 
@@ -608,12 +652,10 @@ class OPSISAgentService {
       const headers: Record<string, string> = {
         'X-Agent-Version': '1.0.0',
         'X-Agent-Machine': os.hostname(),
-        'X-Agent-OS': `${os.platform()} ${os.release()}`,
-        'X-Device-ID': this.deviceInfo.device_id,
-        'X-Tenant-ID': this.deviceInfo.tenant_id
+        'X-Agent-OS': `${os.platform()} ${os.release()}`
       };
 
-      // Add auth token if configured
+      // Auth via API key (server derives tenant from key)
       if (this.config.apiKey) {
         headers['Authorization'] = `Bearer ${this.config.apiKey}`;
       }
@@ -621,9 +663,9 @@ class OPSISAgentService {
       this.ws = new WebSocket(wsUrl, { headers });
 
       this.ws.on('open', () => {
-        this.log('Connected to OPSIS server');
+        this.log('Connected to OPSIS server, waiting for welcome...');
         this.reconnectAttempts = 0; // Reset backoff on successful connection
-        this.sendHeartbeat();
+        // Don't start heartbeat yet — wait for welcome message with config
       });
 
       this.ws.on('message', (data: WebSocket.Data) => {
@@ -692,8 +734,6 @@ class OPSISAgentService {
           stats: this.getSystemStats()
         }
       }));
-
-      setTimeout(() => this.sendHeartbeat(), 30000);
     }
   }
 
@@ -705,9 +745,17 @@ class OPSISAgentService {
       this.logger.info('Received server message', { type: data.type });
 
       switch (data.type) {
+        case 'welcome':
+          this.handleWelcome(data);
+          break;
+
         case 'pong':
           // Heartbeat acknowledgment
           this.logger.debug('Heartbeat acknowledged');
+          break;
+
+        case 'ack':
+          // Message acknowledged
           break;
           
         case 'decision':
@@ -826,6 +874,52 @@ class OPSISAgentService {
     } else if (decision.decision_type === 'block') {
       // Server blocked the action
       this.logger.warn('Server blocked action');
+    }
+  }
+
+  // NEW METHOD: Handle Welcome Message from Server
+  private handleWelcome(data: any): void {
+    this.logger.info('Welcome received from server', {
+      client_name: data.client_name,
+      tenant_id: data.tenant_id,
+      device_id: data.device_id,
+      endpoint_id: data.endpoint_id
+    });
+
+    // Update device info with server-assigned values
+    this.deviceInfo.tenant_id = data.tenant_id || this.deviceInfo.tenant_id;
+    this.deviceInfo.device_id = data.device_id || this.deviceInfo.device_id;
+
+    // Store server configuration
+    if (data.config) {
+      this.serverConfig = data.config;
+
+      // Apply feature flags
+      if (this.serverConfig!.features) {
+        this.config.autoRemediation = this.serverConfig!.features.autonomous_remediation;
+        this.config.autoUpdate = this.serverConfig!.features.auto_update;
+      }
+
+      // Update system monitor thresholds from server config
+      if (this.serverConfig!.thresholds) {
+        this.systemMonitor.updateThresholds(this.serverConfig!.thresholds);
+      }
+
+      // Start heartbeat with server-provided interval
+      const heartbeatMs = this.serverConfig!.monitoring?.heartbeat_interval || 30000;
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      this.sendHeartbeat();
+      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), heartbeatMs);
+
+      this.logger.info('Server config applied', {
+        heartbeat_interval: heartbeatMs,
+        thresholds: this.serverConfig!.thresholds,
+        features: this.serverConfig!.features
+      });
+    } else {
+      // No config — start heartbeat with default interval
+      this.sendHeartbeat();
+      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
     }
   }
 
