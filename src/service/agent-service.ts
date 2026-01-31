@@ -824,6 +824,18 @@ class OPSISAgentService {
         case 'force-diagnostic':
           this.runDiagnostic(data.scenario);
           break;
+
+        case 'diagnostic_request':
+          this.handleDiagnosticRequest(data);
+          break;
+
+        case 'diagnostic_complete':
+          this.handleDiagnosticComplete(data);
+          break;
+
+        case 'add_to_ignore_list':
+          this.handleAddToIgnoreList(data);
+          break;
           
         case 'config-update':
           this.updateConfig(data.config);
@@ -1166,6 +1178,257 @@ class OPSISAgentService {
     return { isIgnore: matched, reason };
   }
 
+  // ============================================
+  // DIAGNOSTIC REQUEST/RESPONSE (N8N Integration)
+  // ============================================
+
+  private async handleDiagnosticRequest(data: any): Promise<void> {
+    const { session_id, step_id, command, timeout, description } = data;
+
+    this.logger.info('Diagnostic request received', {
+      session_id,
+      step_id,
+      description
+    });
+
+    try {
+      const result = await this.executePowerShellCommand(command, timeout || 30);
+      const parsedResult = this.parseDiagnosticOutput(result.output, step_id);
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'diagnostic_result',
+          timestamp: new Date().toISOString(),
+          device_id: this.deviceInfo.device_id,
+          session_id: session_id,
+          step_id: step_id,
+          success: result.exitCode === 0,
+          output: result.output,
+          error: result.error || null,
+          exit_code: result.exitCode,
+          parsed_result: parsedResult
+        }));
+
+        this.logger.info('Diagnostic result sent', { step_id, success: result.exitCode === 0 });
+      }
+    } catch (error: any) {
+      this.logger.error('Diagnostic failed', { step_id, error: error.message });
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'diagnostic_result',
+          timestamp: new Date().toISOString(),
+          device_id: this.deviceInfo.device_id,
+          session_id: session_id,
+          step_id: step_id,
+          success: false,
+          error: error.message,
+          exit_code: -1
+        }));
+      }
+    }
+  }
+
+  private async executePowerShellCommand(
+    command: string,
+    timeoutSeconds: number = 30
+  ): Promise<{ exitCode: number; output: string; error: string }> {
+    try {
+      const { stdout, stderr } = await execAsync(
+        `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "${command.replace(/"/g, '\\"')}"`,
+        {
+          timeout: timeoutSeconds * 1000,
+          maxBuffer: 1024 * 1024
+        }
+      );
+
+      return {
+        exitCode: 0,
+        output: stdout.toString(),
+        error: stderr.toString()
+      };
+    } catch (error: any) {
+      return {
+        exitCode: error.code || -1,
+        output: error.stdout?.toString() || '',
+        error: error.stderr?.toString() || error.message
+      };
+    }
+  }
+
+  private parseDiagnosticOutput(output: string, stepId: string): any {
+    if (stepId.includes('bluetooth') || stepId.includes('device')) {
+      return this.parseDeviceOutput(output);
+    }
+    if (stepId.includes('service')) {
+      return this.parseServiceOutput(output);
+    }
+    if (stepId.includes('event')) {
+      return this.parseEventLogOutput(output);
+    }
+    return { raw_output: output, exit_code: 0 };
+  }
+
+  private parseDeviceOutput(output: string): any {
+    const lines = output.split('\n').filter(l => l.trim());
+    const devices: Array<{ name: string; status: string }> = [];
+
+    for (let i = 3; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const parts = line.split(/\s{2,}/);
+      if (parts.length >= 2) {
+        devices.push({ name: parts[0], status: parts[parts.length - 1] });
+      }
+    }
+
+    return {
+      device_count: devices.length,
+      devices,
+      has_errors: devices.some(d => d.status.toLowerCase().includes('error'))
+    };
+  }
+
+  private parseServiceOutput(output: string): any {
+    return {
+      service_status: output.toLowerCase().includes('running') ? 'running' : 'stopped',
+      raw_output: output
+    };
+  }
+
+  private parseEventLogOutput(output: string): any {
+    const eventCount = (output.match(/\n/g) || []).length;
+    return {
+      event_count: eventCount,
+      has_errors: output.toLowerCase().includes('error'),
+      raw_output: output.substring(0, 500)
+    };
+  }
+
+  private handleDiagnosticComplete(data: any): void {
+    const { decision, reason, add_to_ignore_list, issue_signature, playbook } = data;
+
+    this.logger.info('Diagnostic complete', { decision, reason });
+
+    switch (decision) {
+      case 'IGNORE':
+        if (add_to_ignore_list && issue_signature) {
+          this.addToLocalIgnoreList(issue_signature, reason);
+          this.logger.info('Added to ignore list via diagnostic', { issue_signature });
+        }
+        break;
+
+      case 'REMEDIATE':
+        if (playbook) {
+          this.receivePlaybook(playbook, 'server');
+          this.logger.info('Executing remediation playbook from diagnostic');
+        }
+        break;
+
+      case 'MONITOR_ONLY':
+        this.logger.info('Diagnostic result: monitor only', { reason });
+        break;
+
+      default:
+        this.logger.warn('Unknown diagnostic decision', { decision });
+    }
+  }
+
+  // ============================================
+  // IGNORE LIST MANAGER (data/ignore-list.json)
+  // ============================================
+
+  private handleAddToIgnoreList(data: any): void {
+    const { signature, reason } = data;
+
+    if (!signature) {
+      this.logger.warn('add_to_ignore_list missing signature', { data });
+      return;
+    }
+
+    this.addToLocalIgnoreList(signature, reason || 'Added by server');
+  }
+
+  private addToLocalIgnoreList(signature: string, reason: string): void {
+    const ignoreListPath = path.join(process.cwd(), 'data', 'ignore-list.json');
+
+    let ignoreList: { ignored_signatures: Array<{ signature: string; reason: string; added_at: string; verified_by: string }> } = {
+      ignored_signatures: []
+    };
+
+    // Ensure data directory exists
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    if (fs.existsSync(ignoreListPath)) {
+      try {
+        ignoreList = JSON.parse(fs.readFileSync(ignoreListPath, 'utf8'));
+      } catch (error) {
+        this.logger.warn('Failed to load ignore list, starting fresh', { error });
+      }
+    }
+
+    // Don't add duplicates
+    if (ignoreList.ignored_signatures.some(item => item.signature === signature)) {
+      this.logger.info('Signature already in ignore list', { signature });
+      return;
+    }
+
+    ignoreList.ignored_signatures.push({
+      signature,
+      reason,
+      added_at: new Date().toISOString(),
+      verified_by: 'server'
+    });
+
+    try {
+      fs.writeFileSync(ignoreListPath, JSON.stringify(ignoreList, null, 2));
+      this.logger.info('Ignore list updated', { signature, reason });
+    } catch (error) {
+      this.logger.error('Failed to save ignore list', error);
+    }
+  }
+
+  private shouldIgnoreSignature(signature: string): boolean {
+    const ignoreListPath = path.join(process.cwd(), 'data', 'ignore-list.json');
+
+    if (!fs.existsSync(ignoreListPath)) {
+      return false;
+    }
+
+    try {
+      const ignoreList = JSON.parse(fs.readFileSync(ignoreListPath, 'utf8'));
+      return ignoreList.ignored_signatures.some((item: any) => item.signature === signature);
+    } catch (error) {
+      this.logger.error('Failed to check ignore list', error);
+      return false;
+    }
+  }
+
+  private sendPlaybookResult(playbook: PlaybookTask, status: string, durationMs: number, error?: any): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'playbook_result',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        playbook_id: playbook.id,
+        ticket_id: (playbook as any).ticketId || null,
+        status,
+        execution_time_ms: durationMs,
+        steps_executed: playbook.steps?.length || 0,
+        error: error ? error.toString() : null,
+        source: playbook.source
+      }));
+
+      this.logger.info('Playbook result sent to server', {
+        playbook_id: playbook.id,
+        status
+      });
+    }
+  }
+
   // NEW METHOD: Handle Welcome Message from Server
   private handleWelcome(data: any): void {
     this.logger.info('Welcome received from server', {
@@ -1401,6 +1664,14 @@ class OPSISAgentService {
 
   // NEW METHOD: Escalate to Server (Tier 2) - FIXED
   private escalateToServer(signature: DeviceSignature, runbook: RunbookMatch | null): void {
+    // Check ignore list before escalating
+    if (this.shouldIgnoreSignature(signature.signature_id)) {
+      this.logger.debug('Ignoring signal - on ignore list', {
+        signal_id: signature.signature_id
+      });
+      return;
+    }
+
     this.logger.info('Escalating to server (Tier 2)', {
       signature_id: signature.signature_id,
       has_runbook: !!runbook,
@@ -1750,10 +2021,11 @@ class OPSISAgentService {
       try {
         await this.executePlaybook(playbook);
         const duration = Date.now() - startTime;
-        
+
         this.log(`Playbook completed: ${playbook.name}`);
         this.reportPlaybookResult(playbook.id, 'success');
-        
+        this.sendPlaybookResult(playbook, 'success', duration);
+
         this.remediationMemory.recordAttempt(
           playbook.id,
           signalId,
@@ -1763,10 +2035,11 @@ class OPSISAgentService {
         );
       } catch (error) {
         const duration = Date.now() - startTime;
-        
+
         this.log(`Playbook failed: ${playbook.name}`, error);
         this.reportPlaybookResult(playbook.id, 'failed', error);
-        
+        this.sendPlaybookResult(playbook, 'failed', duration, error);
+
         this.remediationMemory.recordAttempt(
           playbook.id,
           signalId,
