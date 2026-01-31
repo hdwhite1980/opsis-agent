@@ -144,8 +144,9 @@ export class RemediationMemory {
     
     // Update stats
     this.updatePlaybookStats(playbookId, result, duration);
-    this.updateSignalStats(signalId, deviceId, result);
-    this.updateDeviceSensitivity(deviceId, signalId, result);
+    const safeSignalId = signalId || playbookId || 'unknown';
+    this.updateSignalStats(safeSignalId, deviceId, result);
+    this.updateDeviceSensitivity(deviceId, safeSignalId, result);
     
     // Save to disk
     this.saveMemory();
@@ -298,7 +299,7 @@ export class RemediationMemory {
       }
       
       // Extract category from signal ID (e.g., "service-stopped-wuauserv" → "service")
-      const category = signalId.split('-')[0];
+      const category = signalId ? signalId.split('-')[0] : 'unknown';
       if (!sensitivity.problemCategories.includes(category)) {
         sensitivity.problemCategories.push(category);
       }

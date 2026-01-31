@@ -43,14 +43,21 @@ Name: "autostart"; Description: "Start Control Panel on Windows startup"; GroupD
 
 [Files]
 ; Application files
-Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\*"; DestDir: "{app}\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "node_modules\*"; DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "package.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\install-service.js"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\uninstall-service.js"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+; Runbooks (required at runtime)
+Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Assets (optional - only if folder exists)
 Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+
+; Config template
+Source: "config\agent.config.json"; DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Dirs]
 Name: "{app}\data"
@@ -58,23 +65,23 @@ Name: "{app}\logs"
 Name: "{app}\certs"
 
 [Icons]
-Name: "{group}\OPSIS Control Panel"; Filename: "node"; Parameters: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
-Name: "{autodesktop}\OPSIS Control Panel"; Filename: "node"; Parameters: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
+Name: "{group}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
+Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
 ; Install Windows Service
-Filename: "node"; Parameters: """{app}\scripts\install-service.js"""; WorkingDir: "{app}"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
+Filename: "node.exe"; Parameters: """{app}\scripts\install-service.js"""; WorkingDir: "{app}"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 
 ; Offer to launch GUI
-Filename: "node"; Parameters: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Stop and uninstall service
-Filename: "node"; Parameters: """{app}\scripts\uninstall-service.js"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
+Filename: "node.exe"; Parameters: """{app}\scripts\uninstall-service.js"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
 
 [Registry]
 ; Add to startup (if selected)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: "node ""{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; Tasks: autostart
 
 [Code]
 var
@@ -106,14 +113,16 @@ end;
 
 procedure InitializeWizard;
 begin
-  // Create custom page for server URL
+  // Create custom page for server URL and API key
   ServerURLPage := CreateInputQueryPage(wpSelectDir,
-    'OPSIS Server Configuration', 
-    'Enter your OPSIS server details',
-    'If you have a central OPSIS server, enter the URL below. Leave blank for standalone mode.');
-  
-  ServerURLPage.Add('Server URL (e.g., https://opsis.yourdomain.com):', False);
+    'OPSIS Server Configuration',
+    'Enter your OPSIS server connection details',
+    'Enter the server URL and API key provided by your OPSIS administrator.');
+
+  ServerURLPage.Add('Server URL (e.g., ws://opsis.yourdomain.com:8000):', False);
+  ServerURLPage.Add('API Key (e.g., opsis_xxxxxxxxxxxx):', False);
   ServerURLPage.Values[0] := '';
+  ServerURLPage.Values[1] := '';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -132,11 +141,15 @@ begin
       ConfigContent := ConfigContent + '  "serverUrl": "' + ServerURLPage.Values[0] + '",' + #13#10
     else
       ConfigContent := ConfigContent + '  "serverUrl": null,' + #13#10;
-    
+
+    if ServerURLPage.Values[1] <> '' then
+      ConfigContent := ConfigContent + '  "apiKey": "' + ServerURLPage.Values[1] + '",' + #13#10
+    else
+      ConfigContent := ConfigContent + '  "apiKey": "",' + #13#10;
+
     ConfigContent := ConfigContent + '  "autoConnect": true,' + #13#10;
-    ConfigContent := ConfigContent + '  "autoUpdate": true,' + #13#10;
-    ConfigContent := ConfigContent + '  "localAI": true,' + #13#10;
     ConfigContent := ConfigContent + '  "autoRemediation": true,' + #13#10;
+    ConfigContent := ConfigContent + '  "autoUpdate": false,' + #13#10;
     ConfigContent := ConfigContent + '  "confidenceThreshold": 75,' + #13#10;
     ConfigContent := ConfigContent + '  "updateCheckInterval": 60' + #13#10;
     ConfigContent := ConfigContent + '}';

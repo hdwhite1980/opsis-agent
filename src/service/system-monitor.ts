@@ -21,6 +21,8 @@ export interface SystemSignal {
   // For ticket creation
   eventId?: number;
   eventSource?: string;
+  // For hardware health scoring
+  componentType?: 'disk' | 'cpu' | 'memory' | 'motherboard';
 }
 
 export type MonitorCallback = (signal: SystemSignal) => void;
@@ -100,7 +102,14 @@ export class SystemMonitor {
     this.scheduleMonitor(() => this.monitorSecurity(), 300000);        // Every 5min
     this.scheduleMonitor(() => this.monitorFirewall(), 300000);        // Every 5min
 
-    this.logger.info('All 12 monitoring categories started');
+    // ===== CATEGORY 6: HARDWARE HEALTH & FAILURE PREDICTION =====
+    this.scheduleMonitor(() => this.monitorSMART(), 300000);            // Every 5min
+    this.scheduleMonitor(() => this.monitorTemperature(), 60000);       // Every 60s
+    this.scheduleMonitor(() => this.monitorMemoryErrors(), 300000);     // Every 5min
+    this.scheduleMonitor(() => this.monitorDiskIO(), 60000);            // Every 60s
+    this.scheduleMonitor(() => this.monitorCrashDumps(), 300000);       // Every 5min
+
+    this.logger.info('All 17 monitoring categories started');
   }
 
   public stop(): void {
@@ -1010,6 +1019,348 @@ export class SystemMonitor {
     });
 
     this.onSignalDetected(signal);
+  }
+
+  // ============================================
+  // CATEGORY 6: HARDWARE HEALTH & FAILURE PREDICTION
+  // ============================================
+
+  private async monitorSMART(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "$disks = Get-PhysicalDisk -ErrorAction SilentlyContinue; foreach ($d in $disks) { $rel = Get-StorageReliabilityCounter -PhysicalDisk $d -ErrorAction SilentlyContinue; [PSCustomObject]@{ FriendlyName=$d.FriendlyName; DeviceId=$d.DeviceId; MediaType=$d.MediaType; HealthStatus=$d.HealthStatus; OperationalStatus=$d.OperationalStatus; ReadErrorsTotal=if($rel){$rel.ReadErrorsTotal}else{0}; WriteErrorsTotal=if($rel){$rel.WriteErrorsTotal}else{0}; Temperature=if($rel){$rel.Temperature}else{0}; Wear=if($rel){$rel.Wear}else{0}; PowerOnHours=if($rel){$rel.PowerOnHours}else{0} } } | ConvertTo-Json -Compress"`,
+        { timeout: 30000 }
+      );
+
+      if (!stdout.trim()) return;
+
+      const disks = Array.isArray(JSON.parse(stdout.trim())) ? JSON.parse(stdout.trim()) : [JSON.parse(stdout.trim())];
+
+      for (const disk of disks) {
+        const diskId = disk.DeviceId || '0';
+        const meta = {
+          DeviceId: diskId,
+          FriendlyName: disk.FriendlyName,
+          MediaType: disk.MediaType,
+          HealthStatus: disk.HealthStatus,
+          ReadErrors: disk.ReadErrorsTotal || 0,
+          WriteErrors: disk.WriteErrorsTotal || 0,
+          Temperature: disk.Temperature || 0,
+          Wear: disk.Wear || 0,
+          PowerOnHours: disk.PowerOnHours || 0
+        };
+
+        // Health status check
+        if (disk.HealthStatus && disk.HealthStatus !== 'Healthy') {
+          this.emitSignal({
+            id: `smart-health-${diskId}`,
+            category: 'hardware',
+            severity: 'critical',
+            metric: 'smart_health',
+            value: disk.HealthStatus,
+            message: `Disk ${disk.FriendlyName} health status: ${disk.HealthStatus}`,
+            timestamp: new Date(),
+            metadata: meta,
+            componentType: 'disk'
+          });
+        }
+
+        // Read/Write errors
+        const totalErrors = (disk.ReadErrorsTotal || 0) + (disk.WriteErrorsTotal || 0);
+        if (totalErrors > 0) {
+          this.emitSignal({
+            id: `smart-errors-${diskId}`,
+            category: 'hardware',
+            severity: totalErrors > 10 ? 'critical' : 'warning',
+            metric: 'smart_errors',
+            value: totalErrors,
+            threshold: 0,
+            message: `Disk ${disk.FriendlyName} has ${totalErrors} SMART errors (read: ${disk.ReadErrorsTotal || 0}, write: ${disk.WriteErrorsTotal || 0})`,
+            timestamp: new Date(),
+            metadata: meta,
+            componentType: 'disk'
+          });
+        }
+
+        // SSD Wear (only for SSDs)
+        if (disk.MediaType === 'SSD' && disk.Wear != null && disk.Wear > 0) {
+          const wearPct = disk.Wear;
+          if (wearPct > 80) {
+            this.emitSignal({
+              id: `smart-wear-${diskId}`,
+              category: 'hardware',
+              severity: wearPct > 90 ? 'critical' : 'warning',
+              metric: 'smart_wear',
+              value: wearPct,
+              threshold: 80,
+              message: `SSD ${disk.FriendlyName} wear level at ${wearPct}%`,
+              timestamp: new Date(),
+              metadata: meta,
+              componentType: 'disk'
+            });
+          }
+        }
+
+        // Disk temperature
+        if (disk.Temperature && disk.Temperature > 0) {
+          const tempC = disk.Temperature;
+          if (tempC > 55) {
+            this.emitSignal({
+              id: `smart-temp-${diskId}`,
+              category: 'hardware',
+              severity: tempC > 65 ? 'critical' : 'warning',
+              metric: 'disk_temperature',
+              value: tempC,
+              threshold: 55,
+              message: `Disk ${disk.FriendlyName} temperature: ${tempC}°C`,
+              timestamp: new Date(),
+              metadata: meta,
+              componentType: 'disk'
+            });
+          }
+          this.updateBaseline(`disk_temp_${diskId}`, tempC);
+        }
+
+        // Power-on hours (informational, useful for failure prediction)
+        if (disk.PowerOnHours && disk.PowerOnHours > 35000) {
+          this.emitSignal({
+            id: `smart-hours-${diskId}`,
+            category: 'hardware',
+            severity: disk.PowerOnHours > 50000 ? 'warning' : 'info',
+            metric: 'power_on_hours',
+            value: disk.PowerOnHours,
+            threshold: 35000,
+            message: `Disk ${disk.FriendlyName} has ${disk.PowerOnHours} power-on hours`,
+            timestamp: new Date(),
+            metadata: meta,
+            componentType: 'disk'
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.debug('SMART monitoring not available', error);
+    }
+  }
+
+  private async monitorTemperature(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "Get-WmiObject -Namespace root/wmi -Class MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object InstanceName,CurrentTemperature | ConvertTo-Json -Compress"`,
+        { timeout: 10000 }
+      );
+
+      if (!stdout.trim()) return;
+
+      const zones = Array.isArray(JSON.parse(stdout.trim())) ? JSON.parse(stdout.trim()) : [JSON.parse(stdout.trim())];
+
+      for (const zone of zones) {
+        if (!zone.CurrentTemperature) continue;
+
+        // WMI returns temperature in tenths of Kelvin
+        const tempC = Math.round((zone.CurrentTemperature / 10) - 273.15);
+        const zoneName = zone.InstanceName || 'unknown';
+
+        this.updateBaseline(`cpu_temp_${zoneName}`, tempC);
+
+        if (this.isSustainedBreach(`cpu-temp-critical-${zoneName}`, tempC > 90)) {
+          this.emitSignal({
+            id: `cpu-temp-critical`,
+            category: 'hardware',
+            severity: 'critical',
+            metric: 'cpu_temperature',
+            value: tempC,
+            threshold: 90,
+            message: `CPU temperature critically high: ${tempC}°C`,
+            timestamp: new Date(),
+            metadata: { zone: zoneName, temperatureC: tempC },
+            componentType: 'cpu'
+          });
+        } else if (this.isSustainedBreach(`cpu-temp-high-${zoneName}`, tempC > 80)) {
+          this.emitSignal({
+            id: `cpu-temp-high`,
+            category: 'hardware',
+            severity: 'warning',
+            metric: 'cpu_temperature',
+            value: tempC,
+            threshold: 80,
+            message: `CPU temperature elevated: ${tempC}°C`,
+            timestamp: new Date(),
+            metadata: { zone: zoneName, temperatureC: tempC },
+            componentType: 'cpu'
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Temperature monitoring not available (WMI thermal zone not supported on this hardware)');
+    }
+  }
+
+  private async monitorMemoryErrors(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'} -MaxEvents 10 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddMinutes(-10) } | Select-Object TimeCreated,Id,Message | ConvertTo-Json -Compress"`,
+        { timeout: 15000 }
+      );
+
+      if (!stdout.trim()) return;
+
+      const events = Array.isArray(JSON.parse(stdout.trim())) ? JSON.parse(stdout.trim()) : [JSON.parse(stdout.trim())];
+
+      if (events.length > 0) {
+        this.emitSignal({
+          id: 'memory-ecc-error',
+          category: 'hardware',
+          severity: 'critical',
+          metric: 'memory_errors',
+          value: events.length,
+          threshold: 0,
+          message: `${events.length} hardware memory error(s) detected (WHEA). Possible RAM failure.`,
+          timestamp: new Date(),
+          metadata: {
+            errorCount: events.length,
+            latestError: events[0]?.Message?.substring(0, 200) || 'Unknown',
+            eventIds: events.map((e: any) => e.Id)
+          },
+          componentType: 'memory'
+        });
+      }
+    } catch (error) {
+      this.logger.debug('Memory error monitoring: no WHEA events found');
+    }
+  }
+
+  private async monitorDiskIO(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "$samples = (Get-Counter '\\PhysicalDisk(*)\\Avg. Disk sec/Read','\\PhysicalDisk(*)\\Avg. Disk sec/Write','\\PhysicalDisk(*)\\Disk Bytes/sec' -ErrorAction SilentlyContinue).CounterSamples; $samples | Select-Object InstanceName,Path,CookedValue | ConvertTo-Json -Compress"`,
+        { timeout: 15000 }
+      );
+
+      if (!stdout.trim()) return;
+
+      const samples = Array.isArray(JSON.parse(stdout.trim())) ? JSON.parse(stdout.trim()) : [JSON.parse(stdout.trim())];
+
+      // Group by instance
+      const diskMetrics: Record<string, { readLatency?: number; writeLatency?: number; throughput?: number }> = {};
+
+      for (const sample of samples) {
+        if (!sample.InstanceName || sample.InstanceName === '_total') continue;
+        const instance = sample.InstanceName;
+        if (!diskMetrics[instance]) diskMetrics[instance] = {};
+
+        const path = (sample.Path || '').toLowerCase();
+        if (path.includes('sec/read')) {
+          diskMetrics[instance].readLatency = (sample.CookedValue || 0) * 1000; // Convert to ms
+        } else if (path.includes('sec/write')) {
+          diskMetrics[instance].writeLatency = (sample.CookedValue || 0) * 1000;
+        } else if (path.includes('bytes/sec')) {
+          diskMetrics[instance].throughput = sample.CookedValue || 0;
+        }
+      }
+
+      for (const [instance, metrics] of Object.entries(diskMetrics)) {
+        const maxLatency = Math.max(metrics.readLatency || 0, metrics.writeLatency || 0);
+
+        this.updateBaseline(`disk_io_latency_${instance}`, maxLatency);
+        this.updateBaseline(`disk_io_throughput_${instance}`, metrics.throughput || 0);
+
+        if (this.isSustainedBreach(`disk-io-critical-${instance}`, maxLatency > 100)) {
+          this.emitSignal({
+            id: `disk-io-latency-${instance}`,
+            category: 'hardware',
+            severity: 'critical',
+            metric: 'disk_latency',
+            value: maxLatency,
+            threshold: 100,
+            message: `Disk ${instance} latency critically high: ${maxLatency.toFixed(1)}ms`,
+            timestamp: new Date(),
+            metadata: {
+              instance,
+              readLatencyMs: metrics.readLatency?.toFixed(1),
+              writeLatencyMs: metrics.writeLatency?.toFixed(1),
+              throughputBps: metrics.throughput
+            },
+            componentType: 'disk'
+          });
+        } else if (this.isSustainedBreach(`disk-io-warning-${instance}`, maxLatency > 20)) {
+          this.emitSignal({
+            id: `disk-io-latency-${instance}`,
+            category: 'hardware',
+            severity: 'warning',
+            metric: 'disk_latency',
+            value: maxLatency,
+            threshold: 20,
+            message: `Disk ${instance} latency elevated: ${maxLatency.toFixed(1)}ms`,
+            timestamp: new Date(),
+            metadata: {
+              instance,
+              readLatencyMs: metrics.readLatency?.toFixed(1),
+              writeLatencyMs: metrics.writeLatency?.toFixed(1),
+              throughputBps: metrics.throughput
+            },
+            componentType: 'disk'
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Disk I/O monitoring error', error);
+    }
+  }
+
+  private async monitorCrashDumps(): Promise<void> {
+    try {
+      // Check for recent minidumps (last 24 hours)
+      const { stdout: minidumps } = await execAsync(
+        `powershell -NoProfile -Command "Get-ChildItem 'C:\\Windows\\Minidump' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-24) } | Select-Object Name,LastWriteTime,Length | ConvertTo-Json -Compress"`,
+        { timeout: 10000 }
+      );
+
+      // Check for BugCheck events in System log (last 24 hours)
+      const { stdout: bugchecks } = await execAsync(
+        `powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'} -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-24) } | Select-Object TimeCreated,Message | ConvertTo-Json -Compress"`,
+        { timeout: 10000 }
+      );
+
+      let dumpCount = 0;
+      let dumpFiles: string[] = [];
+
+      if (minidumps.trim()) {
+        const dumps = Array.isArray(JSON.parse(minidumps.trim())) ? JSON.parse(minidumps.trim()) : [JSON.parse(minidumps.trim())];
+        dumpCount = dumps.length;
+        dumpFiles = dumps.map((d: any) => d.Name);
+      }
+
+      let bugcheckCount = 0;
+      let bugcheckMessages: string[] = [];
+
+      if (bugchecks.trim()) {
+        const checks = Array.isArray(JSON.parse(bugchecks.trim())) ? JSON.parse(bugchecks.trim()) : [JSON.parse(bugchecks.trim())];
+        bugcheckCount = checks.length;
+        bugcheckMessages = checks.map((c: any) => (c.Message || '').substring(0, 200));
+      }
+
+      if (dumpCount > 0 || bugcheckCount > 0) {
+        this.emitSignal({
+          id: 'bsod-detected',
+          category: 'hardware',
+          severity: 'critical',
+          metric: 'crash_dump',
+          value: dumpCount + bugcheckCount,
+          threshold: 0,
+          message: `BSOD detected: ${dumpCount} crash dump(s), ${bugcheckCount} BugCheck event(s) in last 24 hours`,
+          timestamp: new Date(),
+          metadata: {
+            dumpFiles,
+            dumpCount,
+            bugcheckCount,
+            bugcheckMessages
+          },
+          componentType: 'motherboard'
+        });
+      }
+    } catch (error) {
+      this.logger.debug('Crash dump monitoring error', error);
+    }
   }
 
   // ============================================

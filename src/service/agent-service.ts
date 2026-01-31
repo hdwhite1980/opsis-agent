@@ -147,6 +147,7 @@ class OPSISAgentService {
   private ticketDb: TicketDatabase;
   private ipcServer: IPCServer;
   private remediationMemory: RemediationMemory;
+  private serviceAlerts: any[] = [];
   private patternDetector: PatternDetector;
   private activeTickets: Map<string, string> = new Map(); // playbookId -> ticketId
 
@@ -250,7 +251,15 @@ class OPSISAgentService {
       
       this.ipcServer.sendToClient(socket, {
         type: 'initial-data',
-        data: { tickets, stats: guiStats }
+        data: {
+          tickets,
+          stats: guiStats,
+          healthScores: this.patternDetector.getHealthScores(),
+          correlations: this.patternDetector.getCorrelations(),
+          patterns: this.patternDetector.getDetectedPatterns(),
+          proactiveActions: this.patternDetector.getPendingActions(),
+          serviceAlerts: this.serviceAlerts
+        }
       });
     });
   }
@@ -353,7 +362,14 @@ class OPSISAgentService {
     
     this.ipcServer.broadcast({
       type: 'ticket-update',
-      data: { tickets, stats: guiStats }
+      data: {
+        tickets,
+        stats: guiStats,
+        healthScores: this.patternDetector.getHealthScores(),
+        correlations: this.patternDetector.getCorrelations(),
+        patterns: this.patternDetector.getDetectedPatterns(),
+        proactiveActions: this.patternDetector.getPendingActions()
+      }
     });
   }
 
@@ -402,6 +418,19 @@ class OPSISAgentService {
       });
     });
 
+    this.ipcServer.onMessage('get-health-data', (data, socket) => {
+      this.logger.info('IPC: Received get-health-data request');
+      this.ipcServer.sendToClient(socket, {
+        type: 'health-data',
+        data: {
+          healthScores: this.patternDetector.getHealthScores(),
+          correlations: this.patternDetector.getCorrelations(),
+          patterns: this.patternDetector.getDetectedPatterns(),
+          proactiveActions: this.patternDetector.getPendingActions()
+        }
+      });
+    });
+
     this.ipcServer.onMessage('get-ticket', (data, socket) => {
       const ticket = this.ticketDb.getTicket(data.ticketId);
       this.ipcServer.sendToClient(socket, {
@@ -438,6 +467,19 @@ class OPSISAgentService {
       });
     });
     
+    this.ipcServer.onMessage('get-service-alerts', (data, socket) => {
+      this.logger.info('IPC: Received get-service-alerts request');
+      this.ipcServer.sendToClient(socket, {
+        type: 'service-alerts',
+        data: this.serviceAlerts
+      });
+    });
+
+    this.ipcServer.onMessage('dismiss-alert', (data, socket) => {
+      this.logger.info('IPC: Received dismiss-alert request', { alertId: data.alertId });
+      this.serviceAlerts = this.serviceAlerts.filter(a => a.id !== data.alertId);
+    });
+
     this.ipcServer.onMessage('update-config', (data, socket) => {
       this.updateConfig(data);
       this.ipcServer.sendToClient(socket, {
@@ -731,7 +773,8 @@ class OPSISAgentService {
         timestamp: new Date().toISOString(),
         data: {
           status: 'online',
-          stats: this.getSystemStats()
+          stats: this.getSystemStats(),
+          healthScores: this.patternDetector.getHealthScores()
         }
       }));
     }
@@ -797,6 +840,14 @@ class OPSISAgentService {
           }
           break;
 
+        case 'service-alert':
+          this.handleServiceAlert(data.data);
+          break;
+
+        case 'service-alert-resolved':
+          this.handleServiceAlertResolved(data.data);
+          break;
+
         default:
           this.log(`Unknown message type: ${data.type}`);
       }
@@ -805,10 +856,52 @@ class OPSISAgentService {
     }
   }
 
+  // Handle service outage/issue alerts from server (M365, Google Apps, etc.)
+  private handleServiceAlert(alert: any): void {
+    if (!alert || !alert.id) {
+      this.logger.warn('Received invalid service alert (missing id)');
+      return;
+    }
+
+    this.logger.info('Service alert received', {
+      id: alert.id,
+      service: alert.service,
+      severity: alert.severity
+    });
+
+    // Replace existing alert with same id, or add new
+    const idx = this.serviceAlerts.findIndex(a => a.id === alert.id);
+    if (idx >= 0) {
+      this.serviceAlerts[idx] = alert;
+    } else {
+      this.serviceAlerts.push(alert);
+    }
+
+    // Broadcast to all connected GUI clients
+    this.ipcServer.broadcast({
+      type: 'service-alert',
+      data: alert
+    });
+  }
+
+  // Handle service alert resolution
+  private handleServiceAlertResolved(data: any): void {
+    const alertId = data?.id || data?.alertId;
+    if (!alertId) return;
+
+    this.logger.info('Service alert resolved', { id: alertId });
+    this.serviceAlerts = this.serviceAlerts.filter(a => a.id !== alertId);
+
+    this.ipcServer.broadcast({
+      type: 'service-alert-resolved',
+      data: { id: alertId }
+    });
+  }
+
   // NEW METHOD: Handle Server Decision
   private handleServerDecision(decision: ServerDecision): void {
     // Validate decision fields
-    const validTypes = ['execute_A', 'execute_B', 'request_approval', 'advisory_only', 'block'];
+    const validTypes = ['execute_A', 'execute_B', 'request_approval', 'advisory_only', 'block', 'ignore'];
     if (!validTypes.includes(decision.decision_type)) {
       this.logger.error('Invalid decision_type from server', { decision_type: decision.decision_type });
       return;
@@ -874,7 +967,203 @@ class OPSISAgentService {
     } else if (decision.decision_type === 'block') {
       // Server blocked the action
       this.logger.warn('Server blocked action');
+
+    } else if (decision.decision_type === 'ignore') {
+      // Server says this should be ignored — add to exclusion list and close ticket
+      this.handleIgnoreDecision(decision);
     }
+  }
+
+  private handleIgnoreDecision(decision: ServerDecision): void {
+    const reason = decision.reason || 'Server AI determined this should be ignored';
+
+    this.logger.info('Server decision: Add to ignore list', {
+      reason,
+      ignore_target: decision.ignore_target,
+      ignore_category: decision.ignore_category,
+      signature_id: decision.signature_id
+    });
+
+    // Determine what to exclude
+    let target = decision.ignore_target;
+    let category = decision.ignore_category;
+    const signatureId = decision.signature_id;
+
+    // If server provided a signature_id, try to infer target and category from it
+    if (signatureId && !target) {
+      const inferred = this.inferExclusionFromSignature(signatureId);
+      target = inferred.target;
+      category = inferred.category;
+    }
+
+    // Fall back to using signature_id itself as the exclusion target
+    if (!target && signatureId) {
+      target = signatureId;
+      category = 'signatures';
+    }
+
+    if (target && category) {
+      this.addToExclusionList(target, category);
+    } else {
+      this.logger.warn('Could not determine exclusion target from ignore decision', { decision });
+    }
+
+    // Find and close associated ticket(s)
+    let ticketClosed = false;
+    if (signatureId) {
+      // Check pending escalations for matching signature
+      const sig = this.pendingEscalations.get(signatureId);
+      if (sig) {
+        this.pendingEscalations.delete(signatureId);
+      }
+
+      // Find open tickets related to this signature and close them
+      const tickets = this.ticketDb.getTickets();
+      for (const ticket of tickets) {
+        if (ticket.status !== 'resolved' &&
+            ticket.description && ticket.description.includes(signatureId)) {
+          this.ticketDb.closeTicket(ticket.ticket_id, reason, 'success');
+          this.logger.info('Ticket resolved via ignore decision', {
+            ticketId: ticket.ticket_id,
+            reason
+          });
+          ticketClosed = true;
+        }
+      }
+    }
+
+    // If no specific ticket found, try to close the most recent open escalated ticket
+    if (!ticketClosed) {
+      const tickets = this.ticketDb.getTickets();
+      const openEscalated = tickets.find(t =>
+        t.status !== 'resolved' && t.escalated
+      );
+      if (openEscalated) {
+        this.ticketDb.closeTicket(openEscalated.ticket_id, reason, 'success');
+        this.logger.info('Ticket resolved via ignore decision (fallback)', {
+          ticketId: openEscalated.ticket_id,
+          reason
+        });
+      }
+    }
+
+    this.broadcastTicketUpdate();
+
+    // Report back to server
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'action_result',
+        timestamp: new Date().toISOString(),
+        data: {
+          decision_type: 'ignore',
+          signature_id: signatureId,
+          target,
+          category,
+          status: 'success',
+          reason
+        }
+      }));
+    }
+  }
+
+  private inferExclusionFromSignature(signatureId: string): { target: string; category: 'services' | 'processes' | 'signatures' } {
+    // RULE_SERVICE_STOPPED_<serviceName> → services category
+    const serviceMatch = signatureId.match(/^RULE_SERVICE_STOPPED_(.+)$/);
+    if (serviceMatch) {
+      return { target: serviceMatch[1], category: 'services' };
+    }
+
+    // Default: use the signature ID itself
+    return { target: signatureId, category: 'signatures' };
+  }
+
+  private addToExclusionList(target: string, category: 'services' | 'processes' | 'signatures'): void {
+    const configDir = path.join(process.cwd(), 'config');
+    const exclusionsPath = path.join(configDir, 'exclusions.json');
+
+    // Ensure config directory exists
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    // Load existing exclusions
+    let exclusions: { services: string[]; processes: string[]; signatures: string[] } = {
+      services: [],
+      processes: [],
+      signatures: []
+    };
+
+    try {
+      if (fs.existsSync(exclusionsPath)) {
+        exclusions = JSON.parse(fs.readFileSync(exclusionsPath, 'utf8'));
+      }
+    } catch (err) {
+      this.logger.warn('Failed to read exclusions file, starting fresh', { error: err });
+    }
+
+    // Add target if not already present
+    if (!exclusions[category]) {
+      exclusions[category] = [];
+    }
+
+    if (!exclusions[category].includes(target)) {
+      exclusions[category].push(target);
+
+      try {
+        fs.writeFileSync(exclusionsPath, JSON.stringify(exclusions, null, 2));
+        this.logger.info('Added to exclusion list', { target, category, path: exclusionsPath });
+      } catch (err) {
+        this.logger.error('Failed to write exclusions file', err);
+      }
+    } else {
+      this.logger.info('Target already in exclusion list', { target, category });
+    }
+  }
+
+  private isIgnoreInstruction(playbook: PlaybookTask): { isIgnore: boolean; reason: string } {
+    const ignorePatterns = [
+      /\bignore\b/i,
+      /\bsuppress\b/i,
+      /\bexclud/i,
+      /\bsafe to ignore\b/i,
+      /\bignore list\b/i,
+      /\bput.+on.+ignore/i,
+      /\badd.+to.+ignore/i,
+      /\bno action needed\b/i,
+      /\bfalse positive\b/i,
+      /\bshould be ignored\b/i,
+      /\bcan be ignored\b/i,
+      /\bnot.+concern\b/i,
+      /\bbenign\b/i,
+      /\bnormal behavio/i
+    ];
+
+    const parts: string[] = [playbook.name || ''];
+    if (playbook.steps) {
+      for (const step of playbook.steps) {
+        parts.push(step.action || '');
+        if (step.params) {
+          parts.push(JSON.stringify(step.params));
+        }
+      }
+    }
+    if ((playbook as any).description) {
+      parts.push((playbook as any).description);
+    }
+    if ((playbook as any).reason) {
+      parts.push((playbook as any).reason);
+    }
+
+    const textToCheck = parts.join(' ');
+    const matched = ignorePatterns.some(p => p.test(textToCheck));
+
+    // Use the playbook's reason/description as the resolution reason
+    const reason = (playbook as any).reason ||
+                   (playbook as any).description ||
+                   playbook.name ||
+                   'Server determined this should be ignored';
+
+    return { isIgnore: matched, reason };
   }
 
   // NEW METHOD: Handle Welcome Message from Server
@@ -1018,6 +1307,14 @@ class OPSISAgentService {
       signal.severity as 'critical' | 'warning' | 'info',
       signal.metadata
     );
+
+    // Update hardware health score if signal has a component type
+    if (signal.componentType) {
+      const componentKey = signal.componentType === 'disk'
+        ? `disk:${signal.metadata?.DeviceId || signal.metadata?.drive || '0'}`
+        : signal.componentType;
+      this.patternDetector.updateHealthScore(signal.id, componentKey, signal.severity);
+    }
 
     // NEW: Generate signature from system signal
     const signature = this.signatureGenerator.generateFromSystemSignal(signal, this.deviceInfo);
@@ -1354,10 +1651,46 @@ class OPSISAgentService {
     playbook.createdAt = new Date();
 
     this.log(`Received playbook: ${playbook.name} (${source} - ${playbook.priority})`);
-    
+
+    // Check if this is an ignore instruction from the server
+    if (source === 'server') {
+      const ignoreCheck = this.isIgnoreInstruction(playbook);
+      if (ignoreCheck.isIgnore) {
+        this.logger.info('Playbook detected as ignore instruction', {
+          playbookId: playbook.id,
+          reason: ignoreCheck.reason
+        });
+
+        const signalId = (playbook as any).signalId || playbook.id;
+
+        // Infer exclusion from signal
+        const inferred = this.inferExclusionFromSignature(signalId);
+        this.addToExclusionList(inferred.target, inferred.category);
+
+        // Close associated tickets
+        const tickets = this.ticketDb.getTickets();
+        for (const ticket of tickets) {
+          if (ticket.status !== 'resolved' &&
+              ticket.description && ticket.description.includes(signalId)) {
+            this.ticketDb.closeTicket(ticket.ticket_id, ignoreCheck.reason, 'success');
+            this.logger.info('Ticket resolved via ignore playbook', {
+              ticketId: ticket.ticket_id,
+              reason: ignoreCheck.reason
+            });
+          }
+        }
+
+        // Remove from pending escalations
+        this.pendingEscalations.delete(signalId);
+        this.broadcastTicketUpdate();
+        this.reportPlaybookResult(playbook.id, 'success');
+        return;
+      }
+    }
+
     const signalId = (playbook as any).signalId || playbook.id;
     const deviceId = os.hostname();
-    
+
     const memoryCheck = this.remediationMemory.shouldAttemptRemediation(
       signalId,
       deviceId,
@@ -1493,9 +1826,72 @@ class OPSISAgentService {
     }
   }
 
+  private translatePlainEnglishToPowerShell(script: string): string | null {
+    // Translate common plain-English patterns from server into real PowerShell
+    let match: RegExpMatchArray | null;
+
+    // "Start service <name>"
+    match = script.match(/^Start service (.+)$/i);
+    if (match) return `Start-Service -Name '${match[1]}' -ErrorAction Stop`;
+
+    // "Stop service <name>"
+    match = script.match(/^Stop service (.+)$/i);
+    if (match) return `Stop-Service -Name '${match[1]}' -Force -ErrorAction Stop`;
+
+    // "Restart service <name>"
+    match = script.match(/^Restart service (.+)$/i);
+    if (match) return `Restart-Service -Name '${match[1]}' -Force -ErrorAction Stop`;
+
+    // "Set service <name> to start automatically"
+    match = script.match(/^Set service (.+) to start automatically$/i);
+    if (match) return `Set-Service -Name '${match[1]}' -StartupType Automatic -ErrorAction Stop`;
+
+    // "Kill and restart <name> process"
+    match = script.match(/^Kill and restart (.+) process$/i);
+    if (match) return `Stop-Process -Name '${match[1]}' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-Process '${match[1]}' -ErrorAction SilentlyContinue`;
+
+    // "Kill <name> process"
+    match = script.match(/^Kill (.+) process$/i);
+    if (match) return `Stop-Process -Name '${match[1]}' -Force -ErrorAction Stop`;
+
+    // "Restart <name> process"
+    match = script.match(/^Restart (.+) process$/i);
+    if (match) return `Stop-Process -Name '${match[1]}' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-Process '${match[1]}' -ErrorAction SilentlyContinue`;
+
+    return null;
+  }
+
+  private isValidPowerShell(script: string): boolean {
+    // Check if the script looks like a real PowerShell command (contains a cmdlet or known executable)
+    const cmdletPattern = /^[\w\-]+(-[\w]+)?\s/; // e.g. Get-Service, Stop-Process
+    const execPattern = /\.(exe|ps1|cmd|bat)\b/i;
+    const pipelinePattern = /\|/;
+    const variablePattern = /\$/;
+    const knownCmdlets = ['Clear-', 'Get-', 'Set-', 'Start-', 'Stop-', 'Restart-', 'Remove-', 'New-', 'Invoke-', 'Test-', 'Write-', 'Out-', 'Import-', 'Export-', 'Add-', 'Enable-', 'Disable-', 'Register-', 'Unregister-'];
+
+    return cmdletPattern.test(script) ||
+           execPattern.test(script) ||
+           pipelinePattern.test(script) ||
+           variablePattern.test(script) ||
+           knownCmdlets.some(c => script.startsWith(c));
+  }
+
   private async executePowerShell(script: string, params: Record<string, any>, timeout: number): Promise<string> {
-    let command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${script}"`;
-    
+    // Translate plain-English commands from server into real PowerShell
+    let effectiveScript = script;
+    if (!this.isValidPowerShell(script)) {
+      const translated = this.translatePlainEnglishToPowerShell(script);
+      if (translated) {
+        this.logger.info('Translated plain-English to PowerShell', { original: script, translated });
+        effectiveScript = translated;
+      } else {
+        this.logger.error('Rejecting invalid PowerShell command', { script });
+        throw new Error(`Invalid PowerShell command (not a valid cmdlet or known pattern): ${script}`);
+      }
+    }
+
+    let command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${effectiveScript}"`;
+
     if (params && Object.keys(params).length > 0) {
       const paramString = Object.entries(params)
         .map(([key, value]) => {
@@ -1691,7 +2087,28 @@ class OPSISAgentService {
           count: pendingActions.length
         });
       }
-      
+
+      // Report hardware health scores and correlations
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        const healthScores = this.patternDetector.getHealthScores();
+        const correlations = this.patternDetector.getCorrelations();
+
+        if (Object.keys(healthScores).length > 0 || Object.keys(correlations).length > 0) {
+          this.ws.send(JSON.stringify({
+            type: 'hardware-health-report',
+            timestamp: new Date().toISOString(),
+            deviceId: os.hostname(),
+            healthScores,
+            correlations
+          }));
+
+          this.logger.info('Hardware health report sent to server', {
+            components: Object.keys(healthScores).length,
+            correlations: Object.keys(correlations).length
+          });
+        }
+      }
+
     } catch (error) {
       this.logger.error('Pattern reporting failed', error);
     }

@@ -592,6 +592,263 @@
             background: #159688;
         }
 
+        /* Health Score Cards */
+        .health-scores-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .health-score-card {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #3a3a3a;
+        }
+
+        .health-score-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .health-score-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #ccc;
+            text-transform: capitalize;
+        }
+
+        .health-trend {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 6px;
+        }
+
+        .trend-improving { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+        .trend-stable { background: rgba(148, 163, 184, 0.2); color: #94a3b8; }
+        .trend-degrading { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+
+        .health-score-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+
+        .health-score-bar {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease, background 0.5s ease;
+        }
+
+        .health-score-value {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .health-score-value.score-good { color: #4ade80; }
+        .health-score-value.score-warn { color: #fbbf24; }
+        .health-score-value.score-bad { color: #ef4444; }
+
+        .health-failure-date {
+            font-size: 10px;
+            color: #ef4444;
+            margin-top: 6px;
+        }
+
+        /* Correlation Warning Cards */
+        .correlation-card {
+            background: #1a1a1a;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-left: 4px solid #ef4444;
+        }
+
+        .correlation-card.confidence-high { border-left-color: #ef4444; }
+        .correlation-card.confidence-medium { border-left-color: #f97316; }
+        .correlation-card.confidence-low { border-left-color: #fbbf24; }
+
+        .correlation-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 6px;
+        }
+
+        .correlation-detail {
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 4px;
+        }
+
+        .correlation-confidence {
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+
+        /* Proactive Action Cards */
+        .action-card {
+            background: #1a1a1a;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-left: 4px solid #1FB6A6;
+        }
+
+        .action-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .action-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .urgency-badge {
+            font-size: 9px;
+            font-weight: 700;
+            padding: 3px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .urgency-immediate { background: rgba(239, 68, 68, 0.3); color: #ef4444; }
+        .urgency-high { background: rgba(249, 115, 22, 0.3); color: #f97316; }
+        .urgency-medium { background: rgba(251, 191, 36, 0.3); color: #fbbf24; }
+        .urgency-low { background: rgba(148, 163, 184, 0.3); color: #94a3b8; }
+
+        .action-reasoning {
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 6px;
+        }
+
+        .action-steps {
+            font-size: 11px;
+            color: #888;
+            padding-left: 16px;
+        }
+
+        .action-steps li {
+            margin-bottom: 3px;
+        }
+
+        /* Dashboard health summary */
+        .health-summary-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background: #1a1a1a;
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+
+        .health-summary-label {
+            font-size: 12px;
+            color: #aaa;
+        }
+
+        .health-summary-score {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        /* Ticket Grouping */
+        .ticket-group {
+            margin-bottom: 12px;
+        }
+
+        .ticket-group .ticket-item {
+            margin-bottom: 0;
+        }
+
+        .expand-btn {
+            background: #333;
+            border: none;
+            color: #1FB6A6;
+            font-size: 14px;
+            font-weight: 700;
+            width: 22px;
+            height: 22px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 8px;
+            transition: background 0.2s;
+            flex-shrink: 0;
+        }
+
+        .expand-btn:hover {
+            background: #444;
+        }
+
+        .ticket-count {
+            background: rgba(31, 182, 166, 0.2);
+            color: #1FB6A6;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 8px;
+            margin-left: 8px;
+        }
+
+        .ticket-occurrences {
+            display: none;
+            border-top: 1px solid #2a2a2a;
+            margin-top: 10px;
+            padding-top: 8px;
+        }
+
+        .ticket-occurrences.expanded {
+            display: block;
+        }
+
+        .occurrences-label {
+            font-size: 10px;
+            color: #555;
+            margin-bottom: 6px;
+            letter-spacing: 0.5px;
+        }
+
+        .occurrence-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 5px 0 5px 8px;
+            border-left: 2px solid #333;
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 2px;
+        }
+
+        .occurrence-item .occ-time {
+            color: #666;
+            min-width: 130px;
+        }
+
+        .occurrence-item .occ-status {
+            font-size: 9px;
+            font-weight: 600;
+        }
+
         /* Empty State */
         .empty-state {
             text-align: center;
@@ -609,6 +866,107 @@
 
         .empty-state-icon svg {
             stroke: #444;
+        }
+
+        /* Service Alert Banners */
+        .service-alerts-container {
+            margin-bottom: 15px;
+        }
+
+        .service-alert-banner {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 14px 18px;
+            border-radius: 10px;
+            margin-bottom: 8px;
+            animation: slideIn 0.3s ease;
+            position: relative;
+        }
+
+        .service-alert-banner.severity-outage {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+
+        .service-alert-banner.severity-major {
+            background: rgba(249, 115, 22, 0.15);
+            border: 1px solid rgba(249, 115, 22, 0.4);
+        }
+
+        .service-alert-banner.severity-minor {
+            background: rgba(251, 191, 36, 0.15);
+            border: 1px solid rgba(251, 191, 36, 0.4);
+        }
+
+        .alert-icon {
+            flex-shrink: 0;
+            width: 20px;
+            height: 20px;
+            margin-top: 1px;
+        }
+
+        .severity-outage .alert-icon { color: #ef4444; }
+        .severity-major .alert-icon { color: #f97316; }
+        .severity-minor .alert-icon { color: #fbbf24; }
+
+        .alert-content {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .alert-title {
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .severity-outage .alert-title { color: #ef4444; }
+        .severity-major .alert-title { color: #f97316; }
+        .severity-minor .alert-title { color: #fbbf24; }
+
+        .alert-message {
+            font-size: 12px;
+            color: #ccc;
+            line-height: 1.4;
+            margin-bottom: 6px;
+        }
+
+        .alert-meta {
+            display: flex;
+            gap: 12px;
+            font-size: 10px;
+            color: #888;
+        }
+
+        .alert-provider-badge {
+            font-size: 9px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            background: rgba(255,255,255,0.1);
+            color: #aaa;
+        }
+
+        .alert-dismiss {
+            position: absolute;
+            top: 10px;
+            right: 12px;
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .alert-dismiss:hover {
+            background: rgba(255,255,255,0.1);
+            color: #fff;
         }
     </style>
 </head>
@@ -684,26 +1042,29 @@
 
             <!-- Content Area -->
             <div class="content-area">
+                <!-- Service Outage Alerts (M365, Google Apps) -->
+                <div class="service-alerts-container" id="serviceAlertsContainer"></div>
+
                 <!-- Dashboard View -->
                 <div class="view active" id="dashboard-view">
                     <h1 class="page-title">Dashboard</h1>
                     
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-label">Issues Detected</div>
+                            <div class="stat-label">Total Tickets</div>
                             <div class="stat-value" id="issuesDetected">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Issues Resolved</div>
-                            <div class="stat-value" id="issuesResolved">0</div>
+                            <div class="stat-label">Open Tickets</div>
+                            <div class="stat-value" id="activeTickets">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Escalated</div>
+                            <div class="stat-value" id="issuesEscalated">0</div>
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Success Rate</div>
                             <div class="stat-value" id="successRate">0%</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-label">Active Tickets</div>
-                            <div class="stat-value" id="activeTickets">0</div>
                         </div>
                     </div>
 
@@ -730,9 +1091,9 @@
 
                         <div class="panel">
                             <div class="panel-header">
-                                <div class="panel-title">System Health</div>
+                                <div class="panel-title">Hardware Health</div>
                             </div>
-                            <div class="panel-body">
+                            <div class="panel-body" id="dashboardHealthSummary">
                                 <div class="health-item">
                                     <div class="health-label">Agent Service</div>
                                     <div class="health-status">
@@ -740,26 +1101,18 @@
                                         <span>Running</span>
                                     </div>
                                 </div>
-                                <div class="health-item">
-                                    <div class="health-label">Database</div>
-                                    <div class="health-status">
-                                        <span class="status-indicator-dot status-ok"></span>
-                                        <span>Connected</span>
-                                    </div>
+                                <div style="padding: 15px 0; text-align: center; color: #666; font-size: 11px;">
+                                    Collecting hardware data...
                                 </div>
-                                <div class="health-item">
-                                    <div class="health-label">AI Engine</div>
-                                    <div class="health-status">
-                                        <span class="status-indicator-dot status-ok"></span>
-                                        <span>Online</span>
-                                    </div>
-                                </div>
-                                <div class="health-item">
-                                    <div class="health-label">WMI Monitor</div>
-                                    <div class="health-status">
-                                        <span class="status-indicator-dot status-ok"></span>
-                                        <span>Active</span>
-                                    </div>
+                            </div>
+                        </div>
+                        <div class="panel" style="margin-top: 15px;">
+                            <div class="panel-header">
+                                <div class="panel-title">Proactive Actions</div>
+                            </div>
+                            <div class="panel-body" id="dashboardActions">
+                                <div style="padding: 15px 0; text-align: center; color: #666; font-size: 11px;">
+                                    No pending actions
                                 </div>
                             </div>
                         </div>
@@ -817,7 +1170,7 @@
                     
                     <div class="panel">
                         <div class="panel-header">
-                            <div class="panel-title">Recent 100 Tickets</div>
+                            <div class="panel-title">All Tickets (Grouped)</div>
                             <button class="btn-secondary" onclick="refreshData()">Refresh</button>
                         </div>
                         <div class="panel-body">
@@ -839,10 +1192,49 @@
                 <!-- Health View -->
                 <div class="view" id="health-view">
                     <h1 class="page-title">System Health</h1>
-                    
+
+                    <!-- Component Health Scores -->
+                    <div class="panel" style="margin-bottom: 20px;">
+                        <div class="panel-header">
+                            <div class="panel-title">Component Health Scores</div>
+                        </div>
+                        <div class="panel-body">
+                            <div class="health-scores-grid" id="healthScoresGrid">
+                                <div style="text-align: center; color: #666; font-size: 12px; padding: 30px; grid-column: 1 / -1;">
+                                    Collecting hardware health data...
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Active Correlations / Failure Warnings -->
+                    <div class="panel" style="margin-bottom: 20px;">
+                        <div class="panel-header">
+                            <div class="panel-title">Failure Predictions</div>
+                        </div>
+                        <div class="panel-body" id="correlationsPanel">
+                            <div style="text-align: center; color: #666; font-size: 12px; padding: 20px;">
+                                No active failure predictions
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Detected Patterns -->
+                    <div class="panel" style="margin-bottom: 20px;">
+                        <div class="panel-header">
+                            <div class="panel-title">Detected Patterns</div>
+                        </div>
+                        <div class="panel-body" id="patternsPanel">
+                            <div style="text-align: center; color: #666; font-size: 12px; padding: 20px;">
+                                No patterns detected yet
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Service Status -->
                     <div class="panel">
                         <div class="panel-header">
-                            <div class="panel-title">Component Status</div>
+                            <div class="panel-title">Service Status</div>
                         </div>
                         <div class="panel-body">
                             <div class="health-item">
@@ -860,24 +1252,10 @@
                                 </div>
                             </div>
                             <div class="health-item">
-                                <div class="health-label">Local AI Engine</div>
+                                <div class="health-label">Hardware Monitoring</div>
                                 <div class="health-status">
                                     <span class="status-indicator-dot status-ok"></span>
-                                    <span>Online</span>
-                                </div>
-                            </div>
-                            <div class="health-item">
-                                <div class="health-label">WMI Event Monitor</div>
-                                <div class="health-status">
-                                    <span class="status-indicator-dot status-ok"></span>
-                                    <span>Active</span>
-                                </div>
-                            </div>
-                            <div class="health-item">
-                                <div class="health-label">Autonomous Remediation</div>
-                                <div class="health-status">
-                                    <span class="status-indicator-dot status-ok"></span>
-                                    <span>Enabled</span>
+                                    <span>Active (17 monitors)</span>
                                 </div>
                             </div>
                         </div>
@@ -1009,7 +1387,7 @@
     </div>
 
     <script>
-        const { ipcRenderer } = require('electron');
+        const ipcRenderer = window.ipcRenderer;
 
         // Auto-refresh every 10 seconds
         setInterval(refreshData, 10000);
@@ -1025,26 +1403,146 @@
         function refreshData() {
             ipcRenderer.send('get-stats');
             ipcRenderer.send('get-tickets');
+            ipcRenderer.send('get-health-data');
+        }
+
+        // ============================================
+        // Service Outage Alerts (M365, Google Apps)
+        // ============================================
+        let activeServiceAlerts = [];
+
+        ipcRenderer.on('service-alert', (event, alert) => {
+            // Add or update alert
+            const idx = activeServiceAlerts.findIndex(a => a.id === alert.id);
+            if (idx >= 0) {
+                activeServiceAlerts[idx] = alert;
+            } else {
+                activeServiceAlerts.push(alert);
+            }
+            renderServiceAlerts();
+        });
+
+        ipcRenderer.on('service-alerts', (event, alerts) => {
+            // Bulk load (from initial-data or get-service-alerts)
+            activeServiceAlerts = alerts || [];
+            renderServiceAlerts();
+        });
+
+        ipcRenderer.on('service-alert-resolved', (event, data) => {
+            activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== data.id);
+            renderServiceAlerts();
+        });
+
+        function renderServiceAlerts() {
+            const container = document.getElementById('serviceAlertsContainer');
+            if (activeServiceAlerts.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            // Sort: outage first, then major, then minor
+            const severityOrder = { outage: 0, major: 1, minor: 2 };
+            const sorted = [...activeServiceAlerts].sort((a, b) =>
+                (severityOrder[a.severity] || 2) - (severityOrder[b.severity] || 2)
+            );
+
+            container.innerHTML = sorted.map(alert => {
+                const sevClass = 'severity-' + (alert.severity || 'minor');
+                const providerLabel = alert.provider === 'm365' ? 'M365' :
+                                     alert.provider === 'google' ? 'Google' :
+                                     (alert.provider || '').toUpperCase() || 'Cloud';
+                const time = alert.timestamp ? formatTimeAgo(alert.timestamp) : '';
+                const eta = alert.estimatedResolution
+                    ? 'Est. resolution: ' + new Date(alert.estimatedResolution).toLocaleTimeString()
+                    : '';
+
+                return `
+                    <div class="service-alert-banner ${sevClass}">
+                        <svg class="alert-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                            <line x1="12" y1="9" x2="12" y2="13"></line>
+                            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                        </svg>
+                        <div class="alert-content">
+                            <div class="alert-title">${alert.title || alert.service + ' Issue'}</div>
+                            <div class="alert-message">${alert.message || ''}</div>
+                            <div class="alert-meta">
+                                <span class="alert-provider-badge">${providerLabel}</span>
+                                ${alert.affectedServices ? '<span>Affected: ' + alert.affectedServices.join(', ') + '</span>' : ''}
+                                ${time ? '<span>' + time + '</span>' : ''}
+                                ${eta ? '<span>' + eta + '</span>' : ''}
+                            </div>
+                        </div>
+                        <button class="alert-dismiss" onclick="dismissAlert('${alert.id}')" title="Dismiss">&times;</button>
+                    </div>`;
+            }).join('');
+        }
+
+        function dismissAlert(alertId) {
+            activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== alertId);
+            renderServiceAlerts();
+            ipcRenderer.send('dismiss-alert', alertId);
         }
 
         // Statistics
         ipcRenderer.on('stats-data', (event, data) => {
             document.getElementById('issuesDetected').textContent = data.issuesDetected || 0;
-            document.getElementById('issuesResolved').textContent = data.issuesDetected - (data.issuesEscalated || 0);
+            document.getElementById('activeTickets').textContent = data.activeTickets || 0;
+            document.getElementById('issuesEscalated').textContent = data.issuesEscalated || 0;
             document.getElementById('successRate').textContent = (data.successRate || 0) + '%';
-            document.getElementById('activeTickets').textContent = data.issuesEscalated || 0;
         });
 
         // Tickets
         ipcRenderer.on('tickets-data', (event, tickets) => {
-            updateTicketsList('dashboardTickets', tickets.slice(0, 10));
-            updateTicketsList('allTickets', tickets);
+            const groups = groupTickets(tickets);
+            renderTicketGroups('dashboardTickets', groups.slice(0, 10));
+            renderTicketGroups('allTickets', groups);
         });
 
-        function updateTicketsList(containerId, tickets) {
+        function getDedupeKey(ticket) {
+            const type = ticket.type || ticket.issue_type || 'unknown';
+            if (type === 'system-event' && ticket.event_source && ticket.event_id) {
+                return type + '|' + ticket.event_source + '|' + ticket.event_id;
+            }
+            const desc = (ticket.description || '').substring(0, 80);
+            return type + '|' + desc;
+        }
+
+        function groupTickets(tickets) {
+            const map = {};
+            const order = [];
+            tickets.forEach(t => {
+                const key = getDedupeKey(t);
+                if (!map[key]) {
+                    map[key] = { key, tickets: [], count: 0, latest: t, earliest: t };
+                    order.push(key);
+                }
+                const g = map[key];
+                g.tickets.push(t);
+                g.count++;
+                const ts = new Date(t.timestamp || t.created_at).getTime();
+                if (ts > new Date(g.latest.timestamp || g.latest.created_at).getTime()) g.latest = t;
+                if (ts < new Date(g.earliest.timestamp || g.earliest.created_at).getTime()) g.earliest = t;
+            });
+            // Sort groups by most recent occurrence
+            return order.map(k => map[k]).sort((a, b) => {
+                return new Date(b.latest.timestamp || b.latest.created_at) - new Date(a.latest.timestamp || a.latest.created_at);
+            });
+        }
+
+        function toggleOccurrences(groupKey) {
+            const el = document.getElementById('occ-' + groupKey);
+            const btn = document.getElementById('btn-' + groupKey);
+            if (el) {
+                const expanded = el.classList.toggle('expanded');
+                if (btn) btn.textContent = expanded ? '\u2212' : '+';
+            }
+        }
+
+        function renderTicketGroups(containerId, groups) {
             const container = document.getElementById(containerId);
-            
-            if (tickets.length === 0) {
+
+            if (groups.length === 0) {
                 container.innerHTML = `
                     <div class="empty-state">
                         <div class="empty-state-icon">
@@ -1054,31 +1552,97 @@
                             </svg>
                         </div>
                         <div>No tickets found</div>
-                    </div>
-                `;
+                    </div>`;
                 return;
             }
 
-            container.innerHTML = tickets.map(ticket => {
-                const status = ticket.result === 'success' ? 'success' : 
+            container.innerHTML = groups.map((group, gi) => {
+                const ticket = group.latest;
+                const status = ticket.result === 'success' ? 'success' :
+                              ticket.status === 'resolved' ? 'success' :
                               ticket.escalated ? 'escalated' : 'pending';
-                
                 const statusText = ticket.result === 'success' ? 'Resolved' :
-                                  ticket.escalated ? 'Escalated' : 'In Progress';
-                
-                const time = formatTimeAgo(ticket.created_at);
+                                  ticket.status === 'resolved' ? 'Resolved' :
+                                  ticket.status === 'failed' ? 'Failed' :
+                                  ticket.escalated ? 'Escalated' : 'Open';
+                const time = formatTimeAgo(ticket.timestamp || ticket.created_at);
+                const ticketType = formatTicketType(ticket.type || ticket.issue_type || 'unknown');
+                const desc = formatDescription(ticket.description || 'No description');
+                const source = ticket.source ? `<span style="font-size:9px;color:#555;margin-left:8px;">${ticket.source}</span>` : '';
+                const countBadge = group.count > 1 ? `<span class="ticket-count">&times;${group.count}</span>` : '';
+                const gid = containerId + '-' + gi;
+
+                let occurrencesHtml = '';
+                if (group.count > 1) {
+                    const occRows = group.tickets.map(t => {
+                        const ts = t.timestamp || t.created_at;
+                        const d = new Date(ts);
+                        const timeStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0') + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+                        const s = t.result === 'success' ? 'Resolved' :
+                                  t.status === 'resolved' ? 'Resolved' :
+                                  t.status === 'failed' ? 'Failed' :
+                                  t.escalated ? 'Escalated' : 'Open';
+                        return `<div class="occurrence-item"><span class="occ-time">${timeStr}</span><span class="occ-status">${s}</span></div>`;
+                    }).join('');
+                    occurrencesHtml = `
+                        <div class="ticket-occurrences" id="occ-${gid}">
+                            <div class="occurrences-label">Occurrences (${group.count})</div>
+                            ${occRows}
+                        </div>`;
+                }
+
+                const expandBtn = group.count > 1 ? `<button class="expand-btn" id="btn-${gid}" onclick="toggleOccurrences('${gid}')">+</button>` : '<span style="display:inline-block;width:30px;"></span>';
 
                 return `
-                    <div class="ticket-item">
-                        <div class="ticket-header">
-                            <span class="ticket-type">${ticket.issue_type || 'Issue'}</span>
-                            <span class="ticket-time">${time}</span>
+                    <div class="ticket-group">
+                        <div class="ticket-item">
+                            <div class="ticket-header">
+                                <span class="ticket-type" style="display:flex;align-items:center;">
+                                    ${expandBtn}${ticketType}${countBadge}${source}
+                                </span>
+                                <span class="ticket-time">${time}</span>
+                            </div>
+                            <div class="ticket-description">${desc}</div>
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <span class="ticket-status status-${status}">${statusText}</span>
+                                ${ticket.computer_name ? '<span style="font-size:9px;color:#555;">' + ticket.computer_name + '</span>' : ''}
+                                ${ticket.runbook_id ? '<span style="font-size:9px;color:#1FB6A6;">' + ticket.runbook_id + '</span>' : ''}
+                            </div>
+                            ${occurrencesHtml}
                         </div>
-                        <div class="ticket-description">${ticket.description || 'No description'}</div>
-                        <span class="ticket-status status-${status}">${statusText}</span>
-                    </div>
-                `;
+                    </div>`;
             }).join('');
+        }
+
+        function formatTicketType(type) {
+            const typeMap = {
+                'system-event': 'System Event',
+                'manual-review': 'Manual Review',
+                'monitoring': 'Monitoring Alert',
+                'remediation': 'Remediation',
+                'hardware': 'Hardware Issue',
+                'performance': 'Performance',
+                'disk': 'Disk Issue',
+                'service': 'Service Issue',
+                'network': 'Network Issue',
+                'application': 'Application Error',
+                'security': 'Security Alert'
+            };
+            return typeMap[type] || type.replace(/-/g, ' ').replace(/(^|\s)\w/g, c => c.toUpperCase());
+        }
+
+        function formatDescription(desc) {
+            // Clean up verbose descriptions
+            let clean = desc
+                .replace(/^\[ESCALATED\]\s*/i, '')
+                .replace(/^No matching runbook available:\s*/i, '')
+                .replace(/^Manual review required:\s*/i, '')
+                .replace(/^Remediation (?:succeeded|failed):\s*/i, '');
+            // Truncate long descriptions
+            if (clean.length > 150) {
+                clean = clean.substring(0, 147) + '...';
+            }
+            return clean;
         }
 
         function formatTimeAgo(dateString) {
@@ -1221,6 +1785,155 @@
             } else {
                 console.log('No saved settings found');
             }
+        }
+
+        // Health Data
+        ipcRenderer.on('health-data', (event, data) => {
+            renderHealthScores(data.healthScores || {});
+            renderCorrelations(data.correlations || {});
+            renderPatterns(data.patterns || []);
+            renderDashboardHealth(data.healthScores || {});
+            renderDashboardActions(data.proactiveActions || []);
+        });
+
+        function renderHealthScores(scores) {
+            const grid = document.getElementById('healthScoresGrid');
+            const keys = Object.keys(scores);
+            if (keys.length === 0) {
+                grid.innerHTML = '<div style="text-align:center;color:#666;font-size:12px;padding:30px;grid-column:1/-1;">Collecting hardware health data...</div>';
+                return;
+            }
+            grid.innerHTML = keys.map(key => {
+                const s = scores[key];
+                const score = s.score != null ? s.score : 100;
+                const cls = score > 70 ? 'score-good' : score > 40 ? 'score-warn' : 'score-bad';
+                const barColor = score > 70 ? '#4ade80' : score > 40 ? '#fbbf24' : '#ef4444';
+                const trendCls = s.trend === 'improving' ? 'trend-improving' : s.trend === 'degrading' ? 'trend-degrading' : 'trend-stable';
+                const trendLabel = s.trend === 'improving' ? '&#9650; Improving' : s.trend === 'degrading' ? '&#9660; Degrading' : '&#8212; Stable';
+                const name = key.replace(':', ' ').replace(/(^|\s)\w/g, c => c.toUpperCase());
+                let failureHtml = '';
+                if (s.estimatedFailureDate) {
+                    const d = new Date(s.estimatedFailureDate);
+                    failureHtml = '<div class="health-failure-date">Est. failure: ' + d.toLocaleDateString() + '</div>';
+                }
+                return `
+                    <div class="health-score-card">
+                        <div class="health-score-header">
+                            <span class="health-score-label">${name}</span>
+                            <span class="health-trend ${trendCls}">${trendLabel}</span>
+                        </div>
+                        <div class="health-score-value ${cls}">${score}</div>
+                        <div class="health-score-bar-bg">
+                            <div class="health-score-bar" style="width:${score}%;background:${barColor};"></div>
+                        </div>
+                        ${failureHtml}
+                    </div>`;
+            }).join('');
+        }
+
+        function renderCorrelations(correlations) {
+            const panel = document.getElementById('correlationsPanel');
+            const keys = Object.keys(correlations);
+            if (keys.length === 0) {
+                panel.innerHTML = '<div style="text-align:center;color:#666;font-size:12px;padding:20px;">No active failure predictions</div>';
+                return;
+            }
+            panel.innerHTML = keys.map(key => {
+                const c = correlations[key];
+                const conf = c.confidence || 0;
+                const confCls = conf >= 0.8 ? 'confidence-high' : conf >= 0.5 ? 'confidence-medium' : 'confidence-low';
+                const confPct = Math.round(conf * 100);
+                const confColor = conf >= 0.8 ? '#ef4444' : conf >= 0.5 ? '#f97316' : '#fbbf24';
+                let failHtml = '';
+                if (c.estimatedFailureDate) {
+                    failHtml = '<div class="correlation-detail">Est. failure: ' + new Date(c.estimatedFailureDate).toLocaleDateString() + '</div>';
+                }
+                return `
+                    <div class="correlation-card ${confCls}">
+                        <div class="correlation-title">${c.category || key}</div>
+                        <div class="correlation-detail">${c.recommendedAction || 'Investigation recommended'}</div>
+                        ${failHtml}
+                        <span class="correlation-confidence" style="background:${confColor}33;color:${confColor};">${confPct}% confidence</span>
+                    </div>`;
+            }).join('');
+        }
+
+        function renderPatterns(patterns) {
+            const panel = document.getElementById('patternsPanel');
+            if (!patterns || patterns.length === 0) {
+                panel.innerHTML = '<div style="text-align:center;color:#666;font-size:12px;padding:20px;">No patterns detected yet</div>';
+                return;
+            }
+            panel.innerHTML = patterns.map(p => {
+                const urgCls = 'urgency-' + (p.urgency || 'low');
+                const trendIcon = p.trend === 'increasing' ? '&#9650;' : p.trend === 'decreasing' ? '&#9660;' : '&#8212;';
+                return `
+                    <div class="action-card">
+                        <div class="action-header">
+                            <span class="action-title">${p.signalId || p.patternId}</span>
+                            <span class="urgency-badge ${urgCls}">${p.urgency || 'low'}</span>
+                        </div>
+                        <div class="action-reasoning">${p.recommendation || ''}</div>
+                        <div style="font-size:10px;color:#666;">
+                            ${p.occurrenceCount || 0} occurrences &middot; ${trendIcon} ${p.trend || 'stable'} &middot; ${(p.frequency || 0).toFixed(1)}/day
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        function renderDashboardHealth(scores) {
+            const container = document.getElementById('dashboardHealthSummary');
+            const keys = Object.keys(scores);
+
+            // Always show agent running status
+            let html = `
+                <div class="health-item">
+                    <div class="health-label">Agent Service</div>
+                    <div class="health-status">
+                        <span class="status-indicator-dot status-ok"></span>
+                        <span>Running</span>
+                    </div>
+                </div>`;
+
+            if (keys.length === 0) {
+                html += '<div style="padding:10px 0;text-align:center;color:#666;font-size:11px;">Collecting hardware data...</div>';
+            } else {
+                keys.forEach(key => {
+                    const s = scores[key];
+                    const score = s.score != null ? s.score : 100;
+                    const dotCls = score > 70 ? 'status-ok' : score > 40 ? 'status-warning' : 'status-error';
+                    const name = key.replace(':', ' ').replace(/(^|\s)\w/g, c => c.toUpperCase());
+                    const cls = score > 70 ? 'score-good' : score > 40 ? 'score-warn' : 'score-bad';
+                    html += `
+                        <div class="health-summary-item">
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <span class="status-indicator-dot ${dotCls}"></span>
+                                <span class="health-summary-label">${name}</span>
+                            </div>
+                            <span class="health-summary-score ${cls}">${score}</span>
+                        </div>`;
+                });
+            }
+            container.innerHTML = html;
+        }
+
+        function renderDashboardActions(actions) {
+            const container = document.getElementById('dashboardActions');
+            if (!actions || actions.length === 0) {
+                container.innerHTML = '<div style="padding:15px 0;text-align:center;color:#666;font-size:11px;">No pending actions</div>';
+                return;
+            }
+            container.innerHTML = actions.slice(0, 5).map(a => {
+                const urgCls = 'urgency-' + (a.urgency || 'low');
+                return `
+                    <div class="action-card">
+                        <div class="action-header">
+                            <span class="action-title">${a.title || 'Action'}</span>
+                            <span class="urgency-badge ${urgCls}">${a.urgency || 'low'}</span>
+                        </div>
+                        <div class="action-reasoning">${a.reasoning || ''}</div>
+                    </div>`;
+            }).join('');
         }
 
         function minimizeWindow() {

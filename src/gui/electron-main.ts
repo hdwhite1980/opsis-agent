@@ -34,8 +34,9 @@ function createWindow() {
     width: 1200,
     height: 800,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
     },
     icon: getIcon('icon.ico') || getIcon('icon.png') || getIcon('opsis-logo-icon.png'),
     show: false // Don't show until ready
@@ -71,7 +72,7 @@ function getIcon(iconName: string) {
   if (fs.existsSync(iconPath)) {
     return nativeImage.createFromPath(iconPath);
   }
-  return nativeImage.createEmpty();
+  return null;
 }
 
 function createTray() {
@@ -92,7 +93,7 @@ function createTray() {
         label: 'View Logs',
         click: () => {
           const { shell } = require('electron');
-          const logPath = path.join(app.getPath('userData'), '..', '..', 'logs', 'agent.log');
+          const logPath = path.join(__dirname, '..', '..', 'logs', 'service.log');
           if (fs.existsSync(logPath)) {
             shell.openPath(logPath);
           }
@@ -103,7 +104,11 @@ function createTray() {
         label: 'Restart Service',
         click: () => {
           const { exec } = require('child_process');
-          exec('net stop "OPSIS Agent Service" && net start "OPSIS Agent Service"');
+          exec('net stop "OPSIS Agent Service" && net start "OPSIS Agent Service"', (err) => {
+            if (err) {
+              console.error('Failed to restart service:', err);
+            }
+          });
         }
       },
       { type: 'separator' },
@@ -143,7 +148,6 @@ app.on('activate', () => {
 
 function connectToService() {
   const pipeName = '\\\\.\\pipe\\opsis-agent-service';
-  const fs = require('fs');
   const logPath = path.join(__dirname, '..', '..', 'logs', 'gui-connection.log');
   
   const log = (msg: string) => {
@@ -213,13 +217,24 @@ function handleServiceMessage(message: any) {
   
   // Transform service messages to match what GUI expects
   if (message.type === 'initial-data' || message.type === 'ticket-update') {
-    // Send tickets
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('tickets-data', message.data.tickets || []);
-      
-      // Also send stats if available
+
       if (message.data.stats) {
         mainWindow.webContents.send('stats-data', message.data.stats);
+      }
+      // Forward health data if present
+      if (message.data.healthScores || message.data.correlations || message.data.patterns || message.data.proactiveActions) {
+        mainWindow.webContents.send('health-data', {
+          healthScores: message.data.healthScores || {},
+          correlations: message.data.correlations || {},
+          patterns: message.data.patterns || [],
+          proactiveActions: message.data.proactiveActions || []
+        });
+      }
+      // Forward service alerts if present (from initial-data)
+      if (message.data.serviceAlerts && message.data.serviceAlerts.length > 0) {
+        mainWindow.webContents.send('service-alerts', message.data.serviceAlerts);
       }
     }
   } else if (message.type === 'tickets') {
@@ -232,9 +247,34 @@ function handleServiceMessage(message: any) {
       }
     }
   } else if (message.type === 'stats') {
-    // Stats response
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('stats-data', message.data);
+    }
+  } else if (message.type === 'health-data') {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('health-data', message.data);
+    }
+  } else if (message.type === 'service-alert') {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('service-alert', message.data);
+    }
+    // Show tray balloon for visibility even when minimized
+    if (tray && message.data) {
+      const severity = message.data.severity === 'outage' ? 'OUTAGE' :
+                       message.data.severity === 'major' ? 'Issue' : 'Advisory';
+      tray.displayBalloon({
+        title: `${message.data.service || 'Service'} ${severity}`,
+        content: message.data.message || message.data.title || 'A cloud service issue may affect you.'
+      });
+    }
+  } else if (message.type === 'service-alert-resolved') {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('service-alert-resolved', message.data);
+    }
+  } else if (message.type === 'service-alerts') {
+    // Response to get-service-alerts request
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('service-alerts', message.data);
     }
   } else {
     // Forward other messages as-is
@@ -265,6 +305,18 @@ ipcMain.on('submit-manual-ticket', (_event: any, ticketData: any) => {
     type: 'submit-manual-ticket',
     data: ticketData
   });
+});
+
+ipcMain.on('get-health-data', (_event: any) => {
+  sendToService({ type: 'get-health-data' });
+});
+
+ipcMain.on('get-service-alerts', (_event: any) => {
+  sendToService({ type: 'get-service-alerts' });
+});
+
+ipcMain.on('dismiss-alert', (_event: any, alertId: string) => {
+  sendToService({ type: 'dismiss-alert', data: { alertId } });
 });
 
 ipcMain.on('update-settings', (_event: any, settings: any) => {

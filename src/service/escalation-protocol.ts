@@ -38,7 +38,7 @@ export interface EscalationPayload {
 }
 
 export interface ServerDecision {
-  decision_type: 'execute_A' | 'execute_B' | 'request_approval' | 'advisory_only' | 'block';
+  decision_type: 'execute_A' | 'execute_B' | 'request_approval' | 'advisory_only' | 'block' | 'ignore';
   recommended_playbook_id?: string;
   playbook_version?: string;
   parameters?: Record<string, any>;
@@ -48,6 +48,10 @@ export interface ServerDecision {
   verification_requirements?: string[];
   cooldown_override?: boolean;
   approval_token?: string;
+  ignore_target?: string;
+  ignore_category?: 'services' | 'processes' | 'signatures';
+  reason?: string;
+  signature_id?: string;
 }
 
 export class EscalationProtocol {
