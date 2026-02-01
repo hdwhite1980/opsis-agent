@@ -480,13 +480,18 @@ export class SystemMonitor {
       const serviceArray = Array.isArray(services) ? services : services ? [services] : [];
 
       for (const service of serviceArray) {
-        // Skip services that are intentionally stopped
-        if (this.isKnownStoppedService(service.Name)) continue;
+        const priority = this.getServicePriority(service.Name);
+
+        // Optional services: log only, don't escalate
+        if (priority === 'optional') {
+          this.logger.debug('Skipping optional service', { name: service.Name, priority });
+          continue;
+        }
 
         this.emitSignal({
           id: `service-stopped-${service.Name}`,
           category: 'services',
-          severity: 'warning',
+          severity: priority === 'critical' ? 'warning' : 'warning',
           metric: 'service_status',
           value: 'stopped',
           message: `Service ${service.DisplayName || service.Name} stopped (StartType: ${service.StartType})`,
@@ -495,9 +500,10 @@ export class SystemMonitor {
             serviceName: service.Name,
             displayName: service.DisplayName,
             status: service.Status,
-            startType: service.StartType
+            startType: service.StartType,
+            priority
           },
-          eventId: 7034, // Match Windows Event ID
+          eventId: 7034,
           eventSource: 'Service Control Manager'
         });
       }
@@ -507,15 +513,25 @@ export class SystemMonitor {
     }
   }
 
-  private isKnownStoppedService(name: string): boolean {
-    // Services that are commonly stopped and not critical
-    const knownStopped = [
-      'WSearch',  // Windows Search (often disabled)
-      'TabletInputService',
-      'Fax',
-      'RemoteRegistry'
+  private getServicePriority(name: string): 'critical' | 'normal' | 'optional' {
+    const critical = [
+      'Spooler', 'W32Time', 'Dnscache', 'LanmanWorkstation', 'LanmanServer',
+      'BITS', 'wuauserv', 'gpsvc', 'Schedule', 'EventLog', 'Winmgmt',
+      'CryptSvc', 'RpcSs', 'RpcEptMapper', 'DcomLaunch', 'BFE', 'mpssvc'
     ];
-    return knownStopped.includes(name);
+    const optional = [
+      'edgeupdate', 'edgeupdatem', 'MapsBroker', 'TabletInputService',
+      'Fax', 'RemoteRegistry', 'WSearch', 'GoogleUpdate', 'AdobeUpdate',
+      'DiagTrack', 'dmwappushservice', 'sppsvc', 'SysMain', 'WbioSrvc',
+      'WerSvc', 'wisvc', 'InstallService', 'uhssvc', 'UsoSvc'
+    ];
+    if (critical.includes(name)) return 'critical';
+    if (optional.includes(name)) return 'optional';
+    return 'normal';
+  }
+
+  private isKnownStoppedService(name: string): boolean {
+    return this.getServicePriority(name) === 'optional';
   }
 
   // ============================================

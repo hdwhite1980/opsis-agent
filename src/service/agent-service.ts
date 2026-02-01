@@ -166,6 +166,11 @@ class OPSISAgentService {
   }> = [];
   private pendingEscalations: Map<string, DeviceSignature> = new Map(); // signature_id -> signature
   private pendingRunbooks: Map<string, RunbookMatch> = new Map(); // signature_id -> matched runbook
+  private escalationCooldowns: Map<string, number> = new Map(); // signature_id -> last escalated timestamp
+  private readonly ESCALATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+  private escalationBatch: Array<{signature: DeviceSignature, runbook: RunbookMatch | null}> = [];
+  private batchTimer: NodeJS.Timeout | null = null;
+  private readonly BATCH_FLUSH_MS = 10000; // 10 seconds
 
   // Reconnect backoff state
   private reconnectAttempts: number = 0;
@@ -664,6 +669,11 @@ class OPSISAgentService {
 
     if (this.updateCheckTimer) {
       clearInterval(this.updateCheckTimer);
+    }
+
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.flushEscalationBatch(); // Send any pending batch before shutdown
     }
 
     if (this.heartbeatTimer) {
@@ -1733,18 +1743,22 @@ class OPSISAgentService {
       return;
     }
 
+    // Deduplication: skip if same signature was escalated within cooldown window
+    const now = Date.now();
+    const lastEscalated = this.escalationCooldowns.get(signature.signature_id);
+    if (lastEscalated && (now - lastEscalated) < this.ESCALATION_COOLDOWN_MS) {
+      this.logger.debug('Skipping duplicate escalation (cooldown active)', {
+        signature_id: signature.signature_id,
+        cooldown_remaining_ms: this.ESCALATION_COOLDOWN_MS - (now - lastEscalated)
+      });
+      return;
+    }
+
     this.logger.info('Escalating to server (Tier 2)', {
       signature_id: signature.signature_id,
       has_runbook: !!runbook,
       confidence: signature.confidence_local
     });
-
-    // Build escalation payload
-    const escalationPayload = this.escalationProtocol.buildEscalationPayload(
-      signature,
-      runbook,
-      this.recentActions
-    );
 
     // Store pending escalation and matched runbook
     this.pendingEscalations.set(signature.signature_id, signature);
@@ -1752,26 +1766,88 @@ class OPSISAgentService {
       this.pendingRunbooks.set(signature.signature_id, runbook);
     }
 
-    // Send via WebSocket if connected
+    // Mark as escalated for dedup cooldown
+    this.escalationCooldowns.set(signature.signature_id, now);
+
+    // If not connected, fall back to manual ticket immediately
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.logger.warn('WebSocket not connected, creating manual ticket', {
+        signature_id: signature.signature_id
+      });
+      this.createManualTicket(signature);
+      return;
+    }
+
+    // Check if critical severity — flush immediately
+    const isCritical = signature.severity === 'critical' || signature.severity === 'high';
+    if (isCritical) {
+      this.sendEscalationNow(signature, runbook);
+      return;
+    }
+
+    // Batch: queue for batched send
+    this.escalationBatch.push({ signature, runbook });
+    if (!this.batchTimer) {
+      this.batchTimer = setTimeout(() => this.flushEscalationBatch(), this.BATCH_FLUSH_MS);
+    }
+  }
+
+  private sendEscalationNow(signature: DeviceSignature, runbook: RunbookMatch | null): void {
+    const escalationPayload = this.escalationProtocol.buildEscalationPayload(
+      signature,
+      runbook,
+      this.recentActions
+    );
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // FIXED: Spread the escalation payload at root level with type field
       this.ws.send(JSON.stringify({
         type: 'escalation',
         ...escalationPayload
       }));
-
       this.logger.info('Escalation sent to server', {
         signature_id: escalationPayload.signature_id,
         requested_outcome: escalationPayload.requested_outcome
       });
-    } else {
-      this.logger.warn('WebSocket not connected, creating manual ticket', {
-        signature_id: signature.signature_id
-      });
-      
-      // Fallback: Create manual ticket
-      this.createManualTicket(signature);
     }
+  }
+
+  private flushEscalationBatch(): void {
+    this.batchTimer = null;
+    if (this.escalationBatch.length === 0) return;
+
+    const batch = this.escalationBatch.splice(0);
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.logger.warn('WebSocket not connected, creating manual tickets for batch', {
+        batch_size: batch.length
+      });
+      for (const item of batch) {
+        this.createManualTicket(item.signature);
+      }
+      return;
+    }
+
+    // Single item — send as regular escalation
+    if (batch.length === 1) {
+      this.sendEscalationNow(batch[0].signature, batch[0].runbook);
+      return;
+    }
+
+    // Multiple items — send as batch
+    const escalations = batch.map(item =>
+      this.escalationProtocol.buildEscalationPayload(item.signature, item.runbook, this.recentActions)
+    );
+
+    this.ws.send(JSON.stringify({
+      type: 'batch_escalation',
+      escalations,
+      batch_size: escalations.length
+    }));
+
+    this.logger.info('Batch escalation sent to server', {
+      batch_size: escalations.length,
+      signature_ids: escalations.map(e => e.signature_id)
+    });
   }
 
   // NEW METHOD: Escalate System Issue to Server
