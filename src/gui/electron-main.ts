@@ -23,9 +23,9 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(() => {
-    connectToService();
     createWindow();
     createTray();
+    connectToService();
   });
 }
 
@@ -34,9 +34,8 @@ function createWindow() {
     width: 1200,
     height: 800,
     webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: path.join(__dirname, 'preload.js')
+      nodeIntegration: true,
+      contextIsolation: false
     },
     icon: getIcon('icon.ico') || getIcon('icon.png') || getIcon('opsis-logo-icon.png'),
     show: false // Don't show until ready
@@ -104,7 +103,7 @@ function createTray() {
         label: 'Restart Service',
         click: () => {
           const { exec } = require('child_process');
-          exec('net stop "OPSIS Agent Service" && net start "OPSIS Agent Service"', (err) => {
+          exec('net stop "OPSIS Agent Service" && net start "OPSIS Agent Service"', (err: any) => {
             if (err) {
               console.error('Failed to restart service:', err);
             }
@@ -146,56 +145,66 @@ app.on('activate', () => {
 // SERVICE COMMUNICATION (IPC over Named Pipe)
 // ============================================
 
-function connectToService() {
-  const pipeName = '\\\\.\\pipe\\opsis-agent-service';
-  const logPath = path.join(__dirname, '..', '..', 'logs', 'gui-connection.log');
-  
-  const log = (msg: string) => {
-    const timestamp = new Date().toISOString();
-    const logMsg = `[${timestamp}] ${msg}\n`;
-    console.log(msg);
-    try {
-      fs.appendFileSync(logPath, logMsg);
-    } catch (err) {
-      console.error('Failed to write log:', err);
-    }
-  };
-  
-  log(`Attempting to connect to: ${pipeName}`);
-  let buffer = '';
-  
-  serviceConnection = net.connect(pipeName, () => {
-    log('Connected to OPSIS Agent Service');
-  });
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let isConnected = false;
 
-  serviceConnection.on('data', (data: Buffer) => {
+function scheduleReconnect(reason: string) {
+  isConnected = false;
+  if (reconnectTimer) return;
+  console.log(`${reason}, reconnecting in 5s...`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToService();
+  }, 5000);
+}
+
+function connectToService() {
+  const ipcPort = 19847;
+  // Clean up any existing connection
+  if (serviceConnection) {
+    try { serviceConnection.destroy(); } catch (e) {}
+    serviceConnection = null;
+  }
+  console.log(`Attempting to connect to localhost:${ipcPort}`);
+  let buffer = '';
+  const conn = net.connect({ port: ipcPort, host: '127.0.0.1' }, () => {
+    console.log('Connected to OPSIS Agent Service');
+    isConnected = true;
+    // Request data immediately after connecting
+    setTimeout(() => {
+      if (conn.writable) {
+        console.log('Requesting initial data from service...');
+        conn.write(JSON.stringify({ type: 'get-stats' }) + '\n');
+        conn.write(JSON.stringify({ type: 'get-tickets' }) + '\n');
+        conn.write(JSON.stringify({ type: 'get-health-data' }) + '\n');
+      }
+    }, 500);
+  });
+  serviceConnection = conn;
+  conn.on('data', (data: Buffer) => {
     buffer += data.toString();
-    
-    // Process complete messages (newline-delimited)
     const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // Keep incomplete message in buffer
-    
+    buffer = lines.pop() || '';
     for (const line of lines) {
       if (line.trim()) {
         try {
           const message = JSON.parse(line);
           handleServiceMessage(message);
         } catch (err) {
-          log(`Error parsing service message: ${err}`);
+          console.error(`Error parsing service message: ${err}`);
         }
       }
     }
   });
-
-  serviceConnection.on('error', (err: Error) => {
-    log(`Service connection error: ${err.message}`);
-    // Retry connection after 5 seconds
-    setTimeout(connectToService, 5000);
+  conn.on('error', (err: Error) => {
+    if (serviceConnection === conn) {
+      scheduleReconnect(`Service connection error: ${err.message}`);
+    }
   });
-
-  serviceConnection.on('close', () => {
-    log('Disconnected from service, reconnecting...');
-    setTimeout(connectToService, 5000);
+  conn.on('close', () => {
+    if (serviceConnection === conn) {
+      scheduleReconnect('Disconnected from service');
+    }
   });
 }
 

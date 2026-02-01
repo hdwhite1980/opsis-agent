@@ -1387,7 +1387,7 @@
     </div>
 
     <script>
-        const ipcRenderer = window.ipcRenderer;
+        const { ipcRenderer } = require('electron');
 
         // Auto-refresh every 10 seconds
         setInterval(refreshData, 10000);

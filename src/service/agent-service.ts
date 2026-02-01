@@ -12,6 +12,7 @@ import { TicketDatabase, Ticket } from './ticket-database';
 import { SystemMonitor, SystemSignal } from './system-monitor';
 import { IPCServer } from './ipc-server';
 import { RemediationMemory } from './remediation-memory';
+import { GuiLauncher } from './gui-launcher';
 import { PatternDetector } from './pattern-detector';
 
 // NEW IMPORTS - Tiered Intelligence Components
@@ -146,6 +147,7 @@ class OPSISAgentService {
   private systemMonitor: SystemMonitor;
   private ticketDb: TicketDatabase;
   private ipcServer: IPCServer;
+  private guiLauncher: GuiLauncher;
   private remediationMemory: RemediationMemory;
   private serviceAlerts: any[] = [];
   private patternDetector: PatternDetector;
@@ -192,6 +194,9 @@ class OPSISAgentService {
     // Initialize logger
     this.logger = getServiceLogger(this.logsDir);
     
+    // Initialize GUI launcher
+    this.guiLauncher = new GuiLauncher(this.logger, path.join(__dirname, '..', '..'));
+
     // Initialize ticket database
     const dbPath = path.join(this.dataDir, 'tickets.json');
     this.ticketDb = new TicketDatabase(this.logger, dbPath);
@@ -240,28 +245,32 @@ class OPSISAgentService {
     
     // Send initial data when GUI connects
     this.ipcServer.onClientConnected((socket) => {
-      const tickets = this.ticketDb.getTickets(100);
-      const stats = this.ticketDb.getStatistics();
-      
-      const guiStats = {
-        issuesDetected: stats.totalTickets,
-        issuesEscalated: stats.escalatedTickets,
-        successRate: stats.successRate,
-        activeTickets: stats.openTickets
-      };
-      
-      this.ipcServer.sendToClient(socket, {
-        type: 'initial-data',
-        data: {
-          tickets,
-          stats: guiStats,
-          healthScores: this.patternDetector.getHealthScores(),
-          correlations: this.patternDetector.getCorrelations(),
-          patterns: this.patternDetector.getDetectedPatterns(),
-          proactiveActions: this.patternDetector.getPendingActions(),
-          serviceAlerts: this.serviceAlerts
-        }
-      });
+      try {
+        const tickets = this.ticketDb.getTickets(100);
+        const stats = this.ticketDb.getStatistics();
+
+        const guiStats = {
+          issuesDetected: stats.totalTickets,
+          issuesEscalated: stats.escalatedTickets,
+          successRate: stats.successRate,
+          activeTickets: stats.openTickets
+        };
+
+        this.ipcServer.sendToClient(socket, {
+          type: 'initial-data',
+          data: {
+            tickets,
+            stats: guiStats,
+            healthScores: this.patternDetector.getHealthScores(),
+            correlations: this.patternDetector.getCorrelations(),
+            patterns: this.patternDetector.getDetectedPatterns(),
+            proactiveActions: this.patternDetector.getPendingActions(),
+            serviceAlerts: this.serviceAlerts
+          }
+        });
+      } catch (error) {
+        this.logger.error('Error sending initial data to GUI', error);
+      }
     });
   }
 
@@ -594,6 +603,9 @@ class OPSISAgentService {
     this.ipcServer.start();
     this.log('IPC server started');
 
+    // Launch GUI console in user session
+    this.guiLauncher.launchGui();
+
     // Start event monitoring
     this.eventMonitor.startMonitoring(30);
     this.log('Event monitoring started');
@@ -624,7 +636,12 @@ class OPSISAgentService {
 
   public stop(): void {
     this.log('OPSIS Agent Service Stopping...');
-    
+
+    // Kill GUI before stopping IPC
+    if (this.guiLauncher) {
+      this.guiLauncher.killGui();
+    }
+
     if (this.ipcServer) {
       this.ipcServer.stop();
     }
@@ -862,6 +879,12 @@ class OPSISAgentService {
           break;
 
         case 'advisory':
+          // Log full advisory payload for debugging
+          this.logger.info('Received advisory from server', {
+            message: data.message,
+            data: data.data,
+            raw: JSON.stringify(data)
+          });
           // Server advisory response (e.g. for Class C escalations)
           if (data.data && data.data.decision_type) {
             this.handleServerDecision(data.data);
@@ -873,7 +896,7 @@ class OPSISAgentService {
           break;
 
         default:
-          this.log(`Unknown message type: ${data.type}`);
+          this.logger.warn('Unknown message type', { type: data.type, raw: JSON.stringify(data) });
       }
     } catch (error) {
       this.log('Error handling server message', error);

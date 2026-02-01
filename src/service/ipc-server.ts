@@ -16,9 +16,12 @@ export class IPCServer {
   private messageHandlers: Map<string, (data: any, socket: net.Socket) => void> = new Map();
   private onClientConnectedCallback?: (socket: net.Socket) => void;
 
-  constructor(logger: Logger, pipeName: string = '\\\\.\\pipe\\opsis-agent-service') {
+  private port: number;
+
+  constructor(logger: Logger, pipeName: string = '\\\\.\\pipe\\opsis-agent-service', port: number = 19847) {
     this.logger = logger;
     this.pipeName = pipeName;
+    this.port = port;
   }
 
   public start(): void {
@@ -27,8 +30,9 @@ export class IPCServer {
         this.handleClientConnection(socket);
       });
 
-      this.server.listen(this.pipeName, () => {
-        this.logger.info('IPC Server started', { pipeName: this.pipeName });
+      // Use localhost TCP instead of named pipe to avoid SYSTEM→user permission issues
+      this.server.listen(this.port, '127.0.0.1', () => {
+        this.logger.info('IPC Server started', { port: this.port });
       });
 
       this.server.on('error', (error) => {
