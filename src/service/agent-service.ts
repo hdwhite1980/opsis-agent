@@ -163,6 +163,7 @@ class OPSISAgentService {
     timestamp: string;
   }> = [];
   private pendingEscalations: Map<string, DeviceSignature> = new Map(); // signature_id -> signature
+  private pendingRunbooks: Map<string, RunbookMatch> = new Map(); // signature_id -> matched runbook
 
   // Reconnect backoff state
   private reconnectAttempts: number = 0;
@@ -860,6 +861,17 @@ class OPSISAgentService {
           this.handleServiceAlertResolved(data.data);
           break;
 
+        case 'advisory':
+          // Server advisory response (e.g. for Class C escalations)
+          if (data.data && data.data.decision_type) {
+            this.handleServerDecision(data.data);
+          } else {
+            // Server sent a simple advisory (e.g. "Creating ticket for review")
+            // Check if there's a pending escalation with a matched runbook to execute
+            this.handleAdvisoryWithPendingRunbook(data.message);
+          }
+          break;
+
         default:
           this.log(`Unknown message type: ${data.type}`);
       }
@@ -984,6 +996,32 @@ class OPSISAgentService {
       // Server says this should be ignored — add to exclusion list and close ticket
       this.handleIgnoreDecision(decision);
     }
+  }
+
+  // Handle simple advisory messages by checking for pending escalations with matched runbooks
+  private handleAdvisoryWithPendingRunbook(message?: string): void {
+    // Find the most recent pending escalation that has a matched runbook
+    for (const [sigId, sig] of this.pendingEscalations.entries()) {
+      const runbook = this.pendingRunbooks.get(sigId);
+      if (!runbook) continue;
+
+      this.logger.info('Advisory received - executing pending runbook for escalation', {
+        signature_id: sigId,
+        runbook_id: runbook.runbookId,
+        runbook_name: runbook.name,
+        server_message: message
+      });
+
+      // Clean up pending state
+      this.pendingEscalations.delete(sigId);
+      this.pendingRunbooks.delete(sigId);
+
+      // Execute the matched runbook
+      this.executeLocalRemediation(sig, runbook);
+      return;
+    }
+
+    this.logger.debug('Advisory received but no pending runbook to execute', { message });
   }
 
   private handleIgnoreDecision(decision: ServerDecision): void {
@@ -1685,8 +1723,11 @@ class OPSISAgentService {
       this.recentActions
     );
 
-    // Store pending escalation
+    // Store pending escalation and matched runbook
     this.pendingEscalations.set(signature.signature_id, signature);
+    if (runbook) {
+      this.pendingRunbooks.set(signature.signature_id, runbook);
+    }
 
     // Send via WebSocket if connected
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
