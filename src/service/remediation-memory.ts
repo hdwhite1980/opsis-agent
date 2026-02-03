@@ -79,6 +79,11 @@ export class RemediationMemory {
       if (fs.existsSync(this.filePath)) {
         const data = fs.readFileSync(this.filePath, 'utf8');
         const memory = JSON.parse(data) as RemediationMemoryData;
+        // Ensure all required fields exist (older files may be missing them)
+        memory.signalStats = memory.signalStats || {};
+        memory.deviceSensitivity = memory.deviceSensitivity || {};
+        memory.attempts = memory.attempts || [];
+        memory.playbookStats = memory.playbookStats || {};
         this.logger.info('Remediation memory loaded', {
           attempts: memory.attempts.length,
           playbooks: Object.keys(memory.playbookStats).length

@@ -285,6 +285,15 @@ function handleServiceMessage(message: any) {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('service-alerts', message.data);
     }
+  } else if (message.type === 'user-prompt') {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('user-prompt', message.data);
+      // Bring window to front for user prompts
+      if (!mainWindow.isVisible()) {
+        mainWindow.show();
+      }
+      mainWindow.focus();
+    }
   } else {
     // Forward other messages as-is
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -332,6 +341,13 @@ ipcMain.on('update-settings', (_event: any, settings: any) => {
   sendToService({
     type: 'update-settings',
     data: settings
+  });
+});
+
+ipcMain.on('user-prompt-response', (_event: any, data: any) => {
+  sendToService({
+    type: 'user-prompt-response',
+    data
   });
 });
 

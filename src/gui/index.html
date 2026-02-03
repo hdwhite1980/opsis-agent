@@ -968,9 +968,100 @@
             background: rgba(255,255,255,0.1);
             color: #fff;
         }
+
+        /* User Prompt Modal */
+        .prompt-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(4px);
+            z-index: 10000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .prompt-modal {
+            background: #162A40;
+            border: 1px solid rgba(59,130,246,0.3);
+            border-radius: 16px;
+            padding: 32px;
+            max-width: 480px;
+            width: 90%;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        .prompt-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        .prompt-modal h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #fff;
+        }
+        .prompt-modal p {
+            font-size: 14px;
+            color: #94A3B8;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+        .prompt-countdown {
+            font-size: 13px;
+            color: #64748B;
+            margin-bottom: 16px;
+        }
+        .prompt-buttons {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+        }
+        .prompt-btn {
+            padding: 10px 24px;
+            border-radius: 8px;
+            border: none;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .prompt-btn-primary {
+            background: #3B82F6;
+            color: #fff;
+        }
+        .prompt-btn-primary:hover {
+            background: #2563EB;
+        }
+        .prompt-btn-danger {
+            background: #EF4444;
+            color: #fff;
+        }
+        .prompt-btn-danger:hover {
+            background: #DC2626;
+        }
+        .prompt-btn-secondary {
+            background: rgba(255,255,255,0.1);
+            color: #CBD5E1;
+        }
+        .prompt-btn-secondary:hover {
+            background: rgba(255,255,255,0.15);
+        }
     </style>
 </head>
 <body>
+    <!-- User Prompt Modal Overlay -->
+    <div id="userPromptOverlay" class="prompt-overlay" style="display:none">
+        <div class="prompt-modal">
+            <div class="prompt-icon" id="promptIcon"></div>
+            <h2 id="promptTitle"></h2>
+            <p id="promptMessage"></p>
+            <div id="promptCountdown" class="prompt-countdown" style="display:none"></div>
+            <div class="prompt-buttons" id="promptButtons"></div>
+        </div>
+    </div>
     <div class="app-container">
         <!-- Sidebar -->
         <div class="sidebar">
@@ -1432,6 +1523,79 @@
             activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== data.id);
             renderServiceAlerts();
         });
+
+        // User Prompt handling
+        let activePromptTimer = null;
+        ipcRenderer.on('user-prompt', (event, data) => {
+            showUserPrompt(data);
+        });
+
+        function showUserPrompt(data) {
+            const overlay = document.getElementById('userPromptOverlay');
+            const icon = document.getElementById('promptIcon');
+            const title = document.getElementById('promptTitle');
+            const message = document.getElementById('promptMessage');
+            const countdown = document.getElementById('promptCountdown');
+            const buttonsDiv = document.getElementById('promptButtons');
+
+            // Set icon based on action type
+            if (data.action_on_confirm === 'reboot') {
+                icon.textContent = '\u26A0\uFE0F';
+            } else {
+                icon.textContent = '\u2139\uFE0F';
+            }
+
+            title.textContent = data.title || 'Action Required';
+            message.textContent = data.message || '';
+
+            // Build buttons
+            buttonsDiv.innerHTML = '';
+            const buttons = data.buttons || ['OK', 'Cancel'];
+            buttons.forEach((label, idx) => {
+                const btn = document.createElement('button');
+                btn.textContent = label;
+                btn.className = 'prompt-btn';
+                if (idx === 0) {
+                    btn.className += data.action_on_confirm === 'reboot' ? ' prompt-btn-danger' : ' prompt-btn-primary';
+                } else {
+                    btn.className += ' prompt-btn-secondary';
+                }
+                btn.onclick = () => {
+                    if (activePromptTimer) { clearInterval(activePromptTimer); activePromptTimer = null; }
+                    overlay.style.display = 'none';
+                    ipcRenderer.send('user-prompt-response', {
+                        promptId: data.id,
+                        response: idx === 0 ? 'ok' : 'cancel'
+                    });
+                };
+                buttonsDiv.appendChild(btn);
+            });
+
+            // Countdown timer
+            if (data.timeout && data.timeout > 0) {
+                let remaining = data.timeout;
+                countdown.style.display = 'block';
+                countdown.textContent = 'Auto-dismissing in ' + remaining + 's';
+                activePromptTimer = setInterval(() => {
+                    remaining--;
+                    if (remaining <= 0) {
+                        clearInterval(activePromptTimer);
+                        activePromptTimer = null;
+                        overlay.style.display = 'none';
+                        ipcRenderer.send('user-prompt-response', {
+                            promptId: data.id,
+                            response: 'timeout'
+                        });
+                    } else {
+                        countdown.textContent = 'Auto-dismissing in ' + remaining + 's';
+                    }
+                }, 1000);
+            } else {
+                countdown.style.display = 'none';
+            }
+
+            overlay.style.display = 'flex';
+        }
 
         function renderServiceAlerts() {
             const container = document.getElementById('serviceAlertsContainer');

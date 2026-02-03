@@ -84,7 +84,7 @@ interface PlaybookTask {
 }
 
 interface PlaybookStep {
-  type: 'powershell' | 'registry' | 'service' | 'file' | 'wmi' | 'diagnostic';
+  type: 'powershell' | 'registry' | 'service' | 'file' | 'wmi' | 'diagnostic' | 'reboot' | 'user-prompt';
   action: string;
   params: Record<string, any>;
   timeout?: number;
@@ -181,7 +181,9 @@ class OPSISAgentService {
   // Server-provided configuration (received via welcome message)
   private serverConfig: ServerConfig | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private welcomeTimeout: NodeJS.Timeout | null = null;
   private telemetryTimer: NodeJS.Timeout | null = null;
+  private pendingPrompts: Map<string, { resolve: (response: string) => void; action_on_confirm?: string; timer?: NodeJS.Timeout }> = new Map();
 
   constructor() {
     this.dataDir = path.join(__dirname, '..', '..', 'data');
@@ -511,6 +513,41 @@ class OPSISAgentService {
         data: { success: true }
       });
     });
+
+    this.ipcServer.onMessage('user-prompt-response', (data, socket) => {
+      this.logger.info('Received user-prompt-response from GUI', data);
+      const { promptId, response } = data;
+      const pending = this.pendingPrompts.get(promptId);
+      if (pending) {
+        if (pending.timer) clearTimeout(pending.timer);
+        this.pendingPrompts.delete(promptId);
+
+        // If user confirmed and there's an action
+        if (response === 'ok' && pending.action_on_confirm === 'reboot') {
+          this.logger.info('User confirmed reboot, scheduling restart in 30 seconds');
+          const { exec } = require('child_process');
+          exec('shutdown /r /t 30 /c "OPSIS Agent: Restarting to complete remediation"', (err: any) => {
+            if (err) this.logger.error('Failed to initiate reboot', err);
+          });
+        }
+
+        // Resolve the promise
+        pending.resolve(response);
+
+        // Report back to server
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(JSON.stringify({
+            type: 'user-prompt-response',
+            prompt_id: promptId,
+            response,
+            device_id: this.deviceInfo.device_id,
+            timestamp: new Date().toISOString()
+          }));
+        }
+      } else {
+        this.logger.warn('No pending prompt found for id', { promptId });
+      }
+    });
   }
 
   // ============================================
@@ -733,9 +770,34 @@ class OPSISAgentService {
       this.ws = new WebSocket(wsUrl, { headers });
 
       this.ws.on('open', () => {
-        this.log('Connected to OPSIS server, waiting for welcome...');
+        this.log('Connected to OPSIS server, sending registration...');
         this.reconnectAttempts = 0; // Reset backoff on successful connection
-        // Don't start heartbeat yet — wait for welcome message with config
+
+        // Send registration immediately — don't wait for welcome
+        this.ws!.send(JSON.stringify({
+          type: 'register',
+          device_id: this.deviceInfo.device_id,
+          tenant_id: this.deviceInfo.tenant_id,
+          hostname: os.hostname(),
+          agent_version: '1.0.0',
+          os: `${os.platform()} ${os.release()}`,
+          timestamp: new Date().toISOString()
+        }));
+
+        // Start heartbeat immediately with default interval
+        // (will be updated if welcome arrives with custom config)
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.sendHeartbeat();
+        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
+
+        // Warn if server doesn't send welcome within 10s
+        if (this.welcomeTimeout) clearTimeout(this.welcomeTimeout);
+        this.welcomeTimeout = setTimeout(() => {
+          this.logger.warn('No welcome received from server within 10s — continuing without server config');
+          this.welcomeTimeout = null;
+        }, 10000);
+
+        this.log('Registration sent, heartbeat started');
       });
 
       this.ws.on('message', (data: WebSocket.Data) => {
@@ -854,7 +916,8 @@ class OPSISAgentService {
           break;
 
         case 'diagnostic_request':
-          this.handleDiagnosticRequest(data);
+          this.logger.warn('RAW diagnostic_request message', { raw: message });
+          this.handleDiagnosticRequest(data.data || data);
           break;
 
         case 'diagnostic_complete':
@@ -905,6 +968,10 @@ class OPSISAgentService {
           }
           break;
 
+        case 'user-prompt':
+          this.handleUserPrompt(data.data || data);
+          break;
+
         default:
           this.logger.warn('Unknown message type', { type: data.type, raw: JSON.stringify(data) });
       }
@@ -953,6 +1020,145 @@ class OPSISAgentService {
       type: 'service-alert-resolved',
       data: { id: alertId }
     });
+  }
+
+  /**
+   * Handle a user-prompt message from the server.
+   * Broadcasts to GUI and waits for user response.
+   */
+  private handleUserPrompt(promptData: any): void {
+    const promptId = promptData.id || `prompt-${Date.now()}`;
+    const timeout = (promptData.timeout || 300) * 1000; // default 5 minutes
+
+    this.logger.info('User prompt received', {
+      id: promptId,
+      title: promptData.title,
+      action_on_confirm: promptData.action_on_confirm
+    });
+
+    // Create promise for response tracking (fire-and-forget, response handled by IPC)
+    const timer = setTimeout(() => {
+      this.logger.info('User prompt timed out, auto-declining', { promptId });
+      const pending = this.pendingPrompts.get(promptId);
+      if (pending) {
+        this.pendingPrompts.delete(promptId);
+        pending.resolve('timeout');
+      }
+
+      // Notify server of timeout
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(JSON.stringify({
+          type: 'user-prompt-response',
+          prompt_id: promptId,
+          response: 'timeout',
+          device_id: this.deviceInfo.device_id,
+          timestamp: new Date().toISOString()
+        }));
+      }
+    }, timeout);
+
+    this.pendingPrompts.set(promptId, {
+      resolve: () => {}, // Server-initiated prompts don't block execution
+      action_on_confirm: promptData.action_on_confirm,
+      timer
+    });
+
+    // Broadcast to GUI
+    this.ipcServer.broadcast({
+      type: 'user-prompt',
+      data: {
+        id: promptId,
+        title: promptData.title || 'Action Required',
+        message: promptData.message || '',
+        buttons: promptData.buttons || ['OK', 'Cancel'],
+        action_on_confirm: promptData.action_on_confirm,
+        timeout: promptData.timeout || 300
+      }
+    });
+  }
+
+  /**
+   * Execute a reboot playbook step - prompts user then reboots if confirmed.
+   */
+  private async executeReboot(params: Record<string, any>): Promise<void> {
+    const delay = params.delay || 30;
+    const message = params.message || 'Please save your work. The computer needs to restart to complete a resolution.';
+    const promptId = `reboot-${Date.now()}`;
+
+    this.logger.info('Reboot step: prompting user for confirmation');
+
+    const response = await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        this.logger.info('Reboot prompt timed out, skipping reboot');
+        this.pendingPrompts.delete(promptId);
+        resolve('timeout');
+      }, 300000); // 5 minute timeout
+
+      this.pendingPrompts.set(promptId, {
+        resolve,
+        action_on_confirm: 'reboot',
+        timer
+      });
+
+      this.ipcServer.broadcast({
+        type: 'user-prompt',
+        data: {
+          id: promptId,
+          title: 'Restart Required',
+          message,
+          buttons: ['Restart Now', 'Later'],
+          action_on_confirm: 'reboot',
+          timeout: 300
+        }
+      });
+    });
+
+    if (response === 'ok') {
+      this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`);
+      const { exec } = require('child_process');
+      exec(`shutdown /r /t ${delay} /c "OPSIS Agent: Restarting to complete remediation"`, (err: any) => {
+        if (err) this.logger.error('Failed to initiate reboot', err);
+      });
+    } else {
+      this.logger.info('User declined or timed out on reboot prompt', { response });
+    }
+  }
+
+  /**
+   * Execute a user-prompt playbook step - shows message and waits for response.
+   */
+  private async executeUserPrompt(action: string, params: Record<string, any>): Promise<void> {
+    const promptId = `step-prompt-${Date.now()}`;
+    const timeout = params.timeout || 300;
+
+    this.logger.info('User-prompt step: showing prompt to user', { action });
+
+    const response = await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingPrompts.delete(promptId);
+        resolve('timeout');
+      }, timeout * 1000);
+
+      this.pendingPrompts.set(promptId, {
+        resolve,
+        action_on_confirm: params.action_on_confirm,
+        timer
+      });
+
+      this.ipcServer.broadcast({
+        type: 'user-prompt',
+        data: {
+          id: promptId,
+          title: params.title || 'Action Required',
+          message: action,
+          buttons: params.buttons || ['OK', 'Cancel'],
+          action_on_confirm: params.action_on_confirm,
+          timeout
+        }
+      });
+    });
+
+    this.logger.info('User-prompt step response', { promptId, response });
   }
 
   // NEW METHOD: Handle Server Decision
@@ -1254,16 +1460,100 @@ class OPSISAgentService {
   // ============================================
 
   private async handleDiagnosticRequest(data: any): Promise<void> {
-    const { session_id, step_id, command, timeout, description } = data;
+    const { session_id, commands, command, step_id, timeout, scenario, target, reason } = data;
 
+    // Server sends commands as an array — run each one
+    if (commands && Array.isArray(commands) && commands.length > 0) {
+      this.logger.info('Diagnostic request received (multi-command)', {
+        session_id: session_id || 'diag-unknown',
+        command_count: commands.length,
+        reason
+      });
+
+      const results: any[] = [];
+      for (const cmd of commands) {
+        const cmdStepId = cmd.step_id || `step-${results.length}`;
+        const cmdCommand = cmd.command;
+        const cmdTimeout = cmd.timeout || 30;
+
+        this.logger.info('Running diagnostic command', {
+          step_id: cmdStepId,
+          command: cmdCommand ? cmdCommand.substring(0, 100) : undefined
+        });
+
+        try {
+          const result = await this.executePowerShellCommand(cmdCommand, cmdTimeout);
+          const parsedResult = this.parseDiagnosticOutput(result.output, cmdStepId);
+          results.push({
+            step_id: cmdStepId,
+            success: result.exitCode === 0,
+            output: result.output,
+            error: result.error || null,
+            exit_code: result.exitCode,
+            parsed_result: parsedResult
+          });
+          this.logger.info('Diagnostic command completed', { step_id: cmdStepId, success: result.exitCode === 0 });
+        } catch (error: any) {
+          this.logger.error('Diagnostic command failed', { step_id: cmdStepId, error: error.message });
+          results.push({
+            step_id: cmdStepId,
+            success: false,
+            output: null,
+            error: error.message,
+            exit_code: -1
+          });
+        }
+      }
+
+      // Send all results back in one message
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'diagnostic_result',
+          timestamp: new Date().toISOString(),
+          device_id: this.deviceInfo.device_id,
+          session_id: session_id || 'diag-unknown',
+          results,
+          command_count: results.length,
+          all_success: results.every(r => r.success)
+        }));
+        this.logger.info('Diagnostic results sent', {
+          session_id: session_id || 'diag-unknown',
+          total: results.length,
+          successful: results.filter(r => r.success).length
+        });
+      }
+      return;
+    }
+
+    // Single command fallback
     this.logger.info('Diagnostic request received', {
       session_id,
       step_id,
-      description
+      command: command ? command.substring(0, 100) : undefined,
+      scenario,
+      target
     });
 
+    const diagCommand = command || this.buildDiagnosticCommand(scenario, target);
+    if (!diagCommand) {
+      this.logger.error('Diagnostic request missing command', { data });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'diagnostic_result',
+          timestamp: new Date().toISOString(),
+          device_id: this.deviceInfo.device_id,
+          session_id,
+          step_id,
+          success: false,
+          error: 'No command or recognized scenario provided',
+          exit_code: -1
+        }));
+      }
+      return;
+    }
+
     try {
-      const result = await this.executePowerShellCommand(command, timeout || 30);
+      const result = await this.executePowerShellCommand(diagCommand, timeout || 30);
       const parsedResult = this.parseDiagnosticOutput(result.output, step_id);
 
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -1327,7 +1617,29 @@ class OPSISAgentService {
     }
   }
 
+  private buildDiagnosticCommand(scenario?: string, target?: string): string | null {
+    if (!scenario) return null;
+    switch (scenario) {
+      case 'service-health':
+        return target
+          ? `Get-Service -Name '${target}' | Select-Object Name,Status,StartType | ConvertTo-Json`
+          : `Get-Service | Where-Object {$_.Status -ne 'Running' -and $_.StartType -eq 'Automatic'} | Select-Object Name,Status,StartType | ConvertTo-Json`;
+      case 'disk-health':
+        return `Get-PhysicalDisk | Select-Object DeviceId,MediaType,HealthStatus,OperationalStatus,Size | ConvertTo-Json`;
+      case 'memory-usage':
+        return `Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 10 Name,Id,@{N='MemMB';E={[math]::Round($_.WorkingSet64/1MB)}} | ConvertTo-Json`;
+      case 'event-errors':
+        return `Get-WinEvent -FilterHashtable @{LogName='System';Level=2;StartTime=(Get-Date).AddHours(-1)} -MaxEvents 20 -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id,ProviderName,Message | ConvertTo-Json`;
+      case 'network':
+        return `Test-NetConnection -ComputerName 8.8.8.8 -Port 443 -WarningAction SilentlyContinue | Select-Object ComputerName,TcpTestSucceeded,PingSucceeded,RemotePort | ConvertTo-Json`;
+      default:
+        this.logger.warn('Unknown diagnostic scenario', { scenario });
+        return null;
+    }
+  }
+
   private parseDiagnosticOutput(output: string, stepId: string): any {
+    if (!stepId) return { raw: output };
     if (stepId.includes('bluetooth') || stepId.includes('device')) {
       return this.parseDeviceOutput(output);
     }
@@ -1500,8 +1812,11 @@ class OPSISAgentService {
     }
   }
 
-  // NEW METHOD: Handle Welcome Message from Server
+  // Handle Welcome Message from Server (heartbeat already running from on('open'))
   private handleWelcome(data: any): void {
+    // Clear welcome timeout — server responded
+    if (this.welcomeTimeout) { clearTimeout(this.welcomeTimeout); this.welcomeTimeout = null; }
+
     this.logger.info('Welcome received from server', {
       client_name: data.client_name,
       tenant_id: data.tenant_id,
@@ -1513,7 +1828,7 @@ class OPSISAgentService {
     this.deviceInfo.tenant_id = data.tenant_id || this.deviceInfo.tenant_id;
     this.deviceInfo.device_id = data.device_id || this.deviceInfo.device_id;
 
-    // Store server configuration
+    // Store server configuration and update heartbeat interval if provided
     if (data.config) {
       this.serverConfig = data.config;
 
@@ -1528,10 +1843,9 @@ class OPSISAgentService {
         this.systemMonitor.updateThresholds(this.serverConfig!.thresholds);
       }
 
-      // Start heartbeat with server-provided interval
+      // Update heartbeat interval if server specifies a different one
       const heartbeatMs = this.serverConfig!.monitoring?.heartbeat_interval || 30000;
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-      this.sendHeartbeat();
       this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), heartbeatMs);
 
       this.logger.info('Server config applied', {
@@ -1539,11 +1853,8 @@ class OPSISAgentService {
         thresholds: this.serverConfig!.thresholds,
         features: this.serverConfig!.features
       });
-    } else {
-      // No config — start heartbeat with default interval
-      this.sendHeartbeat();
-      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
     }
+    // No else needed — heartbeat already running from on('open')
   }
 
   // ============================================
@@ -2234,6 +2545,12 @@ class OPSISAgentService {
       case 'diagnostic':
         await this.runDiagnostic(step.action);
         break;
+      case 'reboot':
+        await this.executeReboot(step.params);
+        break;
+      case 'user-prompt':
+        await this.executeUserPrompt(step.action, step.params);
+        break;
       default:
         throw new Error(`Unknown step type: ${step.type}`);
     }
@@ -2270,6 +2587,14 @@ class OPSISAgentService {
     // "Restart <name> process"
     match = script.match(/^Restart (.+) process$/i);
     if (match) return `Stop-Process -Name '${match[1]}' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2; Start-Process '${match[1]}' -ErrorAction SilentlyContinue`;
+
+    // "Restart computer" / "Reboot computer" / "Reboot machine"
+    match = script.match(/^(Restart|Reboot)\s+(computer|machine|system)$/i);
+    if (match) return `shutdown /r /t 30 /c "OPSIS Agent: Restarting to complete remediation"`;
+
+    // "Shutdown computer"
+    match = script.match(/^Shut\s*down\s+(computer|machine|system)$/i);
+    if (match) return `shutdown /s /t 30 /c "OPSIS Agent: Shutting down"`;
 
     return null;
   }
