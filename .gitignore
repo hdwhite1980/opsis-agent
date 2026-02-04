@@ -7,3 +7,7 @@ logs/
 credentials.json
 device.config.json
 agent.config.json
+
+# Build and documentation
+docs/
+installer-output/
