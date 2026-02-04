@@ -152,6 +152,14 @@ class OPSISAgentService {
   private serviceAlerts: any[] = [];
   private patternDetector: PatternDetector;
   private activeTickets: Map<string, string> = new Map(); // playbookId -> ticketId
+  private suppressedServices: Set<string> = new Set(); // Services that should not be auto-restarted
+
+  // Safe services that can be stopped from GUI without corrupting OS
+  private static readonly SAFE_TO_STOP_SERVICES: ReadonlySet<string> = new Set([
+    'Spooler', 'W32Time', 'BITS', 'wuauserv', 'gpsvc', 'Dnscache',
+    'WSearch', 'Themes', 'TabletInputService', 'Fax', 'MapsBroker',
+    'DiagTrack', 'dmwappushservice', 'SysMain', 'WbioSrvc', 'WerSvc'
+  ]);
 
   // NEW PROPERTIES - Tiered Intelligence
   private signatureGenerator: SignatureGenerator;
@@ -178,6 +186,10 @@ class OPSISAgentService {
   private readonly RECONNECT_MAX_MS = 5 * 60 * 1000; // 5 minutes
   private sessionValid: boolean = true;
 
+  // Server runbook storage
+  private readonly serverRunbooksPath: string;
+  private readonly REINVESTIGATION_THRESHOLD = 10; // Escalate for reinvestigation after 10 executions
+
   // Server-provided configuration (received via welcome message)
   private serverConfig: ServerConfig | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -190,6 +202,7 @@ class OPSISAgentService {
     this.logsDir = path.join(__dirname, '..', '..', 'logs');
     this.runbooksDir = path.join(__dirname, '..', '..', 'runbooks');
     this.configPath = path.join(this.dataDir, 'agent.config.json');
+    this.serverRunbooksPath = path.join(this.dataDir, 'server-runbooks.json');
     
     // Ensure directories exist
     [this.dataDir, this.logsDir, this.runbooksDir].forEach(dir => {
@@ -547,6 +560,79 @@ class OPSISAgentService {
       } else {
         this.logger.warn('No pending prompt found for id', { promptId });
       }
+    });
+
+    // Service suppression handlers for GUI
+    this.ipcServer.onMessage('suppress-service', async (data, socket) => {
+      const { serviceName } = data;
+      this.logger.info('IPC: Received suppress-service request', { serviceName });
+
+      // Check if service is safe to stop
+      if (!OPSISAgentService.SAFE_TO_STOP_SERVICES.has(serviceName)) {
+        this.ipcServer.sendToClient(socket, {
+          type: 'suppress-service-result',
+          data: { success: false, error: `Service '${serviceName}' is not safe to stop` }
+        });
+        return;
+      }
+
+      try {
+        // Stop the service
+        await execAsync(`powershell -NoProfile -Command "Stop-Service -Name '${serviceName}' -Force"`, { timeout: 30000 });
+
+        // Add to suppressed list
+        this.suppressedServices.add(serviceName);
+        this.logger.info('Service suppressed', { serviceName, suppressedCount: this.suppressedServices.size });
+
+        this.ipcServer.sendToClient(socket, {
+          type: 'suppress-service-result',
+          data: { success: true, serviceName, status: 'stopped_and_suppressed' }
+        });
+      } catch (error: any) {
+        this.logger.error('Failed to suppress service', { serviceName, error: error.message });
+        this.ipcServer.sendToClient(socket, {
+          type: 'suppress-service-result',
+          data: { success: false, error: error.message }
+        });
+      }
+    });
+
+    this.ipcServer.onMessage('unsuppress-service', async (data, socket) => {
+      const { serviceName, startService } = data;
+      this.logger.info('IPC: Received unsuppress-service request', { serviceName, startService });
+
+      this.suppressedServices.delete(serviceName);
+
+      if (startService) {
+        try {
+          await execAsync(`powershell -NoProfile -Command "Start-Service -Name '${serviceName}'"`, { timeout: 30000 });
+          this.ipcServer.sendToClient(socket, {
+            type: 'unsuppress-service-result',
+            data: { success: true, serviceName, status: 'unsuppressed_and_started' }
+          });
+        } catch (error: any) {
+          this.ipcServer.sendToClient(socket, {
+            type: 'unsuppress-service-result',
+            data: { success: true, serviceName, status: 'unsuppressed_but_start_failed', error: error.message }
+          });
+        }
+      } else {
+        this.ipcServer.sendToClient(socket, {
+          type: 'unsuppress-service-result',
+          data: { success: true, serviceName, status: 'unsuppressed' }
+        });
+      }
+    });
+
+    this.ipcServer.onMessage('get-suppressed-services', (data, socket) => {
+      this.logger.info('IPC: Received get-suppressed-services request');
+      this.ipcServer.sendToClient(socket, {
+        type: 'suppressed-services',
+        data: {
+          services: Array.from(this.suppressedServices),
+          safeServices: Array.from(OPSISAgentService.SAFE_TO_STOP_SERVICES)
+        }
+      });
     });
   }
 
@@ -927,7 +1013,11 @@ class OPSISAgentService {
         case 'add_to_ignore_list':
           this.handleAddToIgnoreList(data);
           break;
-          
+
+        case 'reinvestigation_response':
+          this.handleReinvestigationResponse(data.data || data);
+          break;
+
         case 'config-update':
           this.updateConfig(data.config);
           break;
@@ -1990,8 +2080,14 @@ class OPSISAgentService {
       // Low confidence - escalate
       this.escalateSystemIssueToServer(signature, playbook);
     } else {
-      // No remediation - create manual ticket
-      this.createManualTicket(signature);
+      // No local playbook - escalate to server for decision
+      // Server has ignore list and can send appropriate runbook
+      this.logger.info('No local playbook - escalating to server', {
+        signature_id: signature.signature_id,
+        category: signal.category,
+        metric: signal.metric
+      });
+      this.escalateToServer(signature, null);
     }
   }
 
@@ -2385,7 +2481,10 @@ class OPSISAgentService {
 
         const signalId = (playbook as any).signalId || playbook.id;
 
-        // Infer exclusion from signal
+        // Add to local ignore list so this signal is never sent to server again
+        this.addToLocalIgnoreList(signalId, ignoreCheck.reason);
+
+        // Also add to exclusion list for local processing
         const inferred = this.inferExclusionFromSignature(signalId);
         this.addToExclusionList(inferred.target, inferred.category);
 
@@ -2484,6 +2583,11 @@ class OPSISAgentService {
           'success',
           duration
         );
+
+        // Save successful server runbooks for future local use
+        if (playbook.source === 'server') {
+          this.saveServerRunbook(playbook);
+        }
       } catch (error) {
         const duration = Date.now() - startTime;
 
@@ -3023,6 +3127,12 @@ class OPSISAgentService {
     if (signal.category === 'services' && signal.metric === 'service_status') {
       const serviceName = signal.metadata?.serviceName;
       if (serviceName) {
+        // Skip if service is suppressed (user intentionally stopped it)
+        if (this.suppressedServices.has(serviceName)) {
+          this.logger.info('Skipping local playbook for suppressed service', { serviceName });
+          return null;
+        }
+
         return {
           id: playbookId,
           name: `Restart Service - ${serviceName}`,
@@ -3083,6 +3193,241 @@ class OPSISAgentService {
     this.config = { ...this.config, ...newConfig };
     this.saveConfig();
     this.logger.info('Configuration updated');
+  }
+
+  // ============================================
+  // SERVER RUNBOOK STORAGE & REINVESTIGATION
+  // ============================================
+
+  /**
+   * Save a successful server runbook for future local use
+   */
+  private saveServerRunbook(playbook: PlaybookTask): void {
+    try {
+      let serverRunbooks: { runbooks: Array<any>; version: string } = {
+        runbooks: [],
+        version: '1.0'
+      };
+
+      // Load existing server runbooks
+      if (fs.existsSync(this.serverRunbooksPath)) {
+        try {
+          serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
+        } catch (e) {
+          this.logger.warn('Failed to parse server-runbooks.json, starting fresh');
+        }
+      }
+
+      // Check if runbook already exists (by ID or by similar name+steps)
+      const existingIndex = serverRunbooks.runbooks.findIndex(
+        (rb: any) => rb.id === playbook.id || rb.original_id === playbook.id
+      );
+
+      const runbookEntry = {
+        id: `server-${playbook.id}`,
+        original_id: playbook.id,
+        name: playbook.name,
+        source: 'server',
+        priority: playbook.priority,
+        steps: playbook.steps,
+        saved_at: new Date().toISOString(),
+        execution_count: 1,
+        last_executed: new Date().toISOString(),
+        success_count: 1,
+        signal_id: (playbook as any).signalId,
+        triggers: (playbook as any).triggers || []
+      };
+
+      if (existingIndex >= 0) {
+        // Update existing entry
+        const existing = serverRunbooks.runbooks[existingIndex];
+        runbookEntry.execution_count = (existing.execution_count || 0) + 1;
+        runbookEntry.success_count = (existing.success_count || 0) + 1;
+        runbookEntry.saved_at = existing.saved_at;
+        serverRunbooks.runbooks[existingIndex] = runbookEntry;
+
+        this.logger.info('Updated server runbook', {
+          id: runbookEntry.id,
+          name: runbookEntry.name,
+          execution_count: runbookEntry.execution_count
+        });
+      } else {
+        serverRunbooks.runbooks.push(runbookEntry);
+        this.logger.info('Saved new server runbook', {
+          id: runbookEntry.id,
+          name: runbookEntry.name
+        });
+      }
+
+      fs.writeFileSync(this.serverRunbooksPath, JSON.stringify(serverRunbooks, null, 2), 'utf8');
+
+      // Check if reinvestigation is needed
+      if (runbookEntry.execution_count >= this.REINVESTIGATION_THRESHOLD) {
+        this.escalateForReinvestigation(runbookEntry);
+      }
+    } catch (error) {
+      this.logger.error('Failed to save server runbook', error);
+    }
+  }
+
+  /**
+   * Escalate to server for reinvestigation when a runbook has been executed too many times
+   */
+  private escalateForReinvestigation(runbookEntry: any): void {
+    this.logger.warn('Runbook executed too many times, requesting reinvestigation', {
+      runbook_id: runbookEntry.id,
+      execution_count: runbookEntry.execution_count
+    });
+
+    const reinvestigationPayload = {
+      type: 'reinvestigation_request',
+      data: {
+        runbook_id: runbookEntry.original_id || runbookEntry.id,
+        runbook_name: runbookEntry.name,
+        signal_id: runbookEntry.signal_id,
+        execution_count: runbookEntry.execution_count,
+        success_count: runbookEntry.success_count,
+        first_seen: runbookEntry.saved_at,
+        last_executed: runbookEntry.last_executed,
+        device_id: os.hostname(),
+        message: `Runbook "${runbookEntry.name}" has been executed ${runbookEntry.execution_count} times. Requesting reinvestigation.`
+      }
+    };
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(reinvestigationPayload));
+      this.logger.info('Reinvestigation request sent to server', {
+        runbook_id: runbookEntry.id,
+        execution_count: runbookEntry.execution_count
+      });
+    } else {
+      this.logger.warn('Cannot send reinvestigation request - WebSocket not connected');
+    }
+  }
+
+  /**
+   * Handle reinvestigation response from server
+   */
+  private handleReinvestigationResponse(data: any): void {
+    const { runbook_id, decision, diagnostic_request, new_runbook, reason } = data;
+
+    this.logger.info('Reinvestigation response received', { runbook_id, decision, reason });
+
+    switch (decision) {
+      case 'DIAGNOSTIC':
+        if (diagnostic_request) {
+          this.handleDiagnosticRequest(diagnostic_request);
+        }
+        break;
+
+      case 'CONTINUE_IGNORE':
+        this.addToLocalIgnoreList(
+          data.signal_id || runbook_id,
+          reason || 'Marked as acceptable recurring issue by server'
+        );
+        this.logger.info('Runbook marked as acceptable recurring issue', { runbook_id });
+        break;
+
+      case 'NEW_RUNBOOK':
+        if (new_runbook) {
+          this.replaceServerRunbook(runbook_id, new_runbook);
+          this.logger.info('Runbook replaced with new version from server', { runbook_id });
+        }
+        break;
+
+      case 'PERMANENT_FIX':
+        this.markRunbookAsResolved(runbook_id, reason);
+        break;
+
+      default:
+        this.logger.warn('Unknown reinvestigation decision', { decision, runbook_id });
+    }
+  }
+
+  /**
+   * Replace an existing server runbook with a new version
+   */
+  private replaceServerRunbook(oldRunbookId: string, newRunbook: any): void {
+    try {
+      if (!fs.existsSync(this.serverRunbooksPath)) return;
+
+      const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
+      const index = serverRunbooks.runbooks.findIndex(
+        (rb: any) => rb.id === oldRunbookId || rb.original_id === oldRunbookId
+      );
+
+      if (index >= 0) {
+        const old = serverRunbooks.runbooks[index];
+        serverRunbooks.runbooks[index] = {
+          id: `server-${newRunbook.id}`,
+          original_id: newRunbook.id,
+          name: newRunbook.name,
+          source: 'server',
+          priority: newRunbook.priority || 'medium',
+          steps: newRunbook.steps,
+          saved_at: new Date().toISOString(),
+          replaced_at: new Date().toISOString(),
+          previous_id: old.id,
+          execution_count: 0,
+          success_count: 0,
+          signal_id: newRunbook.signalId || old.signal_id,
+          triggers: newRunbook.triggers || old.triggers || []
+        };
+
+        fs.writeFileSync(this.serverRunbooksPath, JSON.stringify(serverRunbooks, null, 2), 'utf8');
+        this.logger.info('Server runbook replaced', { oldId: oldRunbookId, newId: newRunbook.id });
+      }
+    } catch (error) {
+      this.logger.error('Failed to replace server runbook', error);
+    }
+  }
+
+  /**
+   * Mark a runbook as resolved (permanent fix applied)
+   */
+  private markRunbookAsResolved(runbookId: string, reason: string): void {
+    try {
+      if (!fs.existsSync(this.serverRunbooksPath)) return;
+
+      const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
+      const index = serverRunbooks.runbooks.findIndex(
+        (rb: any) => rb.id === runbookId || rb.original_id === runbookId
+      );
+
+      if (index >= 0) {
+        serverRunbooks.runbooks[index].resolved = true;
+        serverRunbooks.runbooks[index].resolved_at = new Date().toISOString();
+        serverRunbooks.runbooks[index].resolution_reason = reason;
+
+        fs.writeFileSync(this.serverRunbooksPath, JSON.stringify(serverRunbooks, null, 2), 'utf8');
+        this.logger.info('Runbook marked as resolved', { runbookId, reason });
+      }
+    } catch (error) {
+      this.logger.error('Failed to mark runbook as resolved', error);
+    }
+  }
+
+  /**
+   * Get a saved server runbook by signal ID for local reuse
+   */
+  public getServerRunbookForSignal(signalId: string): any | null {
+    try {
+      if (!fs.existsSync(this.serverRunbooksPath)) return null;
+
+      const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
+      const runbook = serverRunbooks.runbooks.find(
+        (rb: any) => rb.signal_id === signalId && !rb.resolved
+      );
+
+      if (runbook) {
+        this.logger.debug('Found cached server runbook for signal', { signalId, runbookId: runbook.id });
+        return runbook;
+      }
+      return null;
+    } catch (error) {
+      this.logger.error('Failed to get server runbook', error);
+      return null;
+    }
   }
 }
 
