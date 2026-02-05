@@ -138,6 +138,7 @@ class OPSISAgentService {
   private isExecutingPlaybook = false;
   private updateCheckTimer: NodeJS.Timeout | null = null;
   private patternAnalysisTimer: NodeJS.Timeout | null = null;
+  private readonly baseDir: string;
   private readonly configPath: string;
   private readonly dataDir: string;
   private readonly logsDir: string;
@@ -210,9 +211,16 @@ class OPSISAgentService {
   private readonly pendingActionsPath: string;
 
   constructor() {
-    this.dataDir = path.join(__dirname, '..', '..', 'data');
-    this.logsDir = path.join(__dirname, '..', '..', 'logs');
-    this.runbooksDir = path.join(__dirname, '..', '..', 'runbooks');
+    // Determine base directory - handle both node.js and pkg compiled exe
+    // When running as pkg exe, __dirname points to snapshot filesystem, so use cwd or exe path
+    const isPkg = (process as any).pkg !== undefined;
+    this.baseDir = isPkg
+      ? process.cwd()  // WinSW sets working directory to app folder
+      : path.join(__dirname, '..', '..');
+
+    this.dataDir = path.join(this.baseDir, 'data');
+    this.logsDir = path.join(this.baseDir, 'logs');
+    this.runbooksDir = path.join(this.baseDir, 'runbooks');
     this.configPath = path.join(this.dataDir, 'agent.config.json');
     this.serverRunbooksPath = path.join(this.dataDir, 'server-runbooks.json');
     this.pendingActionsPath = path.join(this.dataDir, 'pending-actions.json');
@@ -228,7 +236,7 @@ class OPSISAgentService {
     this.logger = getServiceLogger(this.logsDir);
     
     // Initialize GUI launcher
-    this.guiLauncher = new GuiLauncher(this.logger, path.join(__dirname, '..', '..'));
+    this.guiLauncher = new GuiLauncher(this.logger, this.baseDir);
 
     // Initialize ticket database
     const dbPath = path.join(this.dataDir, 'tickets.json');
@@ -758,7 +766,7 @@ class OPSISAgentService {
     // 4. Check if Defender exclusion is in place for this directory
     try {
       const { stdout } = await execAsync(
-        `powershell -Command "(Get-MpPreference).ExclusionPath -contains '${path.join(__dirname, '..', '..')}'  "`,
+        `powershell -Command "(Get-MpPreference).ExclusionPath -contains '${this.baseDir}'  "`,
         { timeout: 10000 }
       );
       if (stdout.trim() !== 'True') {
