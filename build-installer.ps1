@@ -42,13 +42,22 @@ if (-not (Test-Path "LICENSE.txt")) {
 Write-Host ""
 Write-Host "Building application..." -ForegroundColor Yellow
 
-# Build the application
+# Build the application (TypeScript + GUI)
 npm run build
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Build failed!" -ForegroundColor Red
     exit 1
 }
-Write-Host "  + Build complete" -ForegroundColor Green
+Write-Host "  + TypeScript build complete" -ForegroundColor Green
+
+# Build standalone service executable
+Write-Host "Building standalone service executable..." -ForegroundColor Yellow
+npm run build:exe
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Executable build failed!" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  + Standalone exe build complete" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Compiling installer..." -ForegroundColor Yellow

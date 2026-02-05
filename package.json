@@ -8,6 +8,7 @@
     "build:service": "tsc -p tsconfig.service.json",
     "build:gui": "tsc -p tsconfig.gui.json",
     "copy:gui-assets": "node scripts/copy-assets.js",
+    "build:exe": "npm run build:service && pkg dist/service/agent-service.js --targets node18-win-x64 --output dist/opsis-agent-service.exe --compress GZip",
     "start:service": "node dist/service/agent-service.js",
     "start:gui": "electron dist/gui/electron-main.js",
     "install-service": "node scripts/install-service.js",
@@ -15,6 +16,14 @@
     "package": "npm run build && electron-builder",
     "create-installer": "iscc installer.iss",
     "package:installer": "npm run build && npm run create-installer"
+  },
+  "pkg": {
+    "scripts": "dist/**/*.js",
+    "assets": [
+      "runbooks/**/*",
+      "config/**/*"
+    ],
+    "outputPath": "dist"
   },
   "build": {
     "appId": "com.opsis.agent",
@@ -39,19 +48,20 @@
     }
   },
   "dependencies": {
+    "axios": "^1.6.0",
+    "electron": "^28.1.3",
     "node-windows": "^1.0.0-beta.8",
     "semver": "^7.5.4",
     "sql.js": "^1.13.0",
     "ws": "^8.16.0",
-    "yaml": "^2.3.4",
-    "axios": "^1.6.0",
-    "electron": "^28.1.3"
+    "yaml": "^2.3.4"
   },
   "devDependencies": {
     "@types/node": "^20.11.5",
     "@types/sql.js": "^1.4.9",
     "@types/ws": "^8.5.10",
     "electron-builder": "^24.9.1",
+    "pkg": "^5.8.1",
     "typescript": "^5.3.3"
   },
   "author": "OPSIS",

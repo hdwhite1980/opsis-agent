@@ -1,5 +1,5 @@
 ; OPSIS Agent Installer - Inno Setup Script
-; Bundles Node.js runtime - no external dependencies required
+; Uses compiled standalone exe - no Node.js runtime needed for service
 
 #define AppName "OPSIS Agent"
 #define AppVersion "1.0.0"
@@ -42,45 +42,55 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "autostart"; Description: "Start Control Panel on Windows startup"; GroupDescription: "Startup Options:"
 
 [Files]
-; Application files
-Source: "dist\*"; DestDir: "{app}\dist"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "node_modules\*"; DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "package.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "scripts\install-service.js"; DestDir: "{app}\scripts"; Flags: ignoreversion
-Source: "scripts\uninstall-service.js"; DestDir: "{app}\scripts"; Flags: ignoreversion
-Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Compiled service executable (standalone - no Node.js needed)
+Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignoreversion
+
+; WinSW service wrapper
+Source: "node_modules\node-windows\bin\winsw\winsw.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
+Source: "node_modules\node-windows\bin\winsw\winsw.exe.config"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe.config"; Flags: ignoreversion
+
+; GUI files (still needs Electron)
+Source: "dist\gui\*"; DestDir: "{app}\dist\gui"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\common\*"; DestDir: "{app}\dist\common"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "node_modules\electron\*"; DestDir: "{app}\node_modules\electron"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Runbooks (required at runtime)
 Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Assets (optional - only if folder exists)
+; Assets
 Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; Config template
 Source: "config\agent.config.json"; DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist
 
-; Bundled Node.js runtime
-Source: "nodejs\node.exe"; DestDir: "{app}\nodejs"; Flags: ignoreversion
+; License
+Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
 Name: "{app}\data"
 Name: "{app}\logs"
 Name: "{app}\certs"
+Name: "{app}\service"
 
 [Icons]
 Name: "{group}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
 Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
-; Install Windows Service (using bundled Node.js)
-Filename: "{app}\nodejs\node.exe"; Parameters: """{app}\scripts\install-service.js"""; WorkingDir: "{app}"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
+; Install Windows Service using WinSW
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "install"; WorkingDir: "{app}\service"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir: "{app}\service"; StatusMsg: "Starting OPSIS Agent Service..."; Flags: runhidden waituntilterminated
+
+; Add Defender exclusions
+Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'"""; Flags: runhidden waituntilterminated shellexec
 
 ; Offer to launch GUI
 Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Stop and uninstall service (using bundled Node.js)
-Filename: "{app}\nodejs\node.exe"; Parameters: """{app}\scripts\uninstall-service.js"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
+; Stop and uninstall service
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated
 
 [Registry]
 ; Add to startup (if selected)
@@ -92,7 +102,6 @@ var
 
 function InitializeSetup(): Boolean;
 begin
-  // Node.js is bundled - no external dependency check needed
   Result := True;
 end;
 
@@ -110,6 +119,40 @@ begin
   ServerURLPage.Values[1] := '';
 end;
 
+procedure CreateServiceConfig();
+var
+  ConfigFile: string;
+  ConfigContent: string;
+  ServiceExe: string;
+  AppPath: string;
+begin
+  AppPath := ExpandConstant('{app}');
+  ServiceExe := AppPath + '\dist\opsis-agent-service.exe';
+  ConfigFile := AppPath + '\service\OpsisAgentService.xml';
+
+  ConfigContent := '<?xml version="1.0" encoding="UTF-8"?>' + #13#10;
+  ConfigContent := ConfigContent + '<service>' + #13#10;
+  ConfigContent := ConfigContent + '  <id>OpsisAgentService</id>' + #13#10;
+  ConfigContent := ConfigContent + '  <name>OPSIS Agent Service</name>' + #13#10;
+  ConfigContent := ConfigContent + '  <description>OPSIS Autonomous IT Management Agent</description>' + #13#10;
+  ConfigContent := ConfigContent + '  <executable>' + ServiceExe + '</executable>' + #13#10;
+  ConfigContent := ConfigContent + '  <arguments></arguments>' + #13#10;
+  ConfigContent := ConfigContent + '  <logmode>rotate</logmode>' + #13#10;
+  ConfigContent := ConfigContent + '  <logpath>' + AppPath + '\logs</logpath>' + #13#10;
+  ConfigContent := ConfigContent + '  <workingdirectory>' + AppPath + '</workingdirectory>' + #13#10;
+  ConfigContent := ConfigContent + '  <priority>Normal</priority>' + #13#10;
+  ConfigContent := ConfigContent + '  <stoptimeout>30sec</stoptimeout>' + #13#10;
+  ConfigContent := ConfigContent + '  <startmode>Automatic</startmode>' + #13#10;
+  ConfigContent := ConfigContent + '  <env name="NODE_ENV" value="production"/>' + #13#10;
+  ConfigContent := ConfigContent + '  <onfailure action="restart" delay="10 sec"/>' + #13#10;
+  ConfigContent := ConfigContent + '  <onfailure action="restart" delay="20 sec"/>' + #13#10;
+  ConfigContent := ConfigContent + '  <onfailure action="none"/>' + #13#10;
+  ConfigContent := ConfigContent + '  <resetfailure>1 hour</resetfailure>' + #13#10;
+  ConfigContent := ConfigContent + '</service>' + #13#10;
+
+  SaveStringToFile(ConfigFile, ConfigContent, False);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConfigFile: string;
@@ -117,11 +160,14 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    // Create WinSW service configuration
+    CreateServiceConfig();
+
     // Create agent.config.json with server URL if provided
     ConfigFile := ExpandConstant('{app}\data\agent.config.json');
-    
+
     ConfigContent := '{' + #13#10;
-    
+
     if ServerURLPage.Values[0] <> '' then
       ConfigContent := ConfigContent + '  "serverUrl": "' + ServerURLPage.Values[0] + '",' + #13#10
     else
@@ -138,7 +184,7 @@ begin
     ConfigContent := ConfigContent + '  "confidenceThreshold": 75,' + #13#10;
     ConfigContent := ConfigContent + '  "updateCheckInterval": 60' + #13#10;
     ConfigContent := ConfigContent + '}';
-    
+
     SaveStringToFile(ConfigFile, ConfigContent, False);
   end;
 end;
