@@ -197,13 +197,26 @@ class OPSISAgentService {
   private telemetryTimer: NodeJS.Timeout | null = null;
   private pendingPrompts: Map<string, { resolve: (response: string) => void; action_on_confirm?: string; timer?: NodeJS.Timeout }> = new Map();
 
+  // Pending actions awaiting technician review
+  private pendingActions: Map<string, {
+    signature_id: string;
+    signature: DeviceSignature;
+    runbook: RunbookMatch | null;
+    ticket_id: string;
+    created_at: string;
+    server_message: string;
+  }> = new Map();
+  private awaitingReviewSignals: Set<string> = new Set(); // Signals that shouldn't be re-escalated (awaiting technician)
+  private readonly pendingActionsPath: string;
+
   constructor() {
     this.dataDir = path.join(__dirname, '..', '..', 'data');
     this.logsDir = path.join(__dirname, '..', '..', 'logs');
     this.runbooksDir = path.join(__dirname, '..', '..', 'runbooks');
     this.configPath = path.join(this.dataDir, 'agent.config.json');
     this.serverRunbooksPath = path.join(this.dataDir, 'server-runbooks.json');
-    
+    this.pendingActionsPath = path.join(this.dataDir, 'pending-actions.json');
+
     // Ensure directories exist
     [this.dataDir, this.logsDir, this.runbooksDir].forEach(dir => {
       if (!fs.existsSync(dir)) {
@@ -634,6 +647,58 @@ class OPSISAgentService {
         }
       });
     });
+
+    // Pending actions handlers
+    this.ipcServer.onMessage('get-pending-actions', (data, socket) => {
+      this.logger.info('IPC: Received get-pending-actions request');
+      const actions = Array.from(this.pendingActions.entries()).map(([id, action]) => ({
+        signature_id: id,
+        ticket_id: action.ticket_id,
+        runbook_name: action.runbook?.name,
+        server_message: action.server_message,
+        created_at: action.created_at,
+        signature_name: action.signature.signature_id, // Use signature_id as name
+        severity: action.signature.severity
+      }));
+      this.ipcServer.sendToClient(socket, {
+        type: 'pending-actions',
+        data: { actions }
+      });
+    });
+
+    this.ipcServer.onMessage('execute-pending-action', (data, socket) => {
+      const { signature_id } = data;
+      this.logger.info('IPC: Received execute-pending-action request', { signature_id });
+      if (signature_id && this.pendingActions.has(signature_id)) {
+        this.executePendingAction(signature_id);
+        this.ipcServer.sendToClient(socket, {
+          type: 'execute-pending-action-result',
+          data: { success: true, signature_id }
+        });
+      } else {
+        this.ipcServer.sendToClient(socket, {
+          type: 'execute-pending-action-result',
+          data: { success: false, signature_id, error: 'Pending action not found' }
+        });
+      }
+    });
+
+    this.ipcServer.onMessage('cancel-pending-action', (data, socket) => {
+      const { signature_id, reason } = data;
+      this.logger.info('IPC: Received cancel-pending-action request', { signature_id, reason });
+      if (signature_id && this.pendingActions.has(signature_id)) {
+        this.cancelPendingAction(signature_id, reason);
+        this.ipcServer.sendToClient(socket, {
+          type: 'cancel-pending-action-result',
+          data: { success: true, signature_id }
+        });
+      } else {
+        this.ipcServer.sendToClient(socket, {
+          type: 'cancel-pending-action-result',
+          data: { success: false, signature_id, error: 'Pending action not found' }
+        });
+      }
+    });
   }
 
   // ============================================
@@ -730,6 +795,9 @@ class OPSISAgentService {
     // Start IPC server for GUI
     this.ipcServer.start();
     this.log('IPC server started');
+
+    // Load pending actions from disk
+    this.loadPendingActions();
 
     // Launch GUI console in user session
     this.guiLauncher.launchGui();
@@ -1058,8 +1126,42 @@ class OPSISAgentService {
           }
           break;
 
+        case 'ticket_created':
+          // Server created a ticket for manual review
+          this.logger.info('Received ticket_created from server', {
+            ticket_id: data.ticket_id,
+            message: data.message,
+            raw: JSON.stringify(data)
+          });
+          // Treat this as a "manual review required" advisory
+          this.handleAdvisoryWithPendingRunbook(data.message || 'Issue requires manual review');
+          break;
+
         case 'user-prompt':
           this.handleUserPrompt(data.data || data);
+          break;
+
+        case 'execute_pending_action':
+          // Server/technician approved a pending action
+          this.logger.info('Received execute_pending_action from server', {
+            signature_id: data.signature_id || data.data?.signature_id
+          });
+          const execSigId = data.signature_id || data.data?.signature_id;
+          if (execSigId) {
+            this.executePendingAction(execSigId);
+          }
+          break;
+
+        case 'cancel_pending_action':
+          // Server/technician cancelled a pending action
+          this.logger.info('Received cancel_pending_action from server', {
+            signature_id: data.signature_id || data.data?.signature_id,
+            reason: data.reason || data.data?.reason
+          });
+          const cancelSigId = data.signature_id || data.data?.signature_id;
+          if (cancelSigId) {
+            this.cancelPendingAction(cancelSigId, data.reason || data.data?.reason);
+          }
           break;
 
         default:
@@ -1329,9 +1431,38 @@ class OPSISAgentService {
 
   // Handle simple advisory messages by checking for pending escalations with matched runbooks
   private handleAdvisoryWithPendingRunbook(message?: string): void {
+    // Check if this is a "ticket for review" or "manual review" advisory - don't auto-execute
+    const isCreateTicketReview = message && (
+      message.toLowerCase().includes('creating ticket for review') ||
+      message.toLowerCase().includes('ticket for review') ||
+      message.toLowerCase().includes('awaiting review') ||
+      message.toLowerCase().includes('pending review') ||
+      message.toLowerCase().includes('requires manual review') ||
+      message.toLowerCase().includes('manual review')
+    );
+
     // Find the most recent pending escalation that has a matched runbook
     for (const [sigId, sig] of this.pendingEscalations.entries()) {
       const runbook = this.pendingRunbooks.get(sigId);
+
+      // If server says "creating ticket for review", store as pending action instead of executing
+      if (isCreateTicketReview) {
+        this.logger.info('Advisory received - creating pending action for technician review', {
+          signature_id: sigId,
+          runbook_id: runbook?.runbookId,
+          runbook_name: runbook?.name,
+          server_message: message
+        });
+
+        this.createPendingAction(sigId, sig, runbook || null, message || 'Awaiting technician review');
+
+        // Clean up pending state
+        this.pendingEscalations.delete(sigId);
+        if (runbook) this.pendingRunbooks.delete(sigId);
+        return;
+      }
+
+      // Normal flow: execute the runbook if we have one
       if (!runbook) continue;
 
       this.logger.info('Advisory received - executing pending runbook for escalation', {
@@ -1351,6 +1482,165 @@ class OPSISAgentService {
     }
 
     this.logger.debug('Advisory received but no pending runbook to execute', { message });
+  }
+
+  // Create a pending action that awaits technician review
+  private createPendingAction(
+    signatureId: string,
+    signature: DeviceSignature,
+    runbook: RunbookMatch | null,
+    serverMessage: string
+  ): void {
+    // Create a ticket for technician review
+    const ticketId = `pending-action-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Store the pending action
+    const pendingAction = {
+      signature_id: signatureId,
+      signature,
+      runbook,
+      ticket_id: ticketId,
+      created_at: new Date().toISOString(),
+      server_message: serverMessage
+    };
+
+    this.pendingActions.set(signatureId, pendingAction);
+    this.awaitingReviewSignals.add(signatureId);
+
+    // Create a ticket in pending-review status
+    this.ticketDb.createTicket({
+      ticket_id: ticketId,
+      timestamp: new Date().toISOString(),
+      type: 'pending-action',
+      description: `Pending action awaiting technician review: ${runbook?.name || signatureId}`,
+      status: 'pending-review',
+      source: 'server-advisory',
+      computer_name: os.hostname(),
+      escalated: 0,
+      signature_id: signatureId,
+      runbook_id: runbook?.runbookId,
+      runbook_name: runbook?.name,
+      server_message: serverMessage
+    });
+
+    this.logger.info('Created pending action awaiting technician review', {
+      ticket_id: ticketId,
+      signature_id: signatureId,
+      runbook_name: runbook?.name,
+      server_message: serverMessage
+    });
+
+    // Save pending actions to disk
+    this.savePendingActions();
+
+    // Notify GUI of new pending action
+    this.ipcServer.broadcast({
+      type: 'pending-action-created',
+      data: {
+        ticket_id: ticketId,
+        signature_id: signatureId,
+        runbook_name: runbook?.name,
+        server_message: serverMessage,
+        created_at: pendingAction.created_at
+      }
+    });
+  }
+
+  // Save pending actions to disk for persistence
+  private savePendingActions(): void {
+    try {
+      const data = {
+        pending_actions: Array.from(this.pendingActions.entries()).map(([id, action]) => ({
+          ...action,
+          signature: {
+            signature_id: action.signature.signature_id,
+            severity: action.signature.severity
+          }
+        })),
+        awaiting_review: Array.from(this.awaitingReviewSignals)
+      };
+      fs.writeFileSync(this.pendingActionsPath, JSON.stringify(data, null, 2));
+    } catch (error: any) {
+      this.logger.error('Failed to save pending actions', { error: error.message });
+    }
+  }
+
+  // Load pending actions from disk
+  private loadPendingActions(): void {
+    try {
+      if (fs.existsSync(this.pendingActionsPath)) {
+        const data = JSON.parse(fs.readFileSync(this.pendingActionsPath, 'utf-8'));
+        if (data.awaiting_review) {
+          data.awaiting_review.forEach((id: string) => this.awaitingReviewSignals.add(id));
+        }
+        this.logger.info('Loaded pending actions from disk', {
+          awaiting_review_count: this.awaitingReviewSignals.size
+        });
+      }
+    } catch (error: any) {
+      this.logger.error('Failed to load pending actions', { error: error.message });
+    }
+  }
+
+  // Execute a pending action (called by server or technician approval)
+  private executePendingAction(signatureId: string): void {
+    const pendingAction = this.pendingActions.get(signatureId);
+    if (!pendingAction) {
+      this.logger.warn('No pending action found for signature', { signature_id: signatureId });
+      return;
+    }
+
+    this.logger.info('Executing pending action after approval', {
+      signature_id: signatureId,
+      ticket_id: pendingAction.ticket_id,
+      runbook_name: pendingAction.runbook?.name
+    });
+
+    // Clean up pending state
+    this.pendingActions.delete(signatureId);
+    this.awaitingReviewSignals.delete(signatureId);
+    this.savePendingActions();
+
+    // Update ticket status
+    this.ticketDb.updateTicketStatus(pendingAction.ticket_id, 'in-progress');
+
+    // Execute the runbook if we have one
+    if (pendingAction.runbook) {
+      this.executeLocalRemediation(pendingAction.signature, pendingAction.runbook);
+    } else {
+      this.logger.info('No runbook associated with pending action - escalating to server', {
+        signature_id: signatureId
+      });
+      this.escalateToServer(pendingAction.signature, null);
+    }
+  }
+
+  // Cancel a pending action
+  private cancelPendingAction(signatureId: string, reason?: string): void {
+    const pendingAction = this.pendingActions.get(signatureId);
+    if (!pendingAction) {
+      this.logger.warn('No pending action found to cancel', { signature_id: signatureId });
+      return;
+    }
+
+    this.logger.info('Cancelling pending action', {
+      signature_id: signatureId,
+      ticket_id: pendingAction.ticket_id,
+      reason
+    });
+
+    // Clean up
+    this.pendingActions.delete(signatureId);
+    this.awaitingReviewSignals.delete(signatureId);
+    this.savePendingActions();
+
+    // Update ticket
+    this.ticketDb.closeTicket(pendingAction.ticket_id, reason || 'Cancelled by technician', 'success');
+  }
+
+  // Check if a signal is awaiting technician review
+  private isAwaitingReview(signatureId: string): boolean {
+    return this.awaitingReviewSignals.has(signatureId);
   }
 
   private handleIgnoreDecision(decision: ServerDecision): void {
@@ -2145,6 +2435,14 @@ class OPSISAgentService {
     // Check ignore list before escalating
     if (this.shouldIgnoreSignature(signature.signature_id)) {
       this.logger.debug('Ignoring signal - on ignore list', {
+        signal_id: signature.signature_id
+      });
+      return;
+    }
+
+    // Check if signal is awaiting technician review - don't re-escalate
+    if (this.isAwaitingReview(signature.signature_id)) {
+      this.logger.debug('Signal is awaiting technician review - not re-escalating', {
         signal_id: signature.signature_id
       });
       return;

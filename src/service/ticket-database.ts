@@ -10,8 +10,8 @@ export interface Ticket {
   timestamp: string;
   type: string;
   description: string;
-  status: 'open' | 'in-progress' | 'resolved' | 'failed';
-  source: 'event-log' | 'manual' | 'monitoring';
+  status: 'open' | 'in-progress' | 'resolved' | 'failed' | 'pending-review';
+  source: 'event-log' | 'manual' | 'monitoring' | 'server-advisory';
   computer_name: string;
   resolved_at?: string;
   resolution_method?: string;
@@ -20,6 +20,10 @@ export interface Ticket {
   runbook_id?: string;
   escalated?: number; // 0 or 1
   result?: 'success' | 'failure' | null;
+  // Pending action fields
+  signature_id?: string;
+  runbook_name?: string;
+  server_message?: string;
 }
 
 export class TicketDatabase {
