@@ -11,3 +11,4 @@ agent.config.json
 # Build and documentation
 docs/
 installer-output/
+nodejs/

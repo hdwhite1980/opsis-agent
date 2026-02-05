@@ -1,5 +1,5 @@
-; OPSIS Agent Installer - Inno Setup Script (Simplified)
-; Uses system Node.js instead of bundling it
+; OPSIS Agent Installer - Inno Setup Script
+; Bundles Node.js runtime - no external dependencies required
 
 #define AppName "OPSIS Agent"
 #define AppVersion "1.0.0"
@@ -59,6 +59,9 @@ Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
 ; Config template
 Source: "config\agent.config.json"; DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist
 
+; Bundled Node.js runtime
+Source: "nodejs\node.exe"; DestDir: "{app}\nodejs"; Flags: ignoreversion
+
 [Dirs]
 Name: "{app}\data"
 Name: "{app}\logs"
@@ -69,15 +72,15 @@ Name: "{group}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist
 Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
-; Install Windows Service
-Filename: "node.exe"; Parameters: """{app}\scripts\install-service.js"""; WorkingDir: "{app}"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
+; Install Windows Service (using bundled Node.js)
+Filename: "{app}\nodejs\node.exe"; Parameters: """{app}\scripts\install-service.js"""; WorkingDir: "{app}"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 
 ; Offer to launch GUI
 Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Stop and uninstall service
-Filename: "node.exe"; Parameters: """{app}\scripts\uninstall-service.js"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
+; Stop and uninstall service (using bundled Node.js)
+Filename: "{app}\nodejs\node.exe"; Parameters: """{app}\scripts\uninstall-service.js"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
 
 [Registry]
 ; Add to startup (if selected)
@@ -86,29 +89,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Code]
 var
   ServerURLPage: TInputQueryWizardPage;
-  NodeJSInstalled: Boolean;
 
 function InitializeSetup(): Boolean;
-var
-  ResultCode: Integer;
 begin
-  // Check if Node.js is installed
-  NodeJSInstalled := Exec('node', '--version', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
-  
-  if not NodeJSInstalled then
-  begin
-    MsgBox('Node.js is not installed!' + #13#10 + #13#10 + 
-           'OPSIS Agent requires Node.js to run.' + #13#10 + #13#10 +
-           'Please install Node.js from:' + #13#10 +
-           'https://nodejs.org/' + #13#10 + #13#10 +
-           'Then run this installer again.', 
-           mbError, MB_OK);
-    Result := False;
-  end
-  else
-  begin
-    Result := True;
-  end;
+  // Node.js is bundled - no external dependency check needed
+  Result := True;
 end;
 
 procedure InitializeWizard;
