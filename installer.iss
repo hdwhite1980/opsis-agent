@@ -25,8 +25,8 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 ; Icon files (if available)
 #ifexist "assets\icon.ico"
@@ -62,11 +62,13 @@ Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
 
 ; Config template
 Source: "config\agent.config.json"; DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "config\exclusions.json"; DestDir: "{app}\config"; Flags: ignoreversion
 
 ; License
 Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
+Name: "{app}\config"
 Name: "{app}\data"
 Name: "{app}\logs"
 Name: "{app}\certs"
@@ -88,13 +90,15 @@ Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionP
 Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; Kill any running Electron (GUI) processes first
+Filename: "powershell.exe"; Parameters: "-Command ""Get-Process -Name electron -ErrorAction SilentlyContinue | Stop-Process -Force"""; Flags: runhidden waituntilterminated; RunOnceId: "KillElectron"
 ; Stop and uninstall service
-Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated
-Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
+Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
 
 [Registry]
-; Add to startup (if selected)
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; Tasks: autostart
+; Add to startup for all users (if selected) - uses HKLM since installer runs as admin
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Code]
 var

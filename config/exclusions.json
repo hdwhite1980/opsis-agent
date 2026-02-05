@@ -1,0 +1,11 @@
+{
+  "services": [
+    "gpsvc",
+    "sppsvc",
+    "TrustedInstaller",
+    "msiserver",
+    "AppIDSvc"
+  ],
+  "processes": [],
+  "signatures": []
+}
