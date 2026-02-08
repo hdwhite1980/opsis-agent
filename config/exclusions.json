@@ -7,5 +7,9 @@
     "AppIDSvc"
   ],
   "processes": [],
-  "signatures": []
+  "signatures": [
+    "rb-tier3-1339",
+    "rb-tier3-1346",
+    "rb-tier3-1363"
+  ]
 }

@@ -55,6 +55,12 @@ Source: "src-tauri\target\release\opsis-agent-gui.exe"; DestDir: "{app}"; Flags:
 ; Runbooks (required at runtime)
 Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; Self-service portal
+Source: "dist\portal\portal.html"; DestDir: "{app}\dist\portal"; Flags: ignoreversion
+
+; GUI launcher batch file
+Source: "start-opsis-gui.bat"; DestDir: "{app}"; Flags: ignoreversion
+
 ; Assets
 Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
@@ -71,18 +77,47 @@ Name: "{app}\data"
 Name: "{app}\logs"
 Name: "{app}\certs"
 Name: "{app}\service"
+Name: "{app}\dist\portal"
 
 [Icons]
 Name: "{group}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
 Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
-; Install Windows Service using WinSW
+; === SECURITY HARDENING ===
+
+; 1. Set PowerShell execution policy (required for agent monitoring commands)
+Filename: "powershell.exe"; Parameters: "-Command ""Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force"""; StatusMsg: "Configuring PowerShell execution policy..."; Flags: runhidden waituntilterminated shellexec
+
+; 2. Add Defender exclusions for install directory and service exe
+Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe'"""; StatusMsg: "Adding Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
+
+; 3. Lock down NTFS permissions: SYSTEM + Administrators full control, Users read+execute only
+Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'BUILTIN\Users:(OI)(CI)RX' /T /Q"""; StatusMsg: "Setting directory permissions..."; Flags: runhidden waituntilterminated shellexec
+
+; 4. Lock down data directory: SYSTEM + Administrators only (contains API key, tickets)
+Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\data'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing data directory..."; Flags: runhidden waituntilterminated shellexec
+
+; 5. Lock down logs directory: SYSTEM + Administrators only
+Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\logs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing logs directory..."; Flags: runhidden waituntilterminated shellexec
+
+; 6. Lock down certs directory: SYSTEM + Administrators only
+Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\certs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing certificate directory..."; Flags: runhidden waituntilterminated shellexec
+
+; 7. Register Windows Event Log source for OPSIS
+Filename: "powershell.exe"; Parameters: "-Command ""if (-not [System.Diagnostics.EventLog]::SourceExists('OPSIS Agent')) {{ New-EventLog -LogName Application -Source 'OPSIS Agent' -ErrorAction SilentlyContinue }}"""; StatusMsg: "Registering event log source..."; Flags: runhidden waituntilterminated shellexec
+
+; 8. Store API key in Windows Credential Manager (DPAPI encrypted) if provided
+Filename: "powershell.exe"; Parameters: "-Command ""$key = Get-Content '{app}\data\agent.config.json' -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json | Select-Object -ExpandProperty apiKey -ErrorAction SilentlyContinue; if ($key -and $key -ne '') {{ cmdkey /generic:OPSISAgent_ApiKey /user:opsis /pass:$key | Out-Null; Write-Host 'API key stored in Credential Manager' }}"""; StatusMsg: "Securing API credentials..."; Flags: runhidden waituntilterminated shellexec
+
+; 9. Generate IPC authentication secret for GUI-to-service communication
+Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::ToBase64String((1..32 | ForEach-Object {{ [byte](Get-Random -Minimum 0 -Maximum 256) }})); $regPath = 'HKLM:\SOFTWARE\OPSIS\Agent'; if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}; Set-ItemProperty -Path $regPath -Name 'IPCSecret' -Value $secret"""; StatusMsg: "Generating IPC authentication secret..."; Flags: runhidden waituntilterminated shellexec
+
+; === SERVICE INSTALLATION ===
+
+; 10. Install and start Windows Service using WinSW
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "install"; WorkingDir: "{app}\service"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir: "{app}\service"; StatusMsg: "Starting OPSIS Agent Service..."; Flags: runhidden waituntilterminated
-
-; Add Defender exclusions
-Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'"""; Flags: runhidden waituntilterminated shellexec
 
 ; Offer to launch GUI
 Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
@@ -93,6 +128,14 @@ Filename: "powershell.exe"; Parameters: "-Command ""Get-Process -Name opsis-agen
 ; Stop and uninstall service
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
+; Remove stored credentials from Credential Manager
+Filename: "powershell.exe"; Parameters: "-Command ""cmdkey /delete:OPSISAgent_ApiKey -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
+; Remove OPSIS registry keys
+Filename: "powershell.exe"; Parameters: "-Command ""Remove-Item -Path 'HKLM:\SOFTWARE\OPSIS' -Recurse -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanRegistry"
+; Remove Defender exclusions
+Filename: "powershell.exe"; Parameters: "-Command ""Remove-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanDefender"
+; Remove Event Log source
+Filename: "powershell.exe"; Parameters: "-Command ""Remove-EventLog -Source 'OPSIS Agent' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanEventLog"
 
 [Registry]
 ; Add to startup for all users (if selected) - uses HKLM since installer runs as admin
@@ -115,7 +158,7 @@ begin
     'Enter your OPSIS server connection details',
     'Enter the server URL and API key provided by your OPSIS administrator.');
 
-  ServerURLPage.Add('Server URL (e.g., ws://opsis.yourdomain.com:8000):', False);
+  ServerURLPage.Add('Server URL (e.g., wss://opsis.yourdomain.com):', False);
   ServerURLPage.Add('API Key (e.g., opsis_xxxxxxxxxxxx):', False);
   ServerURLPage.Values[0] := '';
   ServerURLPage.Values[1] := '';

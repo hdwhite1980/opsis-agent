@@ -1450,9 +1450,10 @@ export class SystemMonitor {
         { timeout: 30000 }
       );
 
-      // Get running processes with CPU and memory
+      // Get running processes grouped by name with memory usage
+      // Avoid CPU calculation in PS (unreliable for snapshots, and StartTime throws on system processes)
       const { stdout: processRaw } = await execAsync(
-        `powershell -NoProfile -Command "Get-Process | Where-Object {$_.Id -ne 0 -and $_.MainWindowTitle -ne '' -or $_.Path} | Group-Object -Property Name | ForEach-Object { $procs = $_.Group; [PSCustomObject]@{ Name=$_.Name; CPU=[math]::Round(($procs | Measure-Object CPU -Sum).Sum / ((Get-Date) - ($procs[0].StartTime)).TotalSeconds * 100 / (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors, 1); MemMB=[math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB, 1) } } | ConvertTo-Json -Compress"`,
+        `powershell -NoProfile -Command "Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.Id -ne 0} | Group-Object -Property Name | ForEach-Object { $mem = 0; foreach ($p in $_.Group) { $mem += $p.WorkingSet64 }; [PSCustomObject]@{ Name=$_.Name; MemMB=[math]::Round($mem / 1MB, 1) } } | ConvertTo-Json -Compress"`,
         { timeout: 30000 }
       );
 
@@ -1462,32 +1463,26 @@ export class SystemMonitor {
       const processes = JSON.parse(processRaw || '[]');
       const processArr: any[] = Array.isArray(processes) ? processes : [processes];
 
-      // Build process lookup (lowercase name -> {cpu, mem})
-      const processMap = new Map<string, { cpu: number; mem: number }>();
+      // Build process lookup (lowercase name -> memory MB)
+      const processMap = new Map<string, number>();
       for (const p of processArr) {
         if (p.Name) {
-          processMap.set(p.Name.toLowerCase(), {
-            cpu: p.CPU || 0,
-            mem: p.MemMB || 0
-          });
+          processMap.set(p.Name.toLowerCase(), p.MemMB || 0);
         }
       }
 
       return installedArr.map(app => {
         const name = app.DisplayName || '';
         // Try to match installed software name to a running process
-        // Extract likely process name from display name (first word, lowercase)
         const nameWords = name.toLowerCase().split(/[\s\-_]+/);
-        let match = processMap.get(nameWords[0]);
-        if (!match && nameWords.length > 1) {
-          // Try first two words joined
-          match = processMap.get(nameWords.slice(0, 2).join(''));
+        let memMb: number | undefined = processMap.get(nameWords[0]);
+        if (memMb == null && nameWords.length > 1) {
+          memMb = processMap.get(nameWords.slice(0, 2).join(''));
         }
-        // Also try the full name with common exe patterns
-        if (!match) {
-          for (const [procName, procData] of processMap) {
+        if (memMb == null) {
+          for (const [procName, procMem] of processMap) {
             if (procName.includes(nameWords[0]) && nameWords[0].length > 3) {
-              match = procData;
+              memMb = procMem;
               break;
             }
           }
@@ -1500,9 +1495,9 @@ export class SystemMonitor {
           install_date: app.InstallDate
             ? `${app.InstallDate.substring(0, 4)}-${app.InstallDate.substring(4, 6)}-${app.InstallDate.substring(6, 8)}`
             : '',
-          is_running: !!match,
-          cpu_percent: match ? match.cpu : 0,
-          memory_mb: match ? match.mem : 0
+          is_running: memMb != null,
+          cpu_percent: 0,
+          memory_mb: memMb ?? 0
         };
       });
     } catch (error) {

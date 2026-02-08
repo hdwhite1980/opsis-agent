@@ -1284,9 +1284,12 @@ class OPSISAgentService {
 
       this.ws = new WebSocket(wsUrl, { headers });
 
-      this.ws.on('open', () => {
+      this.ws.on('open', async () => {
         this.log('Connected to OPSIS server, sending registration...');
         this.reconnectAttempts = 0; // Reset backoff on successful connection
+
+        // Collect system info for registration
+        const systemInfo = await this.collectSystemInfo();
 
         // Send registration immediately — don't wait for welcome
         this.ws!.send(JSON.stringify({
@@ -1296,7 +1299,8 @@ class OPSISAgentService {
           hostname: os.hostname(),
           agent_version: '1.0.0',
           os: `${os.platform()} ${os.release()}`,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          system_info: systemInfo
         }));
 
         // Start heartbeat immediately with default interval
@@ -4385,6 +4389,45 @@ class OPSISAgentService {
     }
 
     return null;
+  }
+
+  private async collectSystemInfo(): Promise<Record<string, any>> {
+    const cpus = os.cpus();
+    const totalMemGb = Math.round(os.totalmem() / 1024 / 1024 / 1024);
+
+    let cpuModel = cpus.length > 0 ? cpus[0].model : 'Unknown';
+    let cpuCores = cpus.length;
+    let totalDiskGb = 0;
+    let ipAddress = '';
+    let macAddress = '';
+    let osVersion = `${os.platform()} ${os.release()}`;
+
+    try {
+      // Get disk size, IP, MAC, and OS version via PowerShell in one call
+      const { stdout } = await execAsync(
+        `powershell -NoProfile -Command "$disk = Get-PSDrive -Name C -PSProvider FileSystem; $net = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {$_.Status -eq 'Up'} | Select-Object -First 1; $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown'} | Select-Object -First 1).IPAddress; $osInfo = (Get-CimInstance Win32_OperatingSystem).Caption; [PSCustomObject]@{ DiskGB=[math]::Round(($disk.Used + $disk.Free) / 1GB); IP=$ip; MAC=$net.MacAddress; OSVer=$osInfo } | ConvertTo-Json -Compress"`,
+        { timeout: 15000 }
+      );
+      const info = JSON.parse(stdout || '{}');
+      totalDiskGb = info.DiskGB || 0;
+      ipAddress = info.IP || '';
+      macAddress = (info.MAC || '').replace(/-/g, ':');
+      if (info.OSVer) osVersion = info.OSVer;
+    } catch (error) {
+      this.logger.error('Failed to collect system info for registration', error);
+    }
+
+    return {
+      cpuModel,
+      cpuCores,
+      totalMemoryGb: totalMemGb,
+      totalDiskGb,
+      ipAddress,
+      macAddress,
+      osType: 'Windows',
+      osVersion,
+      agentVersion: '1.0.0'
+    };
   }
 
   private getSystemStats(): Record<string, any> {
