@@ -12,3 +12,8 @@ agent.config.json
 docs/
 installer-output/
 nodejs/
+src-tauri/target/
+
+# System artifacts
+nul
+battery-report.html
