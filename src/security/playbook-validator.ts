@@ -154,15 +154,31 @@ export function validateStep(step: any, index: number): string[] {
     return errors;
   }
 
-  // Validate command/script content if present
+  // Validate command/script content if present (relaxed — only block dangerous patterns)
   if (step.command) {
-    const cmdErrors = validateCommand(step.command, `${prefix} command`);
-    errors.push(...cmdErrors);
+    if (typeof step.command !== 'string') {
+      errors.push(`${prefix} command: must be a string`);
+    } else {
+      for (const pattern of DIAGNOSTIC_DANGEROUS_PATTERNS) {
+        if (pattern.test(step.command)) {
+          errors.push(`${prefix} command: contains blocked pattern`);
+          break;
+        }
+      }
+    }
   }
 
   if (step.script) {
-    const scriptErrors = validateCommand(step.script, `${prefix} script`);
-    errors.push(...scriptErrors);
+    if (typeof step.script !== 'string') {
+      errors.push(`${prefix} script: must be a string`);
+    } else {
+      for (const pattern of DIAGNOSTIC_DANGEROUS_PATTERNS) {
+        if (pattern.test(step.script)) {
+          errors.push(`${prefix} script: contains blocked pattern`);
+          break;
+        }
+      }
+    }
   }
 
   // Validate params
@@ -170,11 +186,14 @@ export function validateStep(step: any, index: number): string[] {
     if (typeof step.params !== 'object') {
       errors.push(`${prefix}: params must be an object`);
     } else {
-      // Check each param value for dangerous content
       for (const [key, value] of Object.entries(step.params)) {
         if (typeof value === 'string') {
-          const paramErrors = validateParamValue(value, `${prefix} param '${key}'`);
-          errors.push(...paramErrors);
+          for (const pattern of DIAGNOSTIC_DANGEROUS_PATTERNS) {
+            if (pattern.test(value)) {
+              errors.push(`${prefix} param '${key}': contains blocked pattern`);
+              break;
+            }
+          }
         }
       }
     }

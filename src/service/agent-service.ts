@@ -3397,10 +3397,17 @@ class OPSISAgentService {
       // Step 2: Validate playbook structure and step types
       const validation = validatePlaybook(playbook);
       if (!validation.valid) {
-        this.logger.error('Playbook validation failed', {
-          errors: validation.errors,
+        this.logger.error('Playbook validation failed: ' + validation.errors.join(', '), {
           playbookId: playbook.id
         });
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'playbook_error',
+            playbook_id: playbook.id,
+            error: 'Validation failed: ' + validation.errors.join(', '),
+            timestamp: new Date().toISOString()
+          }));
+        }
         return; // Reject the playbook
       }
       this.logger.info('Playbook validated successfully', { playbookId: playbook.id });
