@@ -338,6 +338,104 @@ export class TroubleshootingRunner {
   }
 
   /**
+   * Run diagnostics by category directly (for self-service portal).
+   * Does not require a DeviceSignature.
+   */
+  async runByCategory(
+    category: IssueCategory,
+    params: Record<string, any> = {},
+    timeoutMs: number = 20000,
+    onProgress?: (step: number, total: number, description: string) => void
+  ): Promise<DiagnosticData | null> {
+    const startTime = Date.now();
+    const runbook = this.runbooks.get(category);
+
+    if (!runbook) {
+      this.logger.warn('No troubleshooting runbook for category', { category });
+      return null;
+    }
+
+    // Apply defaults for missing params
+    if (!params.target_drive) params.target_drive = 'C:';
+    if (!params.target_service) params.target_service = 'Spooler';
+
+    this.logger.info('Running diagnostics by category', { category, runbook_id: runbook.id });
+
+    const results: Record<string, DiagnosticResult> = {};
+    const errors: string[] = [];
+    const effectiveTimeout = Math.min(timeoutMs, runbook.timeout_ms || 20000);
+
+    let timedOut = false;
+    const timeoutId = setTimeout(() => { timedOut = true; }, effectiveTimeout);
+
+    try {
+      for (let i = 0; i < runbook.steps.length; i++) {
+        if (timedOut) {
+          errors.push('Timed out before completing all steps');
+          break;
+        }
+
+        const step = runbook.steps[i];
+
+        // Report progress
+        if (onProgress) {
+          const descriptions: Record<string, string> = {
+            getTopProcesses: 'Checking running processes...',
+            getProcessorDetails: 'Checking CPU details...',
+            getRecentInstalls: 'Checking recent software changes...',
+            getServiceDetails: 'Checking service status...',
+            getServiceEventLogs: 'Checking service event logs...',
+            getFailedServices: 'Checking for stopped services...',
+            getDiskUsage: 'Checking disk space...',
+            getLargestFolders: 'Analyzing folder sizes...',
+            getRecentFileGrowth: 'Checking recent file growth...',
+            getSMARTData: 'Checking disk health...',
+            getMemoryConsumers: 'Checking memory usage...',
+            getPageFileStatus: 'Checking page file...',
+            getSystemMemoryDetails: 'Checking system memory...',
+            getNetworkAdapters: 'Checking network adapters...',
+            getDNSResolutionTest: 'Testing DNS resolution...',
+            getRouteTable: 'Checking network routes...',
+            getConnectivityTest: 'Testing internet connectivity...',
+            getSystemSnapshot: 'Taking system snapshot...',
+            getRecentEventLogErrors: 'Checking event logs...'
+          };
+          onProgress(i + 1, runbook.steps.length, descriptions[step.primitive] || `Running ${step.primitive}...`);
+        }
+
+        try {
+          const resolvedParams = this.resolveParams(step.params, params);
+          const result = await this.executeDiagnosticPrimitive(step.primitive, resolvedParams);
+          results[step.output_key] = result;
+          if (!result.success && result.error) {
+            errors.push(`${step.primitive}: ${result.error}`);
+          }
+        } catch (error: any) {
+          errors.push(`${step.primitive}: ${error.message}`);
+          results[step.output_key] = {
+            success: false,
+            error: error.message,
+            duration_ms: 0,
+            collected_at: new Date().toISOString()
+          };
+        }
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    return {
+      runbook_id: runbook.id,
+      category,
+      collected_at: new Date().toISOString(),
+      duration_ms: Date.now() - startTime,
+      data: results,
+      partial_failure: errors.length > 0,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  }
+
+  /**
    * Extract parameters from signature for template substitution
    */
   private extractParamsFromSignature(signature: DeviceSignature): Record<string, any> {

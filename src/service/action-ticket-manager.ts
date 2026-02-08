@@ -6,7 +6,7 @@ import * as crypto from 'crypto';
 export type ActionStatus = 'open' | 'in-progress' | 'resolved' | 'failed' | 'closed';
 
 export interface ActionTicket extends Ticket {
-  action_type: 'AUTO_REMEDIATION' | 'MANUAL_ACTION' | 'ESCALATION';
+  action_type: 'AUTO_REMEDIATION' | 'MANUAL_ACTION' | 'ESCALATION' | 'SELF_SERVICE';
   playbook_id?: string;
   signature_id?: string;
   steps_completed?: number;

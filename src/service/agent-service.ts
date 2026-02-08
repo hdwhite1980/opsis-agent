@@ -24,6 +24,7 @@ import { ActionTicketManager } from './action-ticket-manager';
 import { TroubleshootingRunner, DiagnosticData } from './troubleshooting-runner';
 import { StateTracker, StateChangeEvent, SeverityEscalationEvent } from './state-tracker';
 import { MaintenanceWindowManager, MaintenanceWindow } from './maintenance-windows';
+import { SelfServiceServer } from './self-service-server';
 
 // Security imports
 import {
@@ -267,6 +268,9 @@ class OPSISAgentService {
   private awaitingReviewSignals: Set<string> = new Set(); // Signals that shouldn't be re-escalated (awaiting technician)
   private readonly pendingActionsPath: string;
 
+  // Self-service portal
+  private selfServiceServer: SelfServiceServer | null = null;
+
   // Monitoring trap agent features
   private stateTracker!: StateTracker;
   private maintenanceManager!: MaintenanceWindowManager;
@@ -349,6 +353,15 @@ class OPSISAgentService {
     // Initialize IPC server for GUI communication
     this.ipcServer = new IPCServer(this.logger);
     this.setupIPCHandlers();
+
+    // Initialize self-service portal
+    this.selfServiceServer = new SelfServiceServer(
+      this.logger,
+      this.troubleshootingRunner,
+      this.actionTicketManager,
+      this.ticketDb,
+      this.baseDir
+    );
     
     // Send initial data when GUI connects
     this.ipcServer.onClientConnected((socket) => {
@@ -1074,6 +1087,13 @@ class OPSISAgentService {
     await this.ipcServer.start();
     this.log('IPC server started');
 
+    // Start self-service portal
+    if (this.selfServiceServer) {
+      await this.selfServiceServer.start();
+      this.selfServiceServer.onResolution = (data) => this.reportSelfServiceResolution(data);
+      this.log(`Self-service portal started on http://localhost:${this.selfServiceServer.getPort()}`);
+    }
+
     // Load pending actions from disk
     this.loadPendingActions();
 
@@ -1156,6 +1176,10 @@ class OPSISAgentService {
     // Kill GUI before stopping IPC
     if (this.guiLauncher) {
       this.guiLauncher.killGui();
+    }
+
+    if (this.selfServiceServer) {
+      this.selfServiceServer.stop();
     }
 
     if (this.ipcServer) {
@@ -1515,6 +1539,13 @@ class OPSISAgentService {
           this.handleCancelMaintenanceWindow(data.data || data);
           break;
 
+        case 'self_service_response':
+          // AI escalation response for self-service portal
+          if (this.selfServiceServer && data.session_id) {
+            this.selfServiceServer.handleEscalationResponse(data.session_id, data);
+          }
+          break;
+
         default:
           this.logger.warn('Unknown message type', { type: data.type, raw: JSON.stringify(data) });
       }
@@ -1545,10 +1576,22 @@ class OPSISAgentService {
     }
 
     // Broadcast to all connected GUI clients
-    this.ipcServer.broadcast({
-      type: 'service-alert',
-      data: alert
-    });
+    if (this.ipcServer.hasAuthenticatedClients()) {
+      this.ipcServer.broadcast({
+        type: 'service-alert',
+        data: alert
+      });
+    } else {
+      // No GUI connected — show native Windows notification
+      this.logger.info('No GUI connected, using native Windows dialog for service alert');
+      const { spawn } = require('child_process');
+      const title = `Service Alert: ${String(alert.service || 'Unknown Service').replace(/[`$&|;<>\r\n"]/g, '')}`;
+      const severity = alert.severity || 'info';
+      const msg = String(alert.message || alert.description || `${alert.service} is experiencing issues`).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+      const icon = severity === 'critical' ? 'Error' : severity === 'warning' ? 'Warning' : 'Information';
+      const psScript = `Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('${msg}', '${title.replace(/'/g, "''")}', 'OK', '${icon}')`;
+      spawn('powershell.exe', ['-NoProfile', '-Command', psScript], { detached: true, stdio: 'ignore' });
+    }
   }
 
   // Handle service alert resolution
@@ -1606,18 +1649,54 @@ class OPSISAgentService {
       timer
     });
 
-    // Broadcast to GUI
-    this.ipcServer.broadcast({
-      type: 'user-prompt',
-      data: {
-        id: promptId,
-        title: promptData.title || 'Action Required',
-        message: promptData.message || '',
-        buttons: promptData.buttons || ['OK', 'Cancel'],
-        action_on_confirm: promptData.action_on_confirm,
-        timeout: promptData.timeout || 300
+    if (this.ipcServer.hasAuthenticatedClients()) {
+      // GUI is connected — broadcast via IPC
+      this.ipcServer.broadcast({
+        type: 'user-prompt',
+        data: {
+          id: promptId,
+          title: promptData.title || 'Action Required',
+          message: promptData.message || '',
+          buttons: promptData.buttons || ['OK', 'Cancel'],
+          action_on_confirm: promptData.action_on_confirm,
+          timeout: promptData.timeout || 300
+        }
+      });
+    } else {
+      // No GUI connected — fall back to native Windows dialog
+      this.logger.info('No GUI connected, using native Windows prompt for server user-prompt');
+      const { spawnSync } = require('child_process');
+      const title = String(promptData.title || 'Action Required').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+      const msg = String(promptData.message || '').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+      const buttons = promptData.buttons || ['OK', 'Cancel'];
+      // Map button labels to WPF button enum
+      const hasCancel = buttons.some((b: string) => /cancel|no|later|decline/i.test(b));
+      const wpfButtons = hasCancel ? 'YesNo' : 'OK';
+      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${msg}', 'OPSIS Agent - ${title}', '${wpfButtons}', 'Information'); Write-Output $result`;
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: (promptData.timeout || 300) * 1000 });
+      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
+      this.logger.info('Native user-prompt result', { promptId, result: output });
+
+      // Resolve the pending prompt
+      clearTimeout(timer);
+      const pending = this.pendingPrompts.get(promptId);
+      if (pending) {
+        this.pendingPrompts.delete(promptId);
+        const userResponse = (output === 'Yes' || output === 'OK') ? 'ok' : 'cancel';
+        pending.resolve(userResponse);
+
+        // Notify server of the response
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(JSON.stringify({
+            type: 'user-prompt-response',
+            prompt_id: promptId,
+            response: userResponse,
+            device_id: this.deviceInfo.device_id,
+            timestamp: new Date().toISOString()
+          }));
+        }
       }
-    });
+    }
   }
 
   /**
@@ -1707,30 +1786,49 @@ class OPSISAgentService {
 
     this.logger.info('User-prompt step: showing prompt to user', { action });
 
-    const response = await new Promise<string>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingPrompts.delete(promptId);
-        resolve('timeout');
-      }, timeout * 1000);
+    let response: string;
 
-      this.pendingPrompts.set(promptId, {
-        resolve,
-        action_on_confirm: params.action_on_confirm,
-        timer
-      });
+    if (this.ipcServer.hasAuthenticatedClients()) {
+      // GUI is connected — use IPC prompt
+      response = await new Promise<string>((resolve) => {
+        const timer = setTimeout(() => {
+          this.pendingPrompts.delete(promptId);
+          resolve('timeout');
+        }, timeout * 1000);
 
-      this.ipcServer.broadcast({
-        type: 'user-prompt',
-        data: {
-          id: promptId,
-          title: params.title || 'Action Required',
-          message: action,
-          buttons: params.buttons || ['OK', 'Cancel'],
+        this.pendingPrompts.set(promptId, {
+          resolve,
           action_on_confirm: params.action_on_confirm,
-          timeout
-        }
+          timer
+        });
+
+        this.ipcServer.broadcast({
+          type: 'user-prompt',
+          data: {
+            id: promptId,
+            title: params.title || 'Action Required',
+            message: action,
+            buttons: params.buttons || ['OK', 'Cancel'],
+            action_on_confirm: params.action_on_confirm,
+            timeout
+          }
+        });
       });
-    });
+    } else {
+      // No GUI connected — fall back to native Windows dialog
+      this.logger.info('No GUI connected, using native Windows prompt for playbook user-prompt');
+      const { spawnSync } = require('child_process');
+      const title = String(params.title || 'Action Required').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+      const msg = String(action).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+      const buttons = params.buttons || ['OK', 'Cancel'];
+      const hasCancel = buttons.some((b: string) => /cancel|no|later|decline/i.test(b));
+      const wpfButtons = hasCancel ? 'YesNo' : 'OK';
+      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${msg}', 'OPSIS Agent - ${title}', '${wpfButtons}', 'Information'); Write-Output $result`;
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: timeout * 1000 });
+      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
+      response = (output === 'Yes' || output === 'OK') ? 'ok' : (output === 'timeout' ? 'timeout' : 'cancel');
+      this.logger.info('Native user-prompt result', { promptId, result: output });
+    }
 
     this.logger.info('User-prompt step response', { promptId, response });
   }
@@ -4483,6 +4581,29 @@ class OPSISAgentService {
     } catch (error) {
       this.logger.error('Failed to get server runbook', error);
       return null;
+    }
+  }
+
+  // Report self-service resolution to server for MSP dashboard metrics
+  private reportSelfServiceResolution(data: {
+    category: string;
+    resolution_time_seconds: number;
+    user_satisfaction?: number;
+    fix_applied?: string;
+    auto_resolved: boolean;
+    session_messages: number;
+    ticket_id?: string;
+  }): void {
+    this.logger.info('Self-service resolution', data);
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'self_service_resolution',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        data
+      }));
     }
   }
 }

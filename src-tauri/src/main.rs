@@ -28,8 +28,12 @@ fn main() {
                 MenuItemBuilder::with_id("restart_service", "Restart Service").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
+            let get_help_item =
+                MenuItemBuilder::with_id("get_help", "Get Help").build(app)?;
+
             let tray_menu = MenuBuilder::new(app)
                 .item(&show_item)
+                .item(&get_help_item)
                 .item(&view_logs_item)
                 .separator()
                 .item(&restart_item)
@@ -48,6 +52,10 @@ fn main() {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
+                        }
+                        "get_help" => {
+                            // Open self-service portal in default browser
+                            let _ = open::that("http://localhost:19850");
                         }
                         "view_logs" => {
                             // Open the log file in the default text editor

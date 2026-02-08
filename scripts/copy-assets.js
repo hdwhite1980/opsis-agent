@@ -71,4 +71,10 @@ if (fs.existsSync(rootAssets)) {
   console.log('✓ Copied root assets');
 }
 
+// Copy self-service portal HTML
+copyFile(
+  path.join(__dirname, '..', 'src', 'portal', 'portal.html'),
+  path.join(__dirname, '..', 'dist', 'portal', 'portal.html')
+);
+
 console.log('Asset copy complete!');

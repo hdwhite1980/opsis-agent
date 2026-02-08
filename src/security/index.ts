@@ -304,7 +304,8 @@ export const IPCMessageTypes = [
   'set-config', 'execute-playbook', 'submit-manual-ticket',
   'get-diagnostics', 'restart-service', 'test-escalation',
   'create-maintenance-window', 'cancel-maintenance-window',
-  'get-maintenance-windows', 'get-state-tracker-summary'
+  'get-maintenance-windows', 'get-state-tracker-summary',
+  'get-self-service-stats'
 ] as const;
 
 export const IPCMessageSchema = z.object({

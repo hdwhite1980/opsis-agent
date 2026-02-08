@@ -21,7 +21,8 @@
     "scripts": "dist/**/*.js",
     "assets": [
       "runbooks/**/*",
-      "config/**/*"
+      "config/**/*",
+      "dist/portal/**/*"
     ],
     "outputPath": "dist"
   },

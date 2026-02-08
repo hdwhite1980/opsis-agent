@@ -41,6 +41,12 @@ export class GuiLauncher {
 
   public launchGui(): void {
     try {
+      // Check if GUI is already running
+      if (this.isGuiRunning()) {
+        this.logger.info('GUI is already running, skipping launch');
+        return;
+      }
+
       const loggedInUser = this.getLoggedInUser();
       if (!loggedInUser) {
         this.logger.warn('No logged-in user found, skipping GUI launch');
@@ -85,8 +91,8 @@ Start-ScheduledTask -TaskName $taskName
     try {
       this.logger.info('Stopping GUI processes');
 
-      // Stop electron processes
-      securePowerShell('Stop-Process -Name electron -Force -ErrorAction SilentlyContinue', { timeout: 10000 });
+      // Stop Tauri GUI processes
+      securePowerShell('Stop-Process -Name "opsis-agent-gui" -Force -ErrorAction SilentlyContinue', { timeout: 10000 });
     } catch {
       // Ignore errors — process may not be running
     }
@@ -100,6 +106,19 @@ Start-ScheduledTask -TaskName $taskName
     }
 
     this.logger.info('GUI processes stopped');
+  }
+
+  private isGuiRunning(): boolean {
+    try {
+      const result = securePowerShell(
+        '(Get-Process -Name "opsis-agent-gui" -ErrorAction SilentlyContinue).Count',
+        { timeout: 10000 }
+      );
+      const count = parseInt(result.stdout.trim(), 10);
+      return !isNaN(count) && count > 0;
+    } catch {
+      return false;
+    }
   }
 
   private getLoggedInUser(): string | null {
