@@ -1,6 +1,7 @@
 import { Logger } from '../common/logger';
 import { TicketDatabase, Ticket } from './ticket-database';
 import * as os from 'os';
+import * as crypto from 'crypto';
 
 export type ActionStatus = 'open' | 'in-progress' | 'resolved' | 'failed' | 'closed';
 
@@ -32,7 +33,8 @@ export class ActionTicketManager {
     description: string,
     totalSteps: number
   ): string {
-    const ticketId = `action-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // SECURITY: Use cryptographically secure random ID
+    const ticketId = `action-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
     
     const ticket: ActionTicket = {
       ticket_id: ticketId,
@@ -95,20 +97,10 @@ export class ActionTicketManager {
     if (ticket) {
       (ticket as ActionTicket).resolution_time_seconds = executionTimeSeconds;
     }
-    
-    this.ticketDb.updateTicketStatus(ticketId, 'resolved', resolution);
-    
-    // Auto-close after 5 seconds
-    setTimeout(() => {
-      const currentTicket = this.ticketDb.getTicket(ticketId);
-      if (currentTicket) {
-        // Manually set status to closed since it's not in the type union
-        (currentTicket as any).status = 'closed';
-        this.ticketDb.updateTicketStatus(ticketId, 'resolved', 'Auto-closed after successful resolution');
-        this.logger.info('Action ticket auto-closed', { ticketId });
-      }
-    }, 5000);
-    
+
+    // Use closeTicket to properly set result='success' for success rate calculation
+    this.ticketDb.closeTicket(ticketId, resolution, 'success');
+
     this.logger.info('Action ticket resolved', {
       ticketId,
       executionTimeSeconds
@@ -126,18 +118,20 @@ export class ActionTicketManager {
     const ticket = this.ticketDb.getTicket(ticketId);
     if (ticket) {
       (ticket as ActionTicket).error_message = errorMessage;
-      this.ticketDb.updateTicketStatus(ticketId, 'failed');
     }
-    
+
+    // Use closeTicket to properly set result='failure' for success rate calculation
+    this.ticketDb.closeTicket(ticketId, errorMessage, 'failure');
+
     this.logger.error('Action ticket failed', {
       ticketId,
       error: errorMessage
     });
-    
+
     if (createEscalation) {
       return this.createEscalationTicket(ticket as ActionTicket, errorMessage);
     }
-    
+
     return null;
   }
   

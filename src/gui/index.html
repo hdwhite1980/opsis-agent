@@ -979,9 +979,12 @@
             background: rgba(0,0,0,0.7);
             backdrop-filter: blur(4px);
             z-index: 10000;
-            display: flex;
+            display: none;
             align-items: center;
             justify-content: center;
+        }
+        .prompt-overlay.visible {
+            display: flex;
         }
         .prompt-modal {
             background: #162A40;
@@ -1053,7 +1056,7 @@
 </head>
 <body>
     <!-- User Prompt Modal Overlay -->
-    <div id="userPromptOverlay" class="prompt-overlay" style="display:none">
+    <div id="userPromptOverlay" class="prompt-overlay">
         <div class="prompt-modal">
             <div class="prompt-icon" id="promptIcon"></div>
             <h2 id="promptTitle"></h2>
@@ -1069,7 +1072,7 @@
                 <img src="assets/opsis-logo-icon.png" alt="OPSIS" style="width: 32px; height: 32px;">
             </div>
             
-            <div class="nav-item active" onclick="switchView('dashboard')" title="Dashboard">
+            <div class="nav-item active" data-view="dashboard" title="Dashboard">
                 <svg viewBox="0 0 24 24">
                     <rect x="3" y="3" width="7" height="7"></rect>
                     <rect x="14" y="3" width="7" height="7"></rect>
@@ -1077,7 +1080,7 @@
                     <rect x="3" y="14" width="7" height="7"></rect>
                 </svg>
             </div>
-            <div class="nav-item" onclick="switchView('submit')" title="Submit Issue">
+            <div class="nav-item" data-view="submit" title="Submit Issue">
                 <svg viewBox="0 0 24 24">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
                     <polyline points="14 2 14 8 20 8"></polyline>
@@ -1085,7 +1088,7 @@
                     <line x1="9" y1="15" x2="15" y2="15"></line>
                 </svg>
             </div>
-            <div class="nav-item" onclick="switchView('tickets')" title="Tickets">
+            <div class="nav-item" data-view="tickets" title="Tickets">
                 <svg viewBox="0 0 24 24">
                     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
                     <polyline points="14 2 14 8 20 8"></polyline>
@@ -1094,12 +1097,12 @@
                     <polyline points="10 9 9 9 8 9"></polyline>
                 </svg>
             </div>
-            <div class="nav-item" onclick="switchView('health')" title="System Health">
+            <div class="nav-item" data-view="health" title="System Health">
                 <svg viewBox="0 0 24 24">
                     <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
                 </svg>
             </div>
-            <div class="nav-item" onclick="switchView('settings')" title="Settings">
+            <div class="nav-item" data-view="settings" title="Settings">
                 <svg viewBox="0 0 24 24">
                     <circle cx="12" cy="12" r="3"></circle>
                     <path d="M12 1v6m0 6v6m9-9h-6m-6 0H3m15.4-6.4l-4.2 4.2m-6 6l-4.2 4.2m12.8 0l-4.2-4.2m-6-6l-4.2-4.2"></path>
@@ -1478,7 +1481,27 @@
     </div>
 
     <script>
-        const { ipcRenderer } = require('electron');
+        // Debug: catch all errors and show on screen
+        window.onerror = function(msg, url, line, col, err) {
+            let d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:red;color:white;padding:10px;z-index:99999;font-size:14px;white-space:pre-wrap;';
+            d.textContent = 'JS ERROR: ' + msg + '\nLine: ' + line + '\nCol: ' + col + '\n\n__TAURI__ keys: ' + (window.__TAURI__ ? Object.keys(window.__TAURI__).join(', ') : 'UNDEFINED');
+            document.body.appendChild(d);
+        };
+
+        // Tauri API (withGlobalTauri: true)
+        let invoke, listen, appWindow;
+        try {
+            invoke = window.__TAURI__.core.invoke;
+            listen = window.__TAURI__.event.listen;
+            const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
+            appWindow = getCurrentWebviewWindow();
+        } catch(e) {
+            let d = document.createElement('div');
+            d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:orange;color:black;padding:10px;z-index:99999;font-size:14px;white-space:pre-wrap;';
+            d.textContent = 'TAURI INIT ERROR: ' + e.message + '\n\n__TAURI__ = ' + JSON.stringify(window.__TAURI__ ? Object.keys(window.__TAURI__) : 'undefined');
+            document.body.appendChild(d);
+        }
 
         // Auto-refresh every 10 seconds
         setInterval(refreshData, 10000);
@@ -1488,13 +1511,46 @@
             setTimeout(() => {
                 loadSettings();  // Load saved settings first
                 refreshData();   // Then load ticket data
+                setupEventListeners();
             }, 250); // Give DOM time to fully render
         });
 
-        function refreshData() {
-            ipcRenderer.send('get-stats');
-            ipcRenderer.send('get-tickets');
-            ipcRenderer.send('get-health-data');
+        // Temporary: show errors on screen for debugging
+        function showDebugError(label, err) {
+            let box = document.getElementById('debugErrors');
+            if (!box) {
+                box = document.createElement('div');
+                box.id = 'debugErrors';
+                box.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#1a1a2e;color:#ff6b6b;padding:8px 12px;font-size:11px;z-index:99999;max-height:150px;overflow-y:auto;font-family:monospace;border-top:2px solid #ff6b6b;';
+                document.body.appendChild(box);
+            }
+            box.innerHTML += label + ': ' + (typeof err === 'string' ? err : JSON.stringify(err)) + '<br>';
+        }
+
+        async function refreshData() {
+            try {
+                const stats = await invoke('get_stats');
+                document.getElementById('issuesDetected').textContent = stats.issuesDetected || 0;
+                document.getElementById('activeTickets').textContent = stats.activeTickets || 0;
+                document.getElementById('issuesEscalated').textContent = stats.issuesEscalated || 0;
+                document.getElementById('successRate').textContent = (stats.successRate || 0) + '%';
+            } catch (e) { showDebugError('Stats', e); }
+
+            try {
+                const tickets = await invoke('get_tickets');
+                const groups = groupTickets(tickets);
+                renderTicketGroups('dashboardTickets', groups.slice(0, 10));
+                renderTicketGroups('allTickets', groups);
+            } catch (e) { showDebugError('Tickets', e); }
+
+            try {
+                const data = await invoke('get_health_data');
+                renderHealthScores(data.healthScores || {});
+                renderCorrelations(data.correlations || {});
+                renderPatterns(data.patterns || []);
+                renderDashboardHealth(data.healthScores || {});
+                renderDashboardActions(data.proactiveActions || []);
+            } catch (e) { showDebugError('Health', e); }
         }
 
         // ============================================
@@ -1502,33 +1558,35 @@
         // ============================================
         let activeServiceAlerts = [];
 
-        ipcRenderer.on('service-alert', (event, alert) => {
-            // Add or update alert
-            const idx = activeServiceAlerts.findIndex(a => a.id === alert.id);
-            if (idx >= 0) {
-                activeServiceAlerts[idx] = alert;
-            } else {
-                activeServiceAlerts.push(alert);
-            }
-            renderServiceAlerts();
-        });
+        async function setupEventListeners() {
+            await listen('service-alert', (event) => {
+                const alert = event.payload;
+                const idx = activeServiceAlerts.findIndex(a => a.id === alert.id);
+                if (idx >= 0) {
+                    activeServiceAlerts[idx] = alert;
+                } else {
+                    activeServiceAlerts.push(alert);
+                }
+                renderServiceAlerts();
+            });
 
-        ipcRenderer.on('service-alerts', (event, alerts) => {
-            // Bulk load (from initial-data or get-service-alerts)
-            activeServiceAlerts = alerts || [];
-            renderServiceAlerts();
-        });
+            await listen('service-alerts', (event) => {
+                activeServiceAlerts = event.payload || [];
+                renderServiceAlerts();
+            });
 
-        ipcRenderer.on('service-alert-resolved', (event, data) => {
-            activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== data.id);
-            renderServiceAlerts();
-        });
+            await listen('service-alert-resolved', (event) => {
+                activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== event.payload.id);
+                renderServiceAlerts();
+            });
+
+            await listen('user-prompt', (event) => {
+                showUserPrompt(event.payload);
+            });
+        }
 
         // User Prompt handling
         let activePromptTimer = null;
-        ipcRenderer.on('user-prompt', (event, data) => {
-            showUserPrompt(data);
-        });
 
         function showUserPrompt(data) {
             const overlay = document.getElementById('userPromptOverlay');
@@ -1562,11 +1620,11 @@
                 }
                 btn.onclick = () => {
                     if (activePromptTimer) { clearInterval(activePromptTimer); activePromptTimer = null; }
-                    overlay.style.display = 'none';
-                    ipcRenderer.send('user-prompt-response', {
+                    overlay.classList.remove('visible');
+                    invoke('user_prompt_response', {
                         promptId: data.id,
                         response: idx === 0 ? 'ok' : 'cancel'
-                    });
+                    }).catch(() => {});
                 };
                 buttonsDiv.appendChild(btn);
             });
@@ -1581,11 +1639,11 @@
                     if (remaining <= 0) {
                         clearInterval(activePromptTimer);
                         activePromptTimer = null;
-                        overlay.style.display = 'none';
-                        ipcRenderer.send('user-prompt-response', {
+                        overlay.classList.remove('visible');
+                        invoke('user_prompt_response', {
                             promptId: data.id,
                             response: 'timeout'
-                        });
+                        }).catch(() => {});
                     } else {
                         countdown.textContent = 'Auto-dismissing in ' + remaining + 's';
                     }
@@ -1594,7 +1652,7 @@
                 countdown.style.display = 'none';
             }
 
-            overlay.style.display = 'flex';
+            overlay.classList.add('visible');
         }
 
         function renderServiceAlerts() {
@@ -1645,23 +1703,8 @@
         function dismissAlert(alertId) {
             activeServiceAlerts = activeServiceAlerts.filter(a => a.id !== alertId);
             renderServiceAlerts();
-            ipcRenderer.send('dismiss-alert', alertId);
+            invoke('dismiss_alert', { alertId }).catch(() => {});
         }
-
-        // Statistics
-        ipcRenderer.on('stats-data', (event, data) => {
-            document.getElementById('issuesDetected').textContent = data.issuesDetected || 0;
-            document.getElementById('activeTickets').textContent = data.activeTickets || 0;
-            document.getElementById('issuesEscalated').textContent = data.issuesEscalated || 0;
-            document.getElementById('successRate').textContent = (data.successRate || 0) + '%';
-        });
-
-        // Tickets
-        ipcRenderer.on('tickets-data', (event, tickets) => {
-            const groups = groupTickets(tickets);
-            renderTicketGroups('dashboardTickets', groups.slice(0, 10));
-            renderTicketGroups('allTickets', groups);
-        });
 
         function getDedupeKey(ticket) {
             const type = ticket.type || ticket.issue_type || 'unknown';
@@ -1820,33 +1863,38 @@
             return Math.floor(seconds / 86400) + 'd ago';
         }
 
-        function clearOldTickets() {
+        async function clearOldTickets() {
             if (confirm('Clear all tickets older than 24 hours?')) {
-                ipcRenderer.send('clear-old-tickets');
+                try {
+                    const count = await invoke('clear_old_tickets');
+                    alert(`Cleared ${count} old tickets`);
+                    refreshData();
+                } catch (e) {
+                    console.error('Clear tickets error:', e);
+                }
             }
         }
 
-        ipcRenderer.on('tickets-cleared', (event, count) => {
-            alert(`Cleared ${count} old tickets`);
-            refreshData();
-        });
-
         // Submit Issue
-        function submitIssue(event) {
+        async function submitIssue(event) {
             event.preventDefault();
-            
+
             const serverName = document.getElementById('serverName').value;
             const category = document.getElementById('issueCategory').value;
             const description = document.getElementById('issueDescription').value;
             const priority = document.getElementById('issuePriority').value;
 
-            ipcRenderer.send('submit-manual-ticket', {
-                serverName,
-                category,
-                description,
-                priority,
-                submittedAt: new Date().toISOString()
-            });
+            try {
+                await invoke('submit_manual_ticket', {
+                    ticket: {
+                        serverName,
+                        category,
+                        description,
+                        priority,
+                        submittedAt: new Date().toISOString()
+                    }
+                });
+            } catch (e) { console.error('Submit error:', e); }
 
             // Show success message
             const successMsg = document.getElementById('successMessage');
@@ -1855,25 +1903,33 @@
 
             // Reset form
             document.getElementById('submitForm').reset();
-            
+
             // Refresh data
             setTimeout(refreshData, 1000);
         }
 
         // Navigation
-        function switchView(viewName) {
+        function switchView(viewName, el) {
             // Update nav items
             document.querySelectorAll('.nav-item').forEach(item => {
                 item.classList.remove('active');
             });
-            event.currentTarget.classList.add('active');
+            if (el) el.classList.add('active');
 
             // Update views
             document.querySelectorAll('.view').forEach(view => {
                 view.classList.remove('active');
             });
-            document.getElementById(viewName + '-view').classList.add('active');
+            var target = document.getElementById(viewName + '-view');
+            if (target) target.classList.add('active');
         }
+
+        // Bind nav items via addEventListener (CSP-safe)
+        document.querySelectorAll('.nav-item[data-view]').forEach(function(item) {
+            item.addEventListener('click', function() {
+                switchView(this.getAttribute('data-view'), this);
+            });
+        });
 
         function toggleSetting(element) {
             element.classList.toggle('active');
@@ -1900,9 +1956,9 @@
             const verification = localStorage.getItem('opsis-settings');
             console.log('Verification - what was actually saved:', verification);
             
-            // Send to agent service via IPC
-            ipcRenderer.send('update-settings', settings);
-            console.log('Sent to agent via IPC');
+            // Send to agent service via Tauri
+            invoke('update_settings', { settings }).catch(e => console.error('Settings save error:', e));
+            console.log('Sent to agent via Tauri');
             
             // Show success message
             const successMsg = document.createElement('div');
@@ -1928,37 +1984,18 @@
             }
         }
         
-        function loadSettings() {
-            console.log('Loading settings...');
-            const saved = localStorage.getItem('opsis-settings');
-            if (saved) {
-                try {
-                    const settings = JSON.parse(saved);
-                    console.log('Settings loaded from localStorage:', settings);
-                    
-                    // Load all settings
-                    if (settings.serverUrl) document.getElementById('serverIP').value = settings.serverUrl;
-                    if (settings.monitorInterval) document.getElementById('monitorInterval').value = settings.monitorInterval;
-                    if (settings.alertEmail) document.getElementById('alertEmail').value = settings.alertEmail;
-                    if (settings.logRetention) document.getElementById('logRetention').value = settings.logRetention;
-                    if (settings.confidenceThreshold) document.getElementById('confidenceThreshold').value = settings.confidenceThreshold;
-                    
-                } catch (error) {
-                    console.error('Failed to load settings:', error);
-                }
-            } else {
-                console.log('No saved settings found');
+        async function loadSettings() {
+            try {
+                const settings = await invoke('get_settings');
+                if (settings.serverUrl) document.getElementById('serverIP').value = settings.serverUrl;
+                if (settings.monitorInterval) document.getElementById('monitorInterval').value = settings.monitorInterval;
+                if (settings.alertEmail) document.getElementById('alertEmail').value = settings.alertEmail;
+                if (settings.logRetention) document.getElementById('logRetention').value = settings.logRetention;
+                if (settings.confidenceThreshold) document.getElementById('confidenceThreshold').value = settings.confidenceThreshold;
+            } catch (e) {
+                console.error('Failed to load settings:', e);
             }
         }
-
-        // Health Data
-        ipcRenderer.on('health-data', (event, data) => {
-            renderHealthScores(data.healthScores || {});
-            renderCorrelations(data.correlations || {});
-            renderPatterns(data.patterns || []);
-            renderDashboardHealth(data.healthScores || {});
-            renderDashboardActions(data.proactiveActions || []);
-        });
 
         function renderHealthScores(scores) {
             const grid = document.getElementById('healthScoresGrid');
@@ -2101,9 +2138,7 @@
         }
 
         function minimizeWindow() {
-            const { remote } = require('electron');
-            const win = remote.getCurrentWindow();
-            win.minimize();
+            appWindow.minimize();
         }
     </script>
 </body>

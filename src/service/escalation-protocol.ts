@@ -1,6 +1,7 @@
 import { Logger } from '../common/logger';
 import { DeviceSignature } from './signature-generator';
 import { RunbookMatch } from './event-monitor';
+import { DiagnosticData } from './troubleshooting-runner';
 
 export interface EscalationPayload {
   tenant_id: string;
@@ -35,6 +36,17 @@ export interface EscalationPayload {
   }>;
   local_confidence: number;
   requested_outcome: 'recommend_playbook' | 'diagnose_root_cause' | 'needs_approval' | 'needs_outage_correlation';
+
+  // Pre-escalation diagnostic data collected by troubleshooting runbooks
+  pre_escalation_diagnostics?: {
+    runbook_id: string;
+    category: string;
+    collected_at: string;
+    duration_ms: number;
+    data: Record<string, any>;
+    partial_failure: boolean;
+    errors?: string[];
+  };
 }
 
 export interface ServerDecision {
@@ -64,9 +76,10 @@ export class EscalationProtocol {
   buildEscalationPayload(
     signature: DeviceSignature,
     runbook: RunbookMatch | null,
-    recentActions: any[]
+    recentActions: any[],
+    diagnosticData?: DiagnosticData | null
   ): EscalationPayload {
-    return {
+    const payload: EscalationPayload = {
       tenant_id: signature.tenant_id,
       device_id: signature.device_id,
       signature_id: signature.signature_id,
@@ -95,6 +108,61 @@ export class EscalationProtocol {
       local_confidence: signature.confidence_local,
       requested_outcome: this.determineRequestedOutcome(signature, runbook)
     };
+
+    // Include diagnostic data if provided
+    if (diagnosticData) {
+      payload.pre_escalation_diagnostics = {
+        runbook_id: diagnosticData.runbook_id,
+        category: diagnosticData.category,
+        collected_at: diagnosticData.collected_at,
+        duration_ms: diagnosticData.duration_ms,
+        data: this.sanitizeDiagnosticData(diagnosticData.data),
+        partial_failure: diagnosticData.partial_failure,
+        errors: diagnosticData.errors
+      };
+
+      this.logger.info('Diagnostic data attached to escalation', {
+        signature_id: signature.signature_id,
+        runbook_id: diagnosticData.runbook_id,
+        category: diagnosticData.category,
+        data_keys: Object.keys(diagnosticData.data)
+      });
+    }
+
+    return payload;
+  }
+
+  /**
+   * Sanitize diagnostic data to remove sensitive information
+   */
+  private sanitizeDiagnosticData(data: Record<string, any>): Record<string, any> {
+    const sanitized: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(data)) {
+      if (value && typeof value === 'object') {
+        // Convert to JSON string, sanitize, then parse back
+        let jsonStr = JSON.stringify(value);
+
+        // Redact user paths
+        jsonStr = jsonStr.replace(/C:\\\\Users\\\\[^\\\\]+/g, 'C:\\\\Users\\\\<user>');
+
+        // Redact IP addresses (but keep localhost and common network IPs)
+        jsonStr = jsonStr.replace(/\b(?!127\.0\.0\.1|0\.0\.0\.0|255\.255\.255\.255|192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[01])\.)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, '<redacted-ip>');
+
+        // Redact tokens (long alphanumeric strings that look like secrets)
+        jsonStr = jsonStr.replace(/\b[A-Za-z0-9+/=_\-]{40,}\b/g, '<redacted-token>');
+
+        try {
+          sanitized[key] = JSON.parse(jsonStr);
+        } catch {
+          sanitized[key] = value;
+        }
+      } else {
+        sanitized[key] = value;
+      }
+    }
+
+    return sanitized;
   }
   
   private sanitizeDetails(details: Record<string, any>): Record<string, any> {

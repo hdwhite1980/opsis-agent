@@ -1,7 +1,33 @@
-import { execSync } from 'child_process';
+import { spawnSync, SpawnSyncOptions } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from '../common/logger';
+
+/**
+ * Execute PowerShell script securely using spawnSync with -EncodedCommand
+ */
+function securePowerShell(script: string, options: { timeout?: number } = {}): { stdout: string; success: boolean } {
+  const encodedCommand = Buffer.from(script, 'utf16le').toString('base64');
+
+  const spawnOptions: SpawnSyncOptions = {
+    encoding: 'utf-8',
+    timeout: options.timeout || 30000,
+    windowsHide: true,
+    shell: false  // CRITICAL: Never use shell
+  };
+
+  const result = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy', 'Bypass',
+    '-EncodedCommand', encodedCommand
+  ], spawnOptions);
+
+  return {
+    stdout: (result.stdout as string) || '',
+    success: result.status === 0
+  };
+}
 
 export class GuiLauncher {
   private logger: Logger;
@@ -24,14 +50,14 @@ export class GuiLauncher {
       this.logger.info('Launching GUI for user', { user: loggedInUser });
 
       const batPath = path.join(this.agentDir, 'start-opsis-gui.bat');
-      const scriptPath = path.join(this.agentDir, 'data', 'launch-gui.ps1');
 
+      // Build the PowerShell script - note: values are validated/controlled by agent
       const ps1Content = `
 $ErrorActionPreference = 'Stop'
-$taskName = '${this.taskName}'
-$batPath = '${batPath.replace(/'/g, "''")}'
-$workDir = '${this.agentDir.replace(/'/g, "''")}'
-$userId = '${loggedInUser.replace(/'/g, "''")}'
+$taskName = '${this.escapeForPowerShell(this.taskName)}'
+$batPath = '${this.escapeForPowerShell(batPath)}'
+$workDir = '${this.escapeForPowerShell(this.agentDir)}'
+$userId = '${this.escapeForPowerShell(loggedInUser)}'
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -43,17 +69,13 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal
 Start-ScheduledTask -TaskName $taskName
 `.trim();
 
-      fs.writeFileSync(scriptPath, ps1Content, 'utf8');
+      const result = securePowerShell(ps1Content, { timeout: 20000 });
 
-      execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`, {
-        timeout: 20000,
-        windowsHide: true
-      });
-
-      // Clean up script file
-      try { fs.unlinkSync(scriptPath); } catch { /* ignore */ }
-
-      this.logger.info('GUI launched via scheduled task');
+      if (result.success) {
+        this.logger.info('GUI launched via scheduled task');
+      } else {
+        this.logger.warn('GUI launch may have failed');
+      }
     } catch (error) {
       this.logger.error('Failed to launch GUI', error);
     }
@@ -63,20 +85,16 @@ Start-ScheduledTask -TaskName $taskName
     try {
       this.logger.info('Stopping GUI processes');
 
-      execSync('powershell -NoProfile -Command "Stop-Process -Name electron -Force -ErrorAction SilentlyContinue"', {
-        timeout: 10000,
-        windowsHide: true,
-        stdio: 'ignore'
-      });
+      // Stop electron processes
+      securePowerShell('Stop-Process -Name electron -Force -ErrorAction SilentlyContinue', { timeout: 10000 });
     } catch {
       // Ignore errors — process may not be running
     }
 
     try {
-      execSync(
-        `powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName '${this.taskName}' -Confirm:$false -ErrorAction SilentlyContinue"`,
-        { timeout: 10000, windowsHide: true, stdio: 'ignore' }
-      );
+      // Unregister the scheduled task
+      const script = `Unregister-ScheduledTask -TaskName '${this.escapeForPowerShell(this.taskName)}' -Confirm:$false -ErrorAction SilentlyContinue`;
+      securePowerShell(script, { timeout: 10000 });
     } catch {
       // Ignore cleanup errors
     }
@@ -86,15 +104,20 @@ Start-ScheduledTask -TaskName $taskName
 
   private getLoggedInUser(): string | null {
     try {
-      const output = execSync(
-        'powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystem).UserName"',
-        { timeout: 10000, windowsHide: true, encoding: 'utf8' }
-      );
-      const user = output.trim();
+      const result = securePowerShell('(Get-CimInstance Win32_ComputerSystem).UserName', { timeout: 10000 });
+      const user = result.stdout.trim();
       return user || null;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Escape string for safe inclusion in PowerShell single-quoted string
+   */
+  private escapeForPowerShell(value: string): string {
+    // In PowerShell single-quoted strings, only single quotes need escaping (doubled)
+    return value.replace(/'/g, "''");
   }
 }
 

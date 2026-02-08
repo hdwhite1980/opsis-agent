@@ -650,4 +650,89 @@ export class PatternDetector {
   public exportData(): PatternDetectorData {
     return JSON.parse(JSON.stringify(this.data));
   }
+
+  /**
+   * Initialize baseline health scores for hardware components.
+   * Called on startup to ensure dashboard shows health data even when no issues detected.
+   */
+  public async initializeBaselineHealthScores(): Promise<void> {
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const execAsync = promisify(exec);
+
+    try {
+      // Initialize CPU health score
+      if (!this.data.healthScores['cpu']) {
+        this.data.healthScores['cpu'] = {
+          component: 'cpu',
+          score: 100,
+          trend: 'stable',
+          factors: [],
+          lastUpdated: new Date().toISOString()
+        };
+      }
+
+      // Initialize Memory health score
+      if (!this.data.healthScores['memory']) {
+        this.data.healthScores['memory'] = {
+          component: 'memory',
+          score: 100,
+          trend: 'stable',
+          factors: [],
+          lastUpdated: new Date().toISOString()
+        };
+      }
+
+      // Get disk information and initialize health scores for each disk
+      try {
+        const { stdout } = await execAsync(
+          'powershell -Command "Get-PhysicalDisk | Select-Object DeviceId, FriendlyName, MediaType, HealthStatus, Size | ConvertTo-Json"',
+          { timeout: 10000 }
+        );
+
+        let disks = JSON.parse(stdout);
+        if (!Array.isArray(disks)) disks = [disks];
+
+        for (const disk of disks) {
+          const diskKey = `disk:${disk.DeviceId || 0}`;
+          if (!this.data.healthScores[diskKey]) {
+            // Start at 100 if healthy, lower if not
+            const baseScore = disk.HealthStatus === 'Healthy' ? 100 : 70;
+            this.data.healthScores[diskKey] = {
+              component: diskKey,
+              score: baseScore,
+              trend: 'stable',
+              factors: [],
+              lastUpdated: new Date().toISOString()
+            };
+            this.logger.info('Initialized disk health score', {
+              disk: disk.FriendlyName,
+              status: disk.HealthStatus,
+              score: baseScore
+            });
+          }
+        }
+      } catch (diskError) {
+        // Fallback: create a generic disk:0 entry
+        if (!this.data.healthScores['disk:0']) {
+          this.data.healthScores['disk:0'] = {
+            component: 'disk:0',
+            score: 100,
+            trend: 'stable',
+            factors: [],
+            lastUpdated: new Date().toISOString()
+          };
+        }
+        this.logger.debug('Could not enumerate disks, using default', diskError);
+      }
+
+      this.saveData();
+      this.logger.info('Baseline health scores initialized', {
+        components: Object.keys(this.data.healthScores)
+      });
+
+    } catch (error) {
+      this.logger.error('Failed to initialize baseline health scores', error);
+    }
+  }
 }

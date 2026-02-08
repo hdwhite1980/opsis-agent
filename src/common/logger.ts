@@ -1,6 +1,7 @@
 // logger.ts - Centralized logging utility for OPSIS Agent
 import * as fs from 'fs';
 import * as path from 'path';
+import { sanitizeLogData } from '../security';
 
 export enum LogLevel {
   DEBUG = 0,
@@ -78,20 +79,28 @@ export class Logger {
   private formatMessage(level: LogLevel, message: string, data?: any, error?: any): string {
     const timestamp = new Date().toISOString();
     const levelName = LogLevel[level];
-    
-    let logLine = `[${timestamp}] [${levelName}] [${this.component}] ${message}`;
-    
+
+    // Sanitize message to remove sensitive data
+    const sanitizedMessage = sanitizeLogData(message) as string;
+    let logLine = `[${timestamp}] [${levelName}] [${this.component}] ${sanitizedMessage}`;
+
     if (data) {
-      logLine += `\n  Data: ${JSON.stringify(data, null, 2)}`;
+      // Sanitize data object to redact sensitive fields
+      const sanitizedData = sanitizeLogData(data);
+      logLine += `\n  Data: ${JSON.stringify(sanitizedData, null, 2)}`;
     }
-    
+
     if (error) {
-      logLine += `\n  Error: ${error.message || error}`;
-      if (error.stack) {
-        logLine += `\n  Stack: ${error.stack}`;
+      // Sanitize error message and stack trace
+      const errorMessage = sanitizeLogData(error.message || String(error)) as string;
+      logLine += `\n  Error: ${errorMessage}`;
+      if (error.stack && level >= LogLevel.ERROR) {
+        // Only include stack traces for ERROR and above, and sanitize them
+        const sanitizedStack = sanitizeLogData(error.stack) as string;
+        logLine += `\n  Stack: ${sanitizedStack}`;
       }
     }
-    
+
     return logLine + '\n';
   }
 

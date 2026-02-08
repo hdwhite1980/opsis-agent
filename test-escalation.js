@@ -1,7 +1,24 @@
-// Test script to send a fake escalation to the server and see the response
+/**
+ * Test Escalation Script
+ * Sends a fake issue directly to the OPSIS server via WebSocket
+ *
+ * Usage: node test-escalation.js [type]
+ *
+ * Types:
+ *   high-cpu        - High CPU from powershell.exe (default)
+ *   disk-space-low  - Low disk space on C:
+ *   service-stopped - Stopped service (Spooler)
+ *   high-memory     - High memory usage
+ */
+
 const WebSocket = require('ws');
 
-const SERVER_URL = 'ws://178.156.234.101:8000/api/agent/ws/device-DESKTOP-JOGTI06';
+const SERVER_URL = 'wss://opsisapp.com/api/agent/ws/device-DESKTOP-JOGTI06';
+const issueType = process.argv[2] || 'high-cpu';
+
+console.log(`\n=== OPSIS Test Escalation ===`);
+console.log(`Server: ${SERVER_URL}`);
+console.log(`Issue Type: ${issueType}\n`);
 
 const ws = new WebSocket(SERVER_URL);
 
@@ -15,20 +32,40 @@ ws.on('open', () => {
     hostname: 'DESKTOP-JOGTI06',
     os_info: {
       platform: 'win32',
-      release: '10.0.19045',
+      release: '10.0.22631',
       arch: 'x64'
     }
   }));
 
-  // Wait a moment then send fake escalation
+  // Build escalation based on type
   setTimeout(() => {
-    const fakeEscalation = {
+    let escalation = {
       type: 'escalation',
       tenant_id: '7',
       device_id: 'device-DESKTOP-JOGTI06',
-      signature_id: 'TEST_HIGH_CPU_POWERSHELL_' + Date.now(),
-      symptoms: [
-        {
+      signature_id: `TEST_${issueType.toUpperCase().replace(/-/g, '_')}_${Date.now()}`,
+      symptoms: [],
+      targets: [],
+      baseline_deviation_flags: {
+        cpu_deviation: false,
+        memory_deviation: false,
+        disk_deviation: false,
+        service_deviation: false
+      },
+      environment_tags: {
+        os_build: '22631',
+        os_version: 'Windows 11 Pro',
+        app_versions: {},
+        device_model_class: 'workstation'
+      },
+      recent_actions_summary: [],
+      local_confidence: 60,
+      requested_outcome: 'diagnose_root_cause'
+    };
+
+    switch (issueType) {
+      case 'high-cpu':
+        escalation.symptoms = [{
           type: 'performance',
           severity: 'high',
           details: {
@@ -40,35 +77,74 @@ ws.on('open', () => {
             duration_seconds: 600,
             description: 'PowerShell process consuming high CPU for extended period'
           }
-        }
-      ],
-      targets: [
-        {
-          type: 'process',
-          name: 'powershell.exe',
-          identifier: '9999'
-        }
-      ],
-      baseline_deviation_flags: {
-        cpu_deviation: true,
-        memory_deviation: false,
-        disk_deviation: false,
-        service_deviation: false
-      },
-      environment_tags: {
-        os_build: '19045',
-        os_version: 'Windows 10 Pro',
-        app_versions: {},
-        device_model_class: 'workstation'
-      },
-      recent_actions_summary: [],
-      local_confidence: 65,
-      requested_outcome: 'diagnose_root_cause'
-    };
+        }];
+        escalation.targets = [{ type: 'process', name: 'powershell.exe', identifier: '9999' }];
+        escalation.baseline_deviation_flags.cpu_deviation = true;
+        break;
 
-    console.log('\n--- Sending fake HIGH CPU escalation for powershell.exe ---');
-    console.log(JSON.stringify(fakeEscalation, null, 2));
-    ws.send(JSON.stringify(fakeEscalation));
+      case 'disk-space-low':
+        escalation.symptoms = [{
+          type: 'disk',
+          severity: 'high',
+          details: {
+            drive: 'C:',
+            free_percent: 3,
+            free_gb: 5,
+            total_gb: 256,
+            threshold: 10,
+            description: 'Critical disk space - only 3% free'
+          }
+        }];
+        escalation.targets = [{ type: 'system', name: 'C:', identifier: 'disk-c' }];
+        escalation.baseline_deviation_flags.disk_deviation = true;
+        escalation.requested_outcome = 'recommend_playbook';
+        break;
+
+      case 'service-stopped':
+        escalation.symptoms = [{
+          type: 'service_status',
+          severity: 'high',
+          details: {
+            service: 'Spooler',
+            display_name: 'Print Spooler',
+            state: 'Stopped',
+            expected: 'Running',
+            description: 'Print Spooler service has stopped unexpectedly'
+          }
+        }];
+        escalation.targets = [{ type: 'service', name: 'Spooler', identifier: 'spooler' }];
+        escalation.baseline_deviation_flags.service_deviation = true;
+        escalation.requested_outcome = 'recommend_playbook';
+        break;
+
+      case 'high-memory':
+        escalation.symptoms = [{
+          type: 'performance',
+          severity: 'high',
+          details: {
+            metric: 'memory_usage',
+            value: 95,
+            threshold: 85,
+            available_mb: 800,
+            total_mb: 16384,
+            description: 'System memory critically low'
+          }
+        }];
+        escalation.targets = [{ type: 'system', name: 'Memory', identifier: 'ram' }];
+        escalation.baseline_deviation_flags.memory_deviation = true;
+        break;
+
+      default:
+        console.log('Unknown issue type, using high-cpu');
+        return;
+    }
+
+    console.log(`\n--- Sending ${issueType} escalation ---`);
+    console.log('Signature ID:', escalation.signature_id);
+    console.log('Symptoms:', JSON.stringify(escalation.symptoms, null, 2));
+    console.log('\nWaiting for server response...\n');
+
+    ws.send(JSON.stringify(escalation));
   }, 1000);
 });
 
@@ -78,11 +154,14 @@ ws.on('message', (data) => {
   messageCount++;
   const msg = JSON.parse(data.toString());
   console.log(`\n=== SERVER RESPONSE #${messageCount} ===`);
-  console.log(JSON.stringify(msg, null, 2));
-  console.log('========================\n');
+  console.log('Type:', msg.type);
+  console.log('Data:', JSON.stringify(msg, null, 2));
+  console.log('================================\n');
 
-  // If we got a playbook or decision, exit after a bit
-  if (msg.type === 'playbook' || msg.type === 'decision' || msg.type === 'advisory' || msg.type === 'ignore') {
+  // If we got a playbook, decision, or advisory, show it and exit
+  if (msg.type === 'playbook' || msg.type === 'decision' || msg.type === 'advisory' ||
+      msg.type === 'execute_playbook' || msg.type === 'diagnostic_request') {
+    console.log('\n*** Received actionable response from server! ***\n');
     setTimeout(() => {
       console.log('Test complete, closing connection');
       ws.close();
@@ -93,21 +172,15 @@ ws.on('message', (data) => {
 
 ws.on('error', (err) => {
   console.error('WebSocket error:', err.message);
-  console.error('Full error:', err);
-});
-
-ws.on('unexpected-response', (req, res) => {
-  console.error('Unexpected response:', res.statusCode, res.statusMessage);
 });
 
 ws.on('close', () => {
   console.log('Connection closed');
 });
 
-// Timeout after 5 minutes
+// Timeout after 2 minutes
 setTimeout(() => {
-  console.log(`\nTimeout after 5 minutes - received ${messageCount} messages total`);
-  console.log('Closing connection...');
+  console.log(`\nTimeout after 2 minutes - received ${messageCount} messages`);
   ws.close();
   process.exit(0);
-}, 300000);
+}, 120000);

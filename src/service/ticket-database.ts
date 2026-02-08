@@ -2,7 +2,9 @@
 // Uses simple JSON file storage instead of SQLite to avoid compilation issues
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { Logger } from '../common/logger';
+import { z, TicketSchema, atomicWriteFileSync } from '../security';
 
 export interface Ticket {
   id?: number;
@@ -51,10 +53,44 @@ export class TicketDatabase {
   private load(): void {
     try {
       if (fs.existsSync(this.dbPath)) {
+        // Security: Check for symlink attack
+        const stats = fs.lstatSync(this.dbPath);
+        if (stats.isSymbolicLink()) {
+          this.logger.error('Security: Ticket database path is a symlink, refusing to load');
+          this.tickets = [];
+          return;
+        }
+
         const data = fs.readFileSync(this.dbPath, 'utf8');
         const parsed = JSON.parse(data);
-        this.tickets = parsed.tickets || [];
-        this.nextId = parsed.nextId || 1;
+
+        // Validate loaded data structure
+        if (!parsed || typeof parsed !== 'object') {
+          throw new Error('Invalid database format');
+        }
+
+        // Validate tickets array
+        if (!Array.isArray(parsed.tickets)) {
+          throw new Error('Invalid tickets array');
+        }
+
+        // Validate each ticket has required fields
+        const validTickets: Ticket[] = [];
+        for (const ticket of parsed.tickets) {
+          if (ticket && typeof ticket === 'object' &&
+              typeof ticket.ticket_id === 'string' &&
+              typeof ticket.timestamp === 'string' &&
+              typeof ticket.type === 'string' &&
+              typeof ticket.description === 'string' &&
+              typeof ticket.status === 'string') {
+            validTickets.push(ticket as Ticket);
+          } else {
+            this.logger.warn('Skipping invalid ticket during load', { ticket_id: ticket?.ticket_id });
+          }
+        }
+
+        this.tickets = validTickets;
+        this.nextId = typeof parsed.nextId === 'number' && parsed.nextId > 0 ? parsed.nextId : 1;
         this.logger.info('Loaded existing tickets', { count: this.tickets.length });
       } else {
         this.logger.info('No existing ticket database, starting fresh');
@@ -71,9 +107,9 @@ export class TicketDatabase {
         tickets: this.tickets,
         nextId: this.nextId
       }, null, 2);
-      const tmpPath = this.dbPath + '.tmp';
-      fs.writeFileSync(tmpPath, data, 'utf8');
-      fs.renameSync(tmpPath, this.dbPath);
+
+      // Use atomic write with restricted permissions
+      atomicWriteFileSync(this.dbPath, data, 0o600);
     } catch (error) {
       this.logger.error('Error saving tickets', error);
     }
@@ -225,8 +261,23 @@ export class TicketDatabase {
       const resolved = this.tickets.filter(t => t.status === 'resolved').length;
       const escalated = this.tickets.filter(t => t.escalated === 1).length;
       const success = this.tickets.filter(t => t.result === 'success').length;
+      const failed = this.tickets.filter(t => t.result === 'failure').length;
 
-      const successRate = resolved > 0 ? Math.round((success / resolved) * 100) : 0;
+      // Calculate success rate based on tickets that have a result (went through remediation)
+      // If no tickets have results yet, calculate based on non-escalated vs escalated
+      const attempted = success + failed;
+      let successRate: number;
+
+      if (attempted > 0) {
+        // Tickets went through auto-remediation: show actual success rate
+        successRate = Math.round((success / attempted) * 100);
+      } else if (total > 0) {
+        // No remediation attempts yet: show % of non-escalated tickets
+        const nonEscalated = total - escalated;
+        successRate = Math.round((nonEscalated / total) * 100);
+      } else {
+        successRate = 0;
+      }
 
       return {
         totalTickets: total,

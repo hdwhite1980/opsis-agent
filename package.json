@@ -10,7 +10,7 @@
     "copy:gui-assets": "node scripts/copy-assets.js",
     "build:exe": "npm run build:service && pkg dist/service/agent-service.js --targets node18-win-x64 --output dist/opsis-agent-service.exe --compress GZip",
     "start:service": "node dist/service/agent-service.js",
-    "start:gui": "electron dist/gui/electron-main.js",
+    "start:gui": "src-tauri\\target\\release\\opsis-agent-gui.exe",
     "install-service": "node scripts/install-service.js",
     "uninstall-service": "node scripts/uninstall-service.js",
     "package": "npm run build && electron-builder",

@@ -1,4 +1,4 @@
-﻿import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 
 export interface ProcessInfo {
   name: string;
@@ -23,25 +23,42 @@ export interface DiskInfo {
 }
 
 export class WMIInterface {
-  
-  private executeCommand(command: string): string {
-    try {
-      const result = execSync(command, {
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true
-      });
-      return result;
-    } catch (error: any) {
-      throw new Error(`Command failed: ${error.message}`);
+
+  /**
+   * Execute PowerShell command securely using spawnSync
+   * Uses -EncodedCommand to prevent injection attacks
+   */
+  private executePowerShell(script: string): string {
+    // Encode the script as Base64 for -EncodedCommand
+    const encodedCommand = Buffer.from(script, 'utf16le').toString('base64');
+
+    const result = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy', 'Bypass',
+      '-EncodedCommand', encodedCommand
+    ], {
+      encoding: 'utf-8',
+      timeout: 30000,
+      windowsHide: true,
+      shell: false  // CRITICAL: Never use shell
+    });
+
+    if (result.error) {
+      throw new Error(`PowerShell execution failed: ${result.error.message}`);
     }
+
+    if (result.status !== 0 && result.stderr) {
+      throw new Error(`PowerShell error: ${result.stderr}`);
+    }
+
+    return result.stdout || '';
   }
 
   async getCPU(): Promise<number> {
     try {
-      const output = this.executeCommand(
-        'powershell -Command "Get-Counter -Counter \'\\Processor(_Total)\\% Processor Time\' | Select-Object -ExpandProperty CounterSamples | Select-Object -ExpandProperty CookedValue"'
-      );
+      const script = `Get-Counter -Counter '\\Processor(_Total)\\% Processor Time' | Select-Object -ExpandProperty CounterSamples | Select-Object -ExpandProperty CookedValue`;
+      const output = this.executePowerShell(script);
       return Math.round(parseFloat(output.trim()));
     } catch (error) {
       return 0;
@@ -50,15 +67,14 @@ export class WMIInterface {
 
   async getMemory(): Promise<{ total_mb: number; used_mb: number; free_mb: number; used_percent: number }> {
     try {
-      const output = this.executeCommand(
-        'powershell -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json"'
-      );
+      const script = `Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json`;
+      const output = this.executePowerShell(script);
       const data = JSON.parse(output);
       const totalMB = Math.round(data.TotalVisibleMemorySize / 1024);
       const freeMB = Math.round(data.FreePhysicalMemory / 1024);
       const usedMB = totalMB - freeMB;
       const usedPercent = Math.round((usedMB / totalMB) * 100);
-      
+
       return { total_mb: totalMB, used_mb: usedMB, free_mb: freeMB, used_percent: usedPercent };
     } catch (error) {
       return { total_mb: 0, used_mb: 0, free_mb: 0, used_percent: 0 };
@@ -67,15 +83,14 @@ export class WMIInterface {
 
   async getDisk(): Promise<DiskInfo[]> {
     try {
-      const output = this.executeCommand(
-        'powershell -Command "Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object Name, @{Name=\'TotalGB\';Expression={[math]::Round($_.Used/1GB + $_.Free/1GB, 2)}}, @{Name=\'UsedGB\';Expression={[math]::Round($_.Used/1GB, 2)}}, @{Name=\'FreeGB\';Expression={[math]::Round($_.Free/1GB, 2)}}, @{Name=\'UsedPercent\';Expression={[math]::Round(($_.Used/($_.Used + $_.Free))*100, 0)}} | ConvertTo-Json"'
-      );
-      
+      const script = `Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object Name, @{Name='TotalGB';Expression={[math]::Round($_.Used/1GB + $_.Free/1GB, 2)}}, @{Name='UsedGB';Expression={[math]::Round($_.Used/1GB, 2)}}, @{Name='FreeGB';Expression={[math]::Round($_.Free/1GB, 2)}}, @{Name='UsedPercent';Expression={[math]::Round(($_.Used/($_.Used + $_.Free))*100, 0)}} | ConvertTo-Json`;
+      const output = this.executePowerShell(script);
+
       let data = JSON.parse(output);
       if (!Array.isArray(data)) {
         data = [data];
       }
-      
+
       return data.map((d: any) => ({
         drive: d.Name + ':',
         total_gb: d.TotalGB,
@@ -90,15 +105,14 @@ export class WMIInterface {
 
   async getProcesses(): Promise<ProcessInfo[]> {
     try {
-      const output = this.executeCommand(
-        'powershell -Command "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Name, Id, CPU, @{Name=\'MemoryMB\';Expression={[math]::Round($_.WorkingSet64/1MB, 2)}} | ConvertTo-Json"'
-      );
-      
+      const script = `Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Name, Id, CPU, @{Name='MemoryMB';Expression={[math]::Round($_.WorkingSet64/1MB, 2)}} | ConvertTo-Json`;
+      const output = this.executePowerShell(script);
+
       let data = JSON.parse(output);
       if (!Array.isArray(data)) {
         data = [data];
       }
-      
+
       return data.map((p: any) => ({
         name: p.Name,
         pid: p.Id,
@@ -112,15 +126,14 @@ export class WMIInterface {
 
   async getServices(): Promise<ServiceInfo[]> {
     try {
-      const output = this.executeCommand(
-        'powershell -Command "Get-Service | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Json"'
-      );
-      
+      const script = `Get-Service | Select-Object Name, DisplayName, Status, StartType | ConvertTo-Json`;
+      const output = this.executePowerShell(script);
+
       let data = JSON.parse(output);
       if (!Array.isArray(data)) {
         data = [data];
       }
-      
+
       return data.map((s: any) => {
         // Convert numeric Status codes to strings
         let state: string;
@@ -130,7 +143,7 @@ export class WMIInterface {
         } else {
           state = String(s.Status);
         }
-        
+
         // Convert numeric StartType codes to strings
         let startType: string;
         if (typeof s.StartType === 'number') {
@@ -142,7 +155,7 @@ export class WMIInterface {
         } else {
           startType = String(s.StartType);
         }
-        
+
         return {
           name: s.Name,
           display_name: s.DisplayName,

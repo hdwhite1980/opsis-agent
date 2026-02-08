@@ -1,5 +1,5 @@
 ; OPSIS Agent Installer - Inno Setup Script
-; Uses compiled standalone exe - no Node.js runtime needed for service
+; Service: compiled standalone exe (pkg). GUI: Tauri native binary (no Electron).
 
 #define AppName "OPSIS Agent"
 #define AppVersion "1.0.0"
@@ -49,10 +49,8 @@ Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignorevers
 Source: "node_modules\node-windows\bin\winsw\winsw.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
 Source: "node_modules\node-windows\bin\winsw\winsw.exe.config"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe.config"; Flags: ignoreversion
 
-; GUI files (still needs Electron)
-Source: "dist\gui\*"; DestDir: "{app}\dist\gui"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "dist\common\*"; DestDir: "{app}\dist\common"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "node_modules\electron\*"; DestDir: "{app}\node_modules\electron"; Flags: ignoreversion recursesubdirs createallsubdirs
+; GUI executable (Tauri - single native binary, no Electron needed)
+Source: "src-tauri\target\release\opsis-agent-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Runbooks (required at runtime)
 Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -75,8 +73,8 @@ Name: "{app}\certs"
 Name: "{app}\service"
 
 [Icons]
-Name: "{group}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
-Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
+Name: "{group}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
+Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
 ; Install Windows Service using WinSW
@@ -87,18 +85,18 @@ Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir
 Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'"""; Flags: runhidden waituntilterminated shellexec
 
 ; Offer to launch GUI
-Filename: "{app}\node_modules\electron\dist\electron.exe"; Parameters: """{app}\dist\gui\electron-main.js"""; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Kill any running Electron (GUI) processes first
-Filename: "powershell.exe"; Parameters: "-Command ""Get-Process -Name electron -ErrorAction SilentlyContinue | Stop-Process -Force"""; Flags: runhidden waituntilterminated; RunOnceId: "KillElectron"
+; Kill any running Tauri GUI processes first
+Filename: "powershell.exe"; Parameters: "-Command ""Get-Process -Name opsis-agent-gui -ErrorAction SilentlyContinue | Stop-Process -Force"""; Flags: runhidden waituntilterminated; RunOnceId: "KillGUI"
 ; Stop and uninstall service
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
 
 [Registry]
 ; Add to startup for all users (if selected) - uses HKLM since installer runs as admin
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\node_modules\electron\dist\electron.exe"" ""{app}\dist\gui\electron-main.js"""; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\opsis-agent-gui.exe"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Code]
 var

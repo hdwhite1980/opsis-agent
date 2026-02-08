@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start /min cmd /c "npm run start:gui"
+start "" "src-tauri\target\release\opsis-agent-gui.exe"
