@@ -1641,31 +1641,45 @@ class OPSISAgentService {
 
     this.logger.info('Reboot step: prompting user for confirmation');
 
-    const response = await new Promise<string>((resolve) => {
-      const timer = setTimeout(() => {
-        this.logger.info('Reboot prompt timed out, skipping reboot');
-        this.pendingPrompts.delete(promptId);
-        resolve('timeout');
-      }, 300000); // 5 minute timeout
+    let response: string;
 
-      this.pendingPrompts.set(promptId, {
-        resolve,
-        action_on_confirm: 'reboot',
-        timer
-      });
+    if (this.ipcServer.hasAuthenticatedClients()) {
+      // GUI is connected — use IPC prompt
+      response = await new Promise<string>((resolve) => {
+        const timer = setTimeout(() => {
+          this.logger.info('Reboot prompt timed out, skipping reboot');
+          this.pendingPrompts.delete(promptId);
+          resolve('timeout');
+        }, 300000); // 5 minute timeout
 
-      this.ipcServer.broadcast({
-        type: 'user-prompt',
-        data: {
-          id: promptId,
-          title: 'Restart Required',
-          message,
-          buttons: ['Restart Now', 'Later'],
+        this.pendingPrompts.set(promptId, {
+          resolve,
           action_on_confirm: 'reboot',
-          timeout: 300
-        }
+          timer
+        });
+
+        this.ipcServer.broadcast({
+          type: 'user-prompt',
+          data: {
+            id: promptId,
+            title: 'Restart Required',
+            message,
+            buttons: ['Restart Now', 'Later'],
+            action_on_confirm: 'reboot',
+            timeout: 300
+          }
+        });
       });
-    });
+    } else {
+      // No GUI connected — fall back to native Windows dialog
+      this.logger.info('No GUI connected, using native Windows prompt for reboot confirmation');
+      const { spawnSync } = require('child_process');
+      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${message.replace(/'/g, "''")}', 'OPSIS Agent - Restart Required', 'YesNo', 'Warning'); if ($result -eq 'Yes') { Write-Output 'ok' } else { Write-Output 'cancel' }`;
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: 300000 });
+      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
+      response = output === 'ok' ? 'ok' : 'cancel';
+      this.logger.info('Native reboot prompt result', { response: output });
+    }
 
     if (response === 'ok') {
       this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`);

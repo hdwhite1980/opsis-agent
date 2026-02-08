@@ -385,6 +385,16 @@ export class IPCServer {
     }
   }
 
+  // Check if any authenticated GUI clients are connected
+  public hasAuthenticatedClients(): boolean {
+    for (const [, client] of this.clients) {
+      if (client.authenticated || !this.requireAuth) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Get IPC secret for GUI to use in authentication
   public getIPCSecret(): string {
     return this.ipcSecret;
