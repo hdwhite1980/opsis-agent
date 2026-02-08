@@ -197,7 +197,7 @@ export class SystemMonitor {
     }
   }
 
-  private async getCPUUsage(): Promise<number> {
+  public async getCPUUsage(): Promise<number> {
     try {
       const { stdout } = await execAsync(
         'powershell -Command "(Get-Counter \'\\\\Processor(_Total)\\\\% Processor Time\').CounterSamples.CookedValue"',
@@ -1390,5 +1390,124 @@ export class SystemMonitor {
       baselineCount: this.baselines.size,
       signalsSuppressed: this.signalCounts.size
     };
+  }
+
+  /**
+   * Get disk usage stats for the primary (C:) drive.
+   */
+  public async getDiskStats(): Promise<{ usedPercent: number; freeGB: number }> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "Get-PSDrive -Name C -PSProvider FileSystem | Select-Object @{N=\'Used\';E={$_.Used}},@{N=\'Free\';E={$_.Free}} | ConvertTo-Json"',
+        { timeout: 10000 }
+      );
+      const drive = JSON.parse(stdout || '{}');
+      if (drive.Used != null && drive.Free != null) {
+        const total = drive.Used + drive.Free;
+        return {
+          usedPercent: Math.round((drive.Used / total) * 1000) / 10,
+          freeGB: Math.round((drive.Free / 1024 / 1024 / 1024) * 10) / 10
+        };
+      }
+    } catch {
+      // fallback
+    }
+    return { usedPercent: 0, freeGB: 0 };
+  }
+
+  /**
+   * Get the number of running processes.
+   */
+  public async getProcessCount(): Promise<number> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -Command "(Get-Process).Count"',
+        { timeout: 10000 }
+      );
+      return parseInt(stdout.trim(), 10) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Get installed software with running status and resource usage.
+   * Used for software inventory reporting.
+   */
+  public async getSoftwareInventory(): Promise<Array<{
+    name: string;
+    version: string;
+    publisher: string;
+    install_date: string;
+    is_running: boolean;
+    cpu_percent: number;
+    memory_mb: number;
+  }>> {
+    try {
+      // Get installed software from registry (both 64-bit and 32-bit)
+      const { stdout: installedRaw } = await execAsync(
+        `powershell -NoProfile -Command "$apps = @(); foreach ($path in 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*') { $apps += Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.DisplayName -ne '' } | Select-Object DisplayName,DisplayVersion,Publisher,InstallDate }; $apps | Sort-Object DisplayName -Unique | ConvertTo-Json -Compress"`,
+        { timeout: 30000 }
+      );
+
+      // Get running processes with CPU and memory
+      const { stdout: processRaw } = await execAsync(
+        `powershell -NoProfile -Command "Get-Process | Where-Object {$_.Id -ne 0 -and $_.MainWindowTitle -ne '' -or $_.Path} | Group-Object -Property Name | ForEach-Object { $procs = $_.Group; [PSCustomObject]@{ Name=$_.Name; CPU=[math]::Round(($procs | Measure-Object CPU -Sum).Sum / ((Get-Date) - ($procs[0].StartTime)).TotalSeconds * 100 / (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors, 1); MemMB=[math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB, 1) } } | ConvertTo-Json -Compress"`,
+        { timeout: 30000 }
+      );
+
+      const installed = JSON.parse(installedRaw || '[]');
+      const installedArr: any[] = Array.isArray(installed) ? installed : [installed];
+
+      const processes = JSON.parse(processRaw || '[]');
+      const processArr: any[] = Array.isArray(processes) ? processes : [processes];
+
+      // Build process lookup (lowercase name -> {cpu, mem})
+      const processMap = new Map<string, { cpu: number; mem: number }>();
+      for (const p of processArr) {
+        if (p.Name) {
+          processMap.set(p.Name.toLowerCase(), {
+            cpu: p.CPU || 0,
+            mem: p.MemMB || 0
+          });
+        }
+      }
+
+      return installedArr.map(app => {
+        const name = app.DisplayName || '';
+        // Try to match installed software name to a running process
+        // Extract likely process name from display name (first word, lowercase)
+        const nameWords = name.toLowerCase().split(/[\s\-_]+/);
+        let match = processMap.get(nameWords[0]);
+        if (!match && nameWords.length > 1) {
+          // Try first two words joined
+          match = processMap.get(nameWords.slice(0, 2).join(''));
+        }
+        // Also try the full name with common exe patterns
+        if (!match) {
+          for (const [procName, procData] of processMap) {
+            if (procName.includes(nameWords[0]) && nameWords[0].length > 3) {
+              match = procData;
+              break;
+            }
+          }
+        }
+
+        return {
+          name,
+          version: app.DisplayVersion || '',
+          publisher: app.Publisher || '',
+          install_date: app.InstallDate
+            ? `${app.InstallDate.substring(0, 4)}-${app.InstallDate.substring(4, 6)}-${app.InstallDate.substring(6, 8)}`
+            : '',
+          is_running: !!match,
+          cpu_percent: match ? match.cpu : 0,
+          memory_mb: match ? match.mem : 0
+        };
+      });
+    } catch (error) {
+      this.logger.error('Failed to collect software inventory', error);
+      return [];
+    }
   }
 }

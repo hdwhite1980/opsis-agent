@@ -254,6 +254,7 @@ class OPSISAgentService {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private welcomeTimeout: NodeJS.Timeout | null = null;
   private telemetryTimer: NodeJS.Timeout | null = null;
+  private inventoryTimer: NodeJS.Timeout | null = null;
   private pendingPrompts: Map<string, { resolve: (response: string) => void; action_on_confirm?: string; timer?: NodeJS.Timeout }> = new Map();
 
   // Pending actions awaiting technician review
@@ -1219,6 +1220,10 @@ class OPSISAgentService {
       clearInterval(this.telemetryTimer);
     }
 
+    if (this.inventoryTimer) {
+      clearInterval(this.inventoryTimer);
+    }
+
     if (this.severityEscalationTimer) {
       clearInterval(this.severityEscalationTimer);
     }
@@ -1300,6 +1305,12 @@ class OPSISAgentService {
         this.sendHeartbeat();
         this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
 
+        // Send software inventory on connect, then hourly
+        if (this.inventoryTimer) clearInterval(this.inventoryTimer);
+        // Delay initial inventory by 10s to let connection stabilize
+        setTimeout(() => this.sendSoftwareInventory(), 10000);
+        this.inventoryTimer = setInterval(() => this.sendSoftwareInventory(), 3600000);
+
         // Warn if server doesn't send welcome within 10s
         if (this.welcomeTimeout) clearTimeout(this.welcomeTimeout);
         this.welcomeTimeout = setTimeout(() => {
@@ -1348,7 +1359,7 @@ class OPSISAgentService {
   private sendTelemetry(signal: SystemSignal): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({
-        type: 'telemetry',
+        type: 'signal',
         timestamp: new Date().toISOString(),
         device_id: this.deviceInfo.device_id,
         tenant_id: this.deviceInfo.tenant_id,
@@ -1366,17 +1377,64 @@ class OPSISAgentService {
     }
   }
 
-  private sendHeartbeat(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+  private async sendHeartbeat(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      // Collect real-time metrics for flat telemetry format
+      const [cpuPercent, diskStats, processCount] = await Promise.all([
+        this.systemMonitor.getCPUUsage(),
+        this.systemMonitor.getDiskStats(),
+        this.systemMonitor.getProcessCount()
+      ]);
+
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      const memPercent = Math.round((usedMem / totalMem) * 1000) / 10;
+      const memUsedMB = Math.round(usedMem / 1024 / 1024);
+      const memAvailableMB = Math.round(freeMem / 1024 / 1024);
+
+      const ticketStats = this.ticketDb.getStatistics();
+
+      // Send flat telemetry format
       this.ws.send(JSON.stringify({
-        type: 'heartbeat',
+        type: 'telemetry',
         timestamp: new Date().toISOString(),
-        data: {
-          status: 'online',
-          stats: this.getSystemStats(),
-          healthScores: this.patternDetector.getHealthScores()
-        }
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        cpu_percent: Math.round(cpuPercent * 10) / 10,
+        memory_percent: memPercent,
+        memory_used_mb: memUsedMB,
+        memory_available_mb: memAvailableMB,
+        disk_percent: diskStats.usedPercent,
+        disk_free_gb: diskStats.freeGB,
+        active_issues: ticketStats.openTickets,
+        process_count: processCount
       }));
+    } catch (error) {
+      this.logger.error('Failed to send telemetry heartbeat', error);
+    }
+  }
+
+  private async sendSoftwareInventory(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      this.logger.info('Collecting software inventory...');
+      const software = await this.systemMonitor.getSoftwareInventory();
+
+      this.ws.send(JSON.stringify({
+        type: 'software_inventory',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        software
+      }));
+
+      this.logger.info('Software inventory sent', { count: software.length });
+    } catch (error) {
+      this.logger.error('Failed to send software inventory', error);
     }
   }
 
