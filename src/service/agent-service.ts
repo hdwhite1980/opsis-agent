@@ -4477,20 +4477,74 @@ class OPSISAgentService {
 // SERVICE ENTRY POINT
 // ============================================
 
+// Prevent multiple instances via PID lock file
+const lockFilePath = path.join(process.cwd(), 'data', 'agent.pid');
+
+function acquireLock(): boolean {
+  try {
+    if (fs.existsSync(lockFilePath)) {
+      const existingPid = parseInt(fs.readFileSync(lockFilePath, 'utf8').trim(), 10);
+      if (!isNaN(existingPid)) {
+        try {
+          // Check if process is still running (signal 0 doesn't kill, just checks)
+          process.kill(existingPid, 0);
+          // Process exists — another instance is running
+          console.error(`OPSIS Agent already running (PID ${existingPid}). Exiting.`);
+          return false;
+        } catch {
+          // Process not found — stale lock file, safe to overwrite
+        }
+      }
+    }
+    // Ensure data directory exists
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    fs.writeFileSync(lockFilePath, String(process.pid));
+    return true;
+  } catch (err) {
+    console.error('Failed to acquire lock:', err);
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  try {
+    if (fs.existsSync(lockFilePath)) {
+      const pid = parseInt(fs.readFileSync(lockFilePath, 'utf8').trim(), 10);
+      if (pid === process.pid) {
+        fs.unlinkSync(lockFilePath);
+      }
+    }
+  } catch { /* best effort */ }
+}
+
+if (!acquireLock()) {
+  process.exit(1);
+}
+
 const agent = new OPSISAgentService();
 
 process.on('SIGINT', () => {
   agent.stop();
+  releaseLock();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   agent.stop();
+  releaseLock();
   process.exit(0);
+});
+
+process.on('exit', () => {
+  releaseLock();
 });
 
 agent.start().catch((error) => {
   console.error('Fatal error:', error);
+  releaseLock();
   process.exit(1);
 });
 
