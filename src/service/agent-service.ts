@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
+import * as crypto from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import WebSocket from 'ws';
@@ -20,6 +21,23 @@ import { SignatureGenerator, DeviceSignature } from './signature-generator';
 import { EscalationProtocol, EscalationPayload, ServerDecision } from './escalation-protocol';
 import { RunbookClassifier, RiskClass } from './runbook-classifier';
 import { ActionTicketManager } from './action-ticket-manager';
+import { TroubleshootingRunner, DiagnosticData } from './troubleshooting-runner';
+
+// Security imports
+import {
+  getApiKey,
+  getHmacSecret,
+  storeCredentialsFromSetup,
+  verifyPlaybook,
+  verifyDiagnosticRequest,
+  validatePlaybook,
+  validateDiagnosticRequest,
+  handleKeyRotation,
+  createRotationAck,
+  createRotationError,
+  isHmacConfigured,
+  tryParseJSON
+} from '../security';
 
 const execAsync = promisify(exec);
 
@@ -89,6 +107,42 @@ interface PlaybookStep {
   params: Record<string, any>;
   timeout?: number;
   requiresApproval?: boolean;
+  allowFailure?: boolean;
+}
+
+/**
+ * Detect verification/check steps that should not fail the playbook.
+ * These are typically Get-Process/Get-Service commands that run after
+ * a kill/stop action to confirm the target is gone or restarted.
+ * An empty result (process not found) is the expected success case.
+ */
+export function isVerificationStep(step: PlaybookStep, allSteps: PlaybookStep[], index: number): boolean {
+  if (step.type !== 'powershell') return false;
+
+  const action = step.action.toLowerCase();
+
+  // Pattern: Get-Process after a Stop-Process / kill step
+  if (action.includes('get-process')) {
+    for (let i = index - 1; i >= 0; i--) {
+      const prev = allSteps[i].action.toLowerCase();
+      if (prev.includes('stop-process') || prev.includes('kill') || prev.includes('taskkill')) {
+        return true;
+      }
+    }
+  }
+
+  // Pattern: Get-Service after a service start/stop/restart step
+  if (action.includes('get-service')) {
+    for (let i = index - 1; i >= 0; i--) {
+      const prev = allSteps[i].action.toLowerCase();
+      if (prev.includes('start-service') || prev.includes('stop-service') ||
+          prev.includes('restart-service') || prev.includes('net start') || prev.includes('net stop')) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 interface AgentConfig {
@@ -167,6 +221,7 @@ class OPSISAgentService {
   private escalationProtocol: EscalationProtocol;
   private runbookClassifier: RunbookClassifier;
   private actionTicketManager: ActionTicketManager;
+  private troubleshootingRunner: TroubleshootingRunner;
   private deviceInfo: DeviceInfo;
   private recentActions: Array<{ 
     playbook_id: string; 
@@ -177,7 +232,7 @@ class OPSISAgentService {
   private pendingRunbooks: Map<string, RunbookMatch> = new Map(); // signature_id -> matched runbook
   private escalationCooldowns: Map<string, number> = new Map(); // signature_id -> last escalated timestamp
   private readonly ESCALATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
-  private escalationBatch: Array<{signature: DeviceSignature, runbook: RunbookMatch | null}> = [];
+  private escalationBatch: Array<{signature: DeviceSignature, runbook: RunbookMatch | null, diagnosticData?: DiagnosticData | null}> = [];
   private batchTimer: NodeJS.Timeout | null = null;
   private readonly BATCH_FLUSH_MS = 10000; // 10 seconds
 
@@ -253,7 +308,8 @@ class OPSISAgentService {
     this.escalationProtocol = new EscalationProtocol(this.logger);
     this.runbookClassifier = new RunbookClassifier(this.logger, this.runbooksDir);
     this.actionTicketManager = new ActionTicketManager(this.logger, this.ticketDb);
-    
+    this.troubleshootingRunner = new TroubleshootingRunner(this.logger, this.dataDir);
+
     // Load device info
     this.deviceInfo = this.loadDeviceInfo();
     
@@ -375,10 +431,46 @@ class OPSISAgentService {
 
   private saveConfig(): void {
     try {
-      fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2));
+      // Remove sensitive fields before saving to disk
+      const safeConfig = { ...this.config };
+      delete safeConfig.apiKey; // Never save API key to disk
+      fs.writeFileSync(this.configPath, JSON.stringify(safeConfig, null, 2));
       this.logger.info('Configuration saved');
     } catch (err) {
       this.logger.error('Error saving config', err);
+    }
+  }
+
+  /**
+   * Load API key and HMAC secret from Windows Credential Manager (keytar)
+   * This is called during startup to retrieve secure credentials
+   */
+  private async loadSecureCredentials(): Promise<void> {
+    try {
+      // Load API key from keytar
+      const apiKey = await getApiKey();
+      if (apiKey) {
+        this.config.apiKey = apiKey;
+        this.logger.info('API key loaded from credential manager');
+      } else {
+        // Fall back to config file for backwards compatibility
+        // This should only happen on first run before migration
+        if (this.config.apiKey) {
+          this.logger.warn('API key in config file - should migrate to credential manager');
+        } else {
+          this.logger.warn('No API key configured');
+        }
+      }
+
+      // Check if HMAC is configured
+      const hmacConfigured = await isHmacConfigured();
+      if (hmacConfigured) {
+        this.logger.info('HMAC verification enabled');
+      } else {
+        this.logger.warn('HMAC secret not configured - server messages will not be verified');
+      }
+    } catch (error) {
+      this.logger.error('Error loading secure credentials', error);
     }
   }
 
@@ -707,6 +799,127 @@ class OPSISAgentService {
         });
       }
     });
+
+    // Handle manual ticket submission from GUI
+    this.ipcServer.onMessage('submit-manual-ticket', (data, socket) => {
+      this.logger.info('IPC: Received submit-manual-ticket request', data);
+      try {
+        const ticketId = `manual-${Date.now()}`;
+        const ticket = {
+          ticket_id: ticketId,
+          timestamp: data.submittedAt || new Date().toISOString(),
+          type: 'manual-investigation',
+          description: `[${data.category}] ${data.description} (Server: ${data.serverName}, Priority: ${data.priority})`,
+          status: 'open' as const,
+          source: 'manual' as const,
+          computer_name: data.serverName || os.hostname(),
+          escalated: 1
+        };
+
+        this.ticketDb.createTicket(ticket);
+        this.ticketDb.markAsEscalated(ticketId);
+
+        this.logger.info('Manual ticket created', { ticketId, category: data.category });
+
+        // Broadcast update to all GUI clients
+        this.broadcastTicketUpdate();
+
+        this.ipcServer.sendToClient(socket, {
+          type: 'submit-manual-ticket-result',
+          data: { success: true, ticketId }
+        });
+      } catch (error) {
+        this.logger.error('Failed to create manual ticket', error);
+        this.ipcServer.sendToClient(socket, {
+          type: 'submit-manual-ticket-result',
+          data: { success: false, error: (error as Error).message }
+        });
+      }
+    });
+
+    // Test escalation handler - creates a fake issue to test server response
+    this.ipcServer.onMessage('test-escalation', async (data, socket) => {
+      this.logger.info('IPC: Received test-escalation request', data);
+
+      const issueType = data.type || 'disk-space-low';
+      const testSignature: DeviceSignature = {
+        signature_id: `test-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+        tenant_id: this.deviceInfo.tenant_id,
+        device_id: this.deviceInfo.device_id,
+        timestamp: new Date().toISOString(),
+        severity: data.severity || 'medium',
+        confidence_local: data.confidence || 65,
+        symptoms: [],
+        targets: [],
+        context: {
+          os_build: os.release(),
+          os_version: `Windows ${os.release()}`,
+          device_role: this.deviceInfo.role || 'workstation'
+        }
+      };
+
+      // Configure symptoms based on issue type
+      switch (issueType) {
+        case 'disk-space-low':
+          testSignature.symptoms = [{
+            type: 'disk',
+            severity: 'high',
+            details: { drive: 'C:', free_percent: 5, threshold: 10 }
+          }];
+          testSignature.targets = [{ type: 'system', name: 'C:', identifier: 'C:' }];
+          break;
+        case 'high-cpu':
+          testSignature.symptoms = [{
+            type: 'performance',
+            severity: 'high',
+            details: { metric: 'cpu_usage', value: 95, threshold: 90 }
+          }];
+          testSignature.targets = [{ type: 'system', name: 'CPU', identifier: 'processor' }];
+          break;
+        case 'service-stopped':
+          testSignature.symptoms = [{
+            type: 'service_status',
+            severity: 'high',
+            details: { service: data.service || 'TestService', state: 'Stopped', expected: 'Running' }
+          }];
+          testSignature.targets = [{ type: 'service', name: data.service || 'TestService' }];
+          break;
+        case 'high-memory':
+          testSignature.symptoms = [{
+            type: 'performance',
+            severity: 'high',
+            details: { metric: 'memory_usage', value: 92, threshold: 85 }
+          }];
+          testSignature.targets = [{ type: 'system', name: 'Memory', identifier: 'ram' }];
+          break;
+        default:
+          testSignature.symptoms = [{
+            type: 'performance',
+            severity: 'medium',
+            details: { description: data.description || 'Test issue for server processing' }
+          }];
+          testSignature.targets = [{ type: 'system', name: 'Test', identifier: 'test' }];
+      }
+
+      this.logger.info('Creating test escalation', {
+        signature_id: testSignature.signature_id,
+        type: issueType,
+        symptoms: testSignature.symptoms
+      });
+
+      // Escalate to server
+      this.escalateToServer(testSignature, null);
+
+      this.ipcServer.sendToClient(socket, {
+        type: 'test-escalation-result',
+        data: {
+          success: true,
+          signature_id: testSignature.signature_id,
+          issue_type: issueType,
+          message: 'Test escalation sent to server'
+        }
+      });
+    });
   }
 
   // ============================================
@@ -797,11 +1010,14 @@ class OPSISAgentService {
   public async start(): Promise<void> {
     this.log('OPSIS Agent Service Starting...');
 
+    // Load credentials from Windows Credential Manager (keytar)
+    await this.loadSecureCredentials();
+
     // Check what this endpoint allows before starting operations
     await this.detectPolicyRestrictions();
 
-    // Start IPC server for GUI
-    this.ipcServer.start();
+    // Start IPC server for GUI (with authentication)
+    await this.ipcServer.start();
     this.log('IPC server started');
 
     // Load pending actions from disk
@@ -817,6 +1033,10 @@ class OPSISAgentService {
     // Start system monitoring
     this.systemMonitor.start();
     this.log('System monitoring started (60 second intervals)');
+
+    // Initialize baseline health scores for hardware components
+    await this.patternDetector.initializeBaselineHealthScores();
+    this.log('Hardware health scores initialized');
 
     // Connect to server if configured
     const serverUrl = this.deviceInfo.websocket_url || this.config.serverUrl;
@@ -1034,9 +1254,14 @@ class OPSISAgentService {
 
   // UPDATED: Handle server messages including decisions
   private handleServerMessage(message: string): void {
+    // SECURITY: Use safe JSON parsing
+    const { parsed: data, error: parseError } = tryParseJSON(message);
+    if (parseError || !data) {
+      this.logger.error('Failed to parse server message', { error: parseError });
+      return;
+    }
+
     try {
-      const data = JSON.parse(message);
-      
       this.logger.info('Received server message', { type: data.type });
 
       switch (data.type) {
@@ -1078,8 +1303,14 @@ class OPSISAgentService {
           break;
 
         case 'diagnostic_request':
-          this.logger.warn('RAW diagnostic_request message', { raw: message });
-          this.handleDiagnosticRequest(data.data || data);
+          this.logger.info('Received diagnostic_request', { session_id: data.data?.session_id });
+          // SECURITY: Verify HMAC and validate before executing
+          this.handleSecureDiagnosticRequest(data.data || data);
+          break;
+
+        case 'key_rotation':
+          // SECURITY: Handle key rotation from server
+          this.handleKeyRotationMessage(data);
           break;
 
         case 'diagnostic_complete':
@@ -1281,8 +1512,19 @@ class OPSISAgentService {
    * Execute a reboot playbook step - prompts user then reboots if confirmed.
    */
   private async executeReboot(params: Record<string, any>): Promise<void> {
-    const delay = params.delay || 30;
-    const message = params.message || 'Please save your work. The computer needs to restart to complete a resolution.';
+    // SECURITY: Validate delay as integer to prevent command injection
+    let delay = 30;
+    if (params.delay !== undefined) {
+      const parsedDelay = parseInt(String(params.delay), 10);
+      if (isNaN(parsedDelay) || parsedDelay < 0 || parsedDelay > 3600) {
+        this.logger.error('Invalid reboot delay parameter', { delay: params.delay });
+        throw new Error('Invalid delay parameter: must be integer 0-3600');
+      }
+      delay = parsedDelay;
+    }
+    // SECURITY: Sanitize message - remove shell metacharacters
+    const rawMessage = params.message || 'Please save your work. The computer needs to restart to complete a resolution.';
+    const message = String(rawMessage).replace(/[`$&|;<>\r\n"]/g, '');
     const promptId = `reboot-${Date.now()}`;
 
     this.logger.info('Reboot step: prompting user for confirmation');
@@ -1315,10 +1557,16 @@ class OPSISAgentService {
 
     if (response === 'ok') {
       this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`);
-      const { exec } = require('child_process');
-      exec(`shutdown /r /t ${delay} /c "OPSIS Agent: Restarting to complete remediation"`, (err: any) => {
-        if (err) this.logger.error('Failed to initiate reboot', err);
-      });
+      const { spawnSync } = require('child_process');
+      // SECURITY: Use spawnSync with array args to prevent command injection
+      const result = spawnSync('shutdown.exe', [
+        '/r',
+        '/t', String(delay),
+        '/c', 'OPSIS Agent: Restarting to complete remediation'
+      ], { timeout: 10000 });
+      if (result.error) {
+        this.logger.error('Failed to initiate reboot', result.error);
+      }
     } else {
       this.logger.info('User declined or timed out on reboot prompt', { response });
     }
@@ -1500,7 +1748,8 @@ class OPSISAgentService {
     serverMessage: string
   ): void {
     // Create a ticket for technician review
-    const ticketId = `pending-action-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // SECURITY: Use cryptographically secure random ID
+    const ticketId = `pending-action-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
 
     // Store the pending action
     const pendingAction = {
@@ -1841,6 +2090,104 @@ class OPSISAgentService {
                    'Server determined this should be ignored';
 
     return { isIgnore: matched, reason };
+  }
+
+  // ============================================
+  // SECURITY: Key Rotation Handler
+  // ============================================
+
+  private async handleKeyRotationMessage(data: any): Promise<void> {
+    this.logger.info('Key rotation request received');
+
+    try {
+      const result = await handleKeyRotation(data, this.logger);
+
+      if (result.success) {
+        // Send acknowledgment
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(createRotationAck(result.rotated)));
+        }
+
+        // Reload credentials to use new keys
+        await this.loadSecureCredentials();
+        this.logger.info('Key rotation completed successfully');
+      } else {
+        // Send error response
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(createRotationError(result.error || 'Unknown error')));
+        }
+        this.logger.error('Key rotation failed', { error: result.error });
+      }
+    } catch (error: any) {
+      this.logger.error('Key rotation exception', { error: error.message });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(createRotationError(error.message)));
+      }
+    }
+  }
+
+  // ============================================
+  // SECURITY: Secure Diagnostic Request Handler
+  // ============================================
+
+  private async handleSecureDiagnosticRequest(data: any): Promise<void> {
+    // Step 1: Verify HMAC signature if present
+    if (data._signature) {
+      const verification = await verifyDiagnosticRequest(data);
+      if (!verification.valid) {
+        this.logger.error('Diagnostic request signature verification failed', {
+          error: verification.error,
+          session_id: data.session_id
+        });
+        // Send error response
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'diagnostic_error',
+            session_id: data.session_id,
+            error: 'Signature verification failed',
+            timestamp: new Date().toISOString()
+          }));
+        }
+        return;
+      }
+      this.logger.info('Diagnostic request signature verified');
+    } else {
+      // No signature - REJECT if HMAC is configured (strict enforcement)
+      const hmacRequired = await isHmacConfigured();
+      if (hmacRequired) {
+        this.logger.error('SECURITY: Diagnostic request missing signature - HMAC is configured, rejecting unsigned request');
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'diagnostic_error',
+            session_id: data.session_id,
+            error: 'Missing signature - signed requests required',
+            timestamp: new Date().toISOString()
+          }));
+        }
+        return;
+      }
+    }
+
+    // Step 2: Validate diagnostic request structure
+    const validation = validateDiagnosticRequest(data);
+    if (!validation.valid) {
+      this.logger.error('Diagnostic request validation failed', {
+        errors: validation.errors,
+        session_id: data.session_id
+      });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'diagnostic_error',
+          session_id: data.session_id,
+          error: 'Validation failed: ' + validation.errors.join(', '),
+          timestamp: new Date().toISOString()
+        }));
+      }
+      return;
+    }
+
+    // Step 3: Execute the diagnostic
+    await this.handleDiagnosticRequest(data);
   }
 
   // ============================================
@@ -2438,8 +2785,8 @@ class OPSISAgentService {
     this.broadcastTicketUpdate();
   }
 
-  // NEW METHOD: Escalate to Server (Tier 2) - FIXED
-  private escalateToServer(signature: DeviceSignature, runbook: RunbookMatch | null): void {
+  // NEW METHOD: Escalate to Server (Tier 2) - With Pre-Escalation Troubleshooting
+  private async escalateToServer(signature: DeviceSignature, runbook: RunbookMatch | null): Promise<void> {
     // Check ignore list before escalating
     if (this.shouldIgnoreSignature(signature.signature_id)) {
       this.logger.debug('Ignoring signal - on ignore list', {
@@ -2482,6 +2829,26 @@ class OPSISAgentService {
     // Mark as escalated for dedup cooldown
     this.escalationCooldowns.set(signature.signature_id, now);
 
+    // Run pre-escalation troubleshooting to collect diagnostic data
+    let diagnosticData: DiagnosticData | null = null;
+    try {
+      diagnosticData = await this.troubleshootingRunner.runTroubleshooting(signature, 15000);
+      if (diagnosticData) {
+        this.logger.info('Pre-escalation diagnostics collected', {
+          signature_id: signature.signature_id,
+          category: diagnosticData.category,
+          steps_collected: Object.keys(diagnosticData.data).length,
+          duration_ms: diagnosticData.duration_ms
+        });
+      }
+    } catch (error: any) {
+      // Log but don't block escalation if troubleshooting fails
+      this.logger.warn('Pre-escalation troubleshooting failed', {
+        signature_id: signature.signature_id,
+        error: error.message
+      });
+    }
+
     // If not connected, fall back to manual ticket immediately
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.logger.warn('WebSocket not connected, creating manual ticket', {
@@ -2494,22 +2861,23 @@ class OPSISAgentService {
     // Check if critical severity — flush immediately
     const isCritical = signature.severity === 'critical' || signature.severity === 'high';
     if (isCritical) {
-      this.sendEscalationNow(signature, runbook);
+      this.sendEscalationNow(signature, runbook, diagnosticData);
       return;
     }
 
     // Batch: queue for batched send
-    this.escalationBatch.push({ signature, runbook });
+    this.escalationBatch.push({ signature, runbook, diagnosticData });
     if (!this.batchTimer) {
       this.batchTimer = setTimeout(() => this.flushEscalationBatch(), this.BATCH_FLUSH_MS);
     }
   }
 
-  private sendEscalationNow(signature: DeviceSignature, runbook: RunbookMatch | null): void {
+  private sendEscalationNow(signature: DeviceSignature, runbook: RunbookMatch | null, diagnosticData?: DiagnosticData | null): void {
     const escalationPayload = this.escalationProtocol.buildEscalationPayload(
       signature,
       runbook,
-      this.recentActions
+      this.recentActions,
+      diagnosticData
     );
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -2519,7 +2887,9 @@ class OPSISAgentService {
       }));
       this.logger.info('Escalation sent to server', {
         signature_id: escalationPayload.signature_id,
-        requested_outcome: escalationPayload.requested_outcome
+        requested_outcome: escalationPayload.requested_outcome,
+        has_diagnostic_data: !!escalationPayload.pre_escalation_diagnostics,
+        diagnostic_category: escalationPayload.pre_escalation_diagnostics?.category
       });
     }
   }
@@ -2542,13 +2912,13 @@ class OPSISAgentService {
 
     // Single item — send as regular escalation
     if (batch.length === 1) {
-      this.sendEscalationNow(batch[0].signature, batch[0].runbook);
+      this.sendEscalationNow(batch[0].signature, batch[0].runbook, batch[0].diagnosticData);
       return;
     }
 
-    // Multiple items — send as batch
+    // Multiple items — send as batch (include diagnostic data)
     const escalations = batch.map(item =>
-      this.escalationProtocol.buildEscalationPayload(item.signature, item.runbook, this.recentActions)
+      this.escalationProtocol.buildEscalationPayload(item.signature, item.runbook, this.recentActions, item.diagnosticData)
     );
 
     this.ws.send(JSON.stringify({
@@ -2559,7 +2929,8 @@ class OPSISAgentService {
 
     this.logger.info('Batch escalation sent to server', {
       batch_size: escalations.length,
-      signature_ids: escalations.map(e => e.signature_id)
+      signature_ids: escalations.map(e => e.signature_id),
+      with_diagnostics: escalations.filter(e => e.pre_escalation_diagnostics).length
     });
   }
 
@@ -2770,11 +3141,48 @@ class OPSISAgentService {
   // PLAYBOOK SYSTEM (Unchanged)
   // ============================================
 
-  public receivePlaybook(playbook: PlaybookTask, source: 'server' | 'admin' | 'local'): void {
+  public async receivePlaybook(playbook: PlaybookTask, source: 'server' | 'admin' | 'local'): Promise<void> {
     playbook.source = source;
     playbook.createdAt = new Date();
 
     this.log(`Received playbook: ${playbook.name} (${source} - ${playbook.priority})`);
+
+    // SECURITY: Verify and validate server playbooks
+    if (source === 'server') {
+      // Step 1: Verify HMAC signature if present
+      const pbAny = playbook as any;
+      if (pbAny._signature) {
+        const verification = await verifyPlaybook(playbook);
+        if (!verification.valid) {
+          this.logger.error('Playbook signature verification failed', {
+            error: verification.error,
+            playbookId: playbook.id
+          });
+          return; // Reject the playbook
+        }
+        this.logger.info('Playbook signature verified', { playbookId: playbook.id });
+      } else {
+        // No signature - REJECT if HMAC is configured (strict enforcement)
+        const hmacRequired = await isHmacConfigured();
+        if (hmacRequired) {
+          this.logger.error('SECURITY: Server playbook missing signature - HMAC is configured, rejecting unsigned playbook', {
+            playbookId: playbook.id
+          });
+          return; // Reject the playbook
+        }
+      }
+
+      // Step 2: Validate playbook structure and step types
+      const validation = validatePlaybook(playbook);
+      if (!validation.valid) {
+        this.logger.error('Playbook validation failed', {
+          errors: validation.errors,
+          playbookId: playbook.id
+        });
+        return; // Reject the playbook
+      }
+      this.logger.info('Playbook validated successfully', { playbookId: playbook.id });
+    }
 
     // Check if this is an ignore instruction from the server
     if (source === 'server') {
@@ -2916,7 +3324,8 @@ class OPSISAgentService {
   }
 
   private async executePlaybook(playbook: PlaybookTask): Promise<void> {
-    for (const step of playbook.steps) {
+    for (let i = 0; i < playbook.steps.length; i++) {
+      const step = playbook.steps[i];
       this.log(`  Executing step: ${step.type} - ${step.action}`);
 
       if (step.requiresApproval && !this.config.autoRemediation) {
@@ -2924,13 +3333,23 @@ class OPSISAgentService {
         continue;
       }
 
+      const isVerification = step.allowFailure || this.isVerificationStep(step, playbook.steps, i);
+
       try {
         await this.executeStep(step);
       } catch (error) {
+        if (isVerification) {
+          this.log(`  Verification step result (non-fatal): ${step.action}`, error);
+          continue;
+        }
         this.log(`  Step failed: ${step.action}`, error);
         throw error;
       }
     }
+  }
+
+  private isVerificationStep(step: PlaybookStep, allSteps: PlaybookStep[], index: number): boolean {
+    return isVerificationStep(step, allSteps, index);
   }
 
   private async executeStep(step: PlaybookStep): Promise<void> {
