@@ -22,6 +22,8 @@ import { EscalationProtocol, EscalationPayload, ServerDecision } from './escalat
 import { RunbookClassifier, RiskClass } from './runbook-classifier';
 import { ActionTicketManager } from './action-ticket-manager';
 import { TroubleshootingRunner, DiagnosticData } from './troubleshooting-runner';
+import { StateTracker, StateChangeEvent, SeverityEscalationEvent } from './state-tracker';
+import { MaintenanceWindowManager, MaintenanceWindow } from './maintenance-windows';
 
 // Security imports
 import {
@@ -265,6 +267,12 @@ class OPSISAgentService {
   private awaitingReviewSignals: Set<string> = new Set(); // Signals that shouldn't be re-escalated (awaiting technician)
   private readonly pendingActionsPath: string;
 
+  // Monitoring trap agent features
+  private stateTracker!: StateTracker;
+  private maintenanceManager!: MaintenanceWindowManager;
+  private severityEscalationTimer: NodeJS.Timeout | null = null;
+  private dependencyRefreshTimer: NodeJS.Timeout | null = null;
+
   constructor() {
     // Determine base directory - handle both node.js and pkg compiled exe
     // When running as pkg exe, __dirname points to snapshot filesystem, so use cwd or exe path
@@ -309,6 +317,8 @@ class OPSISAgentService {
     this.runbookClassifier = new RunbookClassifier(this.logger, this.runbooksDir);
     this.actionTicketManager = new ActionTicketManager(this.logger, this.ticketDb);
     this.troubleshootingRunner = new TroubleshootingRunner(this.logger, this.dataDir);
+    this.stateTracker = new StateTracker(this.logger, this.dataDir);
+    this.maintenanceManager = new MaintenanceWindowManager(this.logger, this.dataDir);
 
     // Load device info
     this.deviceInfo = this.loadDeviceInfo();
@@ -920,6 +930,50 @@ class OPSISAgentService {
         }
       });
     });
+
+    // Maintenance window IPC handlers
+    this.ipcServer.onMessage('create-maintenance-window', (data, socket) => {
+      const window: MaintenanceWindow = {
+        id: `mw-gui-${Date.now()}`,
+        name: data.name || 'Maintenance Window',
+        startTime: data.startTime || new Date().toISOString(),
+        endTime: data.endTime,
+        scope: data.scope || { type: 'all' },
+        suppressEscalation: data.suppressEscalation !== false,
+        suppressRemediation: data.suppressRemediation !== false,
+        createdBy: 'technician',
+        createdAt: new Date().toISOString()
+      };
+      this.maintenanceManager.addWindow(window);
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'maintenance_window_created', data: window }));
+      }
+
+      this.ipcServer.sendToClient(socket, { type: 'maintenance-window-created', data: { success: true, window } });
+    });
+
+    this.ipcServer.onMessage('cancel-maintenance-window', (data, socket) => {
+      this.maintenanceManager.removeWindow(data.id);
+      this.ipcServer.sendToClient(socket, { type: 'maintenance-window-cancelled', data: { success: true, id: data.id } });
+    });
+
+    this.ipcServer.onMessage('get-maintenance-windows', (data, socket) => {
+      this.ipcServer.sendToClient(socket, {
+        type: 'maintenance-windows',
+        data: {
+          all: this.maintenanceManager.getAllWindows(),
+          active: this.maintenanceManager.getActiveWindows()
+        }
+      });
+    });
+
+    this.ipcServer.onMessage('get-state-tracker-summary', (data, socket) => {
+      this.ipcServer.sendToClient(socket, {
+        type: 'state-tracker-summary',
+        data: this.stateTracker.getSummary()
+      });
+    });
   }
 
   // ============================================
@@ -1055,6 +1109,44 @@ class OPSISAgentService {
     // Process playbook queue
     this.processPlaybookQueue();
 
+    // Start monitoring trap agent features
+    this.stateTracker.refreshDependencyMap().catch(err =>
+      this.logger.warn('Initial dependency map refresh failed', err)
+    );
+    this.dependencyRefreshTimer = setInterval(() => {
+      this.stateTracker.refreshDependencyMap().catch(err =>
+        this.logger.warn('Dependency map refresh failed', err)
+      );
+    }, 5 * 60 * 1000);
+
+    this.severityEscalationTimer = setInterval(() => {
+      this.checkSeverityEscalations();
+      const stableResources = this.stateTracker.checkFlapStability();
+      for (const resourceId of stableResources) {
+        this.stateTracker.clearState(resourceId);
+      }
+    }, 60000);
+
+    this.maintenanceManager.startExpirationChecks();
+    this.maintenanceManager.onExpiration((window) => {
+      this.logger.info('Maintenance window expired, forcing re-evaluation', { id: window.id, name: window.name });
+      if (window.scope.type === 'services' && window.scope.services) {
+        for (const svc of window.scope.services) {
+          this.stateTracker.clearState(`service:${svc}`);
+        }
+      } else if (window.scope.type === 'all') {
+        this.stateTracker.clearAllStates();
+      }
+    });
+
+    // Start real-time event subscriptions
+    try {
+      this.eventMonitor.startEventSubscriptions();
+      this.log('Real-time event subscriptions started');
+    } catch (err) {
+      this.logger.warn('Failed to start event subscriptions, polling fallback active', err);
+    }
+
     this.log('OPSIS Agent Service Started Successfully');
   }
 
@@ -1101,6 +1193,18 @@ class OPSISAgentService {
 
     if (this.telemetryTimer) {
       clearInterval(this.telemetryTimer);
+    }
+
+    if (this.severityEscalationTimer) {
+      clearInterval(this.severityEscalationTimer);
+    }
+
+    if (this.dependencyRefreshTimer) {
+      clearInterval(this.dependencyRefreshTimer);
+    }
+
+    if (this.maintenanceManager) {
+      this.maintenanceManager.stopExpirationChecks();
     }
 
     this.log('OPSIS Agent Service Stopped');
@@ -1401,6 +1505,14 @@ class OPSISAgentService {
           if (cancelSigId) {
             this.cancelPendingAction(cancelSigId, data.reason || data.data?.reason);
           }
+          break;
+
+        case 'maintenance_window':
+          this.handleMaintenanceWindowMessage(data.data || data);
+          break;
+
+        case 'cancel_maintenance_window':
+          this.handleCancelMaintenanceWindow(data.data || data);
           break;
 
         default:
@@ -2590,6 +2702,15 @@ class OPSISAgentService {
       });
     }
     // No else needed — heartbeat already running from on('open')
+
+    // Apply severity escalation and flap detection config from server
+    const sc = this.serverConfig as any;
+    if (sc?.severity_escalation) {
+      this.stateTracker.updateSeverityConfig(sc.severity_escalation);
+    }
+    if (sc?.flap_detection) {
+      this.stateTracker.updateFlapConfig(sc.flap_detection);
+    }
   }
 
   // ============================================
@@ -2607,7 +2728,30 @@ class OPSISAgentService {
       hasRunbook: !!runbook
     });
 
-    // NEW: Generate signature from event
+    // Gate 1: Maintenance window check
+    const maintenanceCheck = this.maintenanceManager.isUnderMaintenance(
+      'event-log',
+      event.raw?.serviceName,
+      `event:${event.source}:${event.id}`
+    );
+    if (maintenanceCheck.suppressed) {
+      this.logger.info('Event suppressed by maintenance window', {
+        eventId: event.id,
+        source: event.source,
+        window: maintenanceCheck.window?.name
+      });
+      return;
+    }
+
+    // Gate 2: State tracking deduplication
+    const resourceId = `event:${event.source}:${event.id}`;
+    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, undefined, { eventId: event.id, source: event.source });
+    if (!stateChange) {
+      this.logger.debug('Event state unchanged, suppressing', { resourceId });
+      return;
+    }
+
+    // Generate signature from event
     const signature = this.signatureGenerator.generateFromEvent(event, this.deviceInfo);
     
     this.logger.info('Signature generated', {
@@ -2675,6 +2819,67 @@ class OPSISAgentService {
       metric: signal.metric,
       value: signal.value
     });
+
+    // Gate 1: Maintenance window check
+    const maintenanceCheck = this.maintenanceManager.isUnderMaintenance(
+      signal.category,
+      signal.metadata?.serviceName,
+      signal.id
+    );
+    if (maintenanceCheck.suppressed) {
+      this.logger.info('Signal suppressed by maintenance window', {
+        signal: signal.id,
+        window: maintenanceCheck.window?.name,
+        reason: maintenanceCheck.reason
+      });
+      this.sendTelemetry(signal);
+      return;
+    }
+
+    // Gate 2: State tracking deduplication
+    const resourceId = this.deriveResourceId(signal);
+    const currentState = this.deriveCurrentState(signal);
+    const resourceType = this.deriveResourceType(signal);
+    const stateChange = this.stateTracker.checkState(resourceId, resourceType, currentState, signal.severity as any, signal.metadata);
+
+    if (!stateChange) {
+      this.sendTelemetry(signal);
+      this.patternDetector.recordOccurrence(
+        signal.id, signal.category, os.hostname(),
+        signal.severity as 'critical' | 'warning' | 'info', signal.metadata
+      );
+      return;
+    }
+
+    // Gate 3: Dependency awareness — suppress downstream service alerts
+    if (signal.category === 'services' && signal.metadata?.serviceName) {
+      const depCheck = this.stateTracker.isDownstreamOfDownParent(signal.metadata.serviceName);
+      if (depCheck.isDownstream) {
+        this.logger.info('Suppressing downstream service alert', {
+          service: signal.metadata.serviceName,
+          downParents: depCheck.downParents
+        });
+        this.sendTelemetry(signal);
+        return;
+      }
+    }
+
+    // Gate 4: Flap detection — replace signal with FLAP signal
+    if (stateChange.isFlap) {
+      signal = {
+        ...signal,
+        id: `FLAP_${resourceId}`,
+        severity: 'warning',
+        metric: 'flap_detected',
+        value: stateChange.transitionCount,
+        message: `Resource ${resourceId} is flapping: ${stateChange.transitionCount} state changes in ${this.stateTracker.getFlapConfig().windowMinutes} minutes`,
+        metadata: {
+          ...signal.metadata,
+          flapTransitionCount: stateChange.transitionCount,
+          originalSignalId: signal.id
+        }
+      } as SystemSignal;
+    }
 
     // Stream telemetry to server in real-time
     this.sendTelemetry(signal);
@@ -3810,6 +4015,94 @@ class OPSISAgentService {
     };
 
     return diagnostics[scenario] || [];
+  }
+
+  // ============================================
+  // MONITORING TRAP AGENT HELPERS
+  // ============================================
+
+  private deriveResourceId(signal: SystemSignal): string {
+    if (signal.category === 'services') return `service:${signal.metadata?.serviceName || signal.id}`;
+    if (signal.category === 'performance' && signal.metadata?.processName) return `process:${signal.metadata.processName}`;
+    if (signal.category === 'storage') return `disk:${signal.metadata?.drive || signal.id}`;
+    if (signal.category === 'network') return `network:${signal.metadata?.adapter || signal.id}`;
+    return `metric:${signal.category}:${signal.metric || signal.id}`;
+  }
+
+  private deriveCurrentState(signal: SystemSignal): string {
+    if (signal.category === 'services' && signal.value) return String(signal.value);
+    return signal.severity;
+  }
+
+  private deriveResourceType(signal: SystemSignal): 'service' | 'process' | 'metric' | 'disk' | 'network' {
+    switch (signal.category) {
+      case 'services': return 'service';
+      case 'storage': return 'disk';
+      case 'network': return 'network';
+      default: return 'metric';
+    }
+  }
+
+  private checkSeverityEscalations(): void {
+    const escalations = this.stateTracker.checkSeverityEscalation();
+    for (const esc of escalations) {
+      this.logger.warn('Severity escalated due to persistence', {
+        resourceId: esc.resourceId,
+        from: esc.escalatedFrom,
+        to: esc.escalatedTo,
+        duration_minutes: esc.durationMinutes
+      });
+
+      const resourceState = this.stateTracker.getResourceState(esc.resourceId);
+      if (!resourceState) continue;
+
+      const escalatedSignal: SystemSignal = {
+        id: `escalated-${esc.resourceId}-${Date.now()}`,
+        category: resourceState.resourceType === 'service' ? 'services' : 'performance',
+        severity: esc.escalatedTo as 'critical' | 'warning' | 'info',
+        metric: 'severity_escalation',
+        value: esc.durationMinutes,
+        message: `Issue persisted for ${esc.durationMinutes} minutes, severity escalated from ${esc.escalatedFrom} to ${esc.escalatedTo}`,
+        timestamp: new Date(),
+        metadata: {
+          ...resourceState.metadata,
+          escalatedFrom: esc.escalatedFrom,
+          originalTimestamp: esc.originalSignalTimestamp
+        }
+      };
+
+      // Process escalated signal — bypass state tracker gate since this is an internal escalation
+      this.sendTelemetry(escalatedSignal);
+      const signature = this.signatureGenerator.generateFromSystemSignal(escalatedSignal, this.deviceInfo);
+      this.escalateToServer(signature, null);
+    }
+  }
+
+  private handleMaintenanceWindowMessage(data: any): void {
+    const window: MaintenanceWindow = {
+      id: data.id || `mw-server-${Date.now()}`,
+      name: data.name || 'Server Maintenance',
+      startTime: data.start_time || data.startTime || new Date().toISOString(),
+      endTime: data.end_time || data.endTime,
+      scope: data.scope || { type: 'all' },
+      suppressEscalation: data.suppress_escalation !== false,
+      suppressRemediation: data.suppress_remediation !== false,
+      createdBy: 'server',
+      createdAt: new Date().toISOString()
+    };
+
+    this.maintenanceManager.addWindow(window);
+    this.logger.info('Maintenance window added from server', { id: window.id, name: window.name });
+
+    this.ipcServer.broadcast({ type: 'maintenance-window-added', data: window });
+  }
+
+  private handleCancelMaintenanceWindow(data: any): void {
+    const windowId = data.id || data.window_id;
+    if (windowId) {
+      this.maintenanceManager.removeWindow(windowId);
+      this.ipcServer.broadcast({ type: 'maintenance-window-removed', data: { id: windowId } });
+    }
   }
 
   private createPlaybookForSystemSignal(signal: SystemSignal): PlaybookTask | null {

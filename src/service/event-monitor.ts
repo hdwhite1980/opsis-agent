@@ -1,6 +1,7 @@
 // event-monitor.ts - Windows Event Log Monitor with Runbook Matching
-import { exec } from 'child_process';
+import { exec, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
+import * as os from 'os';
 import { Logger } from '../common/logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -61,6 +62,9 @@ export class EventMonitor {
   private lastCheckedTime: Date;
   private onIssueDetected: (event: EventLogEntry, runbook?: RunbookMatch) => void;
   private onEscalationNeeded: (event: EventLogEntry, reason: string) => void;
+  private subscriptionProcess: ChildProcess | null = null;
+  private subscriptionBuffer: string = '';
+  private subscriptionRestartTimer: NodeJS.Timeout | null = null;
 
   constructor(
     logger: Logger,
@@ -622,11 +626,13 @@ export class EventMonitor {
     }
 
     this.isMonitoring = false;
-    
+
     if (this.monitoringInterval) {
       clearInterval(this.monitoringInterval);
       this.monitoringInterval = null;
     }
+
+    this.stopEventSubscriptions();
 
     this.logger.info('Stopped event log monitoring');
   }
@@ -1100,6 +1106,7 @@ ConvertTo-Json -Depth 3
       isMonitoring: this.isMonitoring,
       runbooksLoaded: this.runbooks.size,
       lastChecked: this.lastCheckedTime,
+      hasSubscriptions: this.subscriptionProcess !== null,
       runbooks: Array.from(this.runbooks.values()).map(rb => ({
         id: rb.id,
         name: rb.name,
@@ -1107,6 +1114,229 @@ ConvertTo-Json -Depth 3
         triggers: rb.triggers.length
       }))
     };
+  }
+
+  // ============================================
+  // REAL-TIME WMI EVENT SUBSCRIPTIONS (Feature 1)
+  // ============================================
+
+  public startEventSubscriptions(): void {
+    if (this.subscriptionProcess) {
+      this.logger.warn('Event subscriptions already running');
+      return;
+    }
+
+    this.logger.info('Starting real-time WMI event subscriptions...');
+
+    // PowerShell script that runs persistent WMI subscriptions and outputs JSON events
+    const psScript = `
+$ErrorActionPreference = 'SilentlyContinue'
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+function Emit-Event($type, $data) {
+  $obj = @{ type = $type; timestamp = (Get-Date -Format o); data = $data }
+  $json = ($obj | ConvertTo-Json -Compress -Depth 5)
+  [Console]::Out.WriteLine("OPSIS_EVENT:$json")
+  [Console]::Out.Flush()
+}
+
+try {
+  # 1. Service state change subscription (WITHIN 2 = poll WMI every 2s)
+  Register-WmiEvent -Query "SELECT * FROM __InstanceModificationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Service' AND TargetInstance.State <> PreviousInstance.State" -SourceIdentifier 'ServiceStateChange'
+
+  # 2. Critical event log entries (WITHIN 1 = poll every 1s)
+  Register-WmiEvent -Query "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_NTLogEvent' AND (TargetInstance.EventType <= 2) AND (TargetInstance.Logfile = 'System' OR TargetInstance.Logfile = 'Application')" -SourceIdentifier 'CriticalEventLog'
+
+  Emit-Event 'subscription_started' @{ subscriptions = 2 }
+
+  while ($true) {
+    # Check for service state change events
+    $svcEvent = Get-Event -SourceIdentifier 'ServiceStateChange' -ErrorAction SilentlyContinue
+    if ($svcEvent) {
+      foreach ($evt in $svcEvent) {
+        $target = $evt.SourceEventArgs.NewEvent.TargetInstance
+        $prev = $evt.SourceEventArgs.NewEvent.PreviousInstance
+        if ($target -and $prev) {
+          Emit-Event 'service_state_change' @{
+            Name = [string]$target.Name
+            DisplayName = [string]$target.DisplayName
+            NewState = [string]$target.State
+            PreviousState = [string]$prev.State
+            StartMode = [string]$target.StartMode
+          }
+        }
+        Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+      }
+    }
+
+    # Check for critical event log events
+    $logEvent = Get-Event -SourceIdentifier 'CriticalEventLog' -ErrorAction SilentlyContinue
+    if ($logEvent) {
+      foreach ($evt in $logEvent) {
+        $entry = $evt.SourceEventArgs.NewEvent.TargetInstance
+        if ($entry) {
+          $msg = [string]$entry.Message
+          if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) }
+          Emit-Event 'critical_event' @{
+            EventCode = $entry.EventCode
+            SourceName = [string]$entry.SourceName
+            Message = $msg
+            Type = $entry.Type
+            Logfile = [string]$entry.Logfile
+          }
+        }
+        Remove-Event -EventIdentifier $evt.EventIdentifier -ErrorAction SilentlyContinue
+      }
+    }
+
+    Start-Sleep -Milliseconds 500
+  }
+} catch {
+  Emit-Event 'subscription_error' @{ error = $_.Exception.Message }
+} finally {
+  Unregister-Event -SourceIdentifier 'ServiceStateChange' -ErrorAction SilentlyContinue
+  Unregister-Event -SourceIdentifier 'CriticalEventLog' -ErrorAction SilentlyContinue
+}
+`;
+
+    this.subscriptionProcess = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-Command', psScript
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    this.subscriptionProcess.stdout!.on('data', (data: Buffer) => {
+      this.subscriptionBuffer += data.toString();
+      this.processSubscriptionBuffer();
+    });
+
+    this.subscriptionProcess.stderr!.on('data', (data: Buffer) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        this.logger.debug('Subscription stderr', { output: msg.substring(0, 200) });
+      }
+    });
+
+    this.subscriptionProcess.on('exit', (code: number | null) => {
+      this.logger.warn('Subscription process exited', { code });
+      this.subscriptionProcess = null;
+      this.subscriptionBuffer = '';
+
+      // Auto-restart after 5s if monitoring is still active
+      if (this.isMonitoring) {
+        this.subscriptionRestartTimer = setTimeout(() => {
+          this.subscriptionRestartTimer = null;
+          if (this.isMonitoring) {
+            this.logger.info('Restarting event subscriptions...');
+            this.startEventSubscriptions();
+          }
+        }, 5000);
+      }
+    });
+
+    this.subscriptionProcess.on('error', (err: Error) => {
+      this.logger.warn('Failed to spawn subscription process', { error: err.message });
+      this.subscriptionProcess = null;
+    });
+  }
+
+  public stopEventSubscriptions(): void {
+    if (this.subscriptionRestartTimer) {
+      clearTimeout(this.subscriptionRestartTimer);
+      this.subscriptionRestartTimer = null;
+    }
+
+    if (this.subscriptionProcess) {
+      this.subscriptionProcess.kill();
+      this.subscriptionProcess = null;
+      this.subscriptionBuffer = '';
+      this.logger.info('Event subscriptions stopped');
+    }
+  }
+
+  public processSubscriptionBuffer(): void {
+    const lines = this.subscriptionBuffer.split('\n');
+    this.subscriptionBuffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('OPSIS_EVENT:')) continue;
+
+      try {
+        const json = JSON.parse(trimmed.substring('OPSIS_EVENT:'.length));
+        this.handleSubscriptionEvent(json);
+      } catch {
+        this.logger.debug('Failed to parse subscription event', { line: trimmed.substring(0, 100) });
+      }
+    }
+  }
+
+  private handleSubscriptionEvent(event: any): void {
+    if (event.type === 'subscription_started') {
+      this.logger.info('Real-time event subscriptions active', {
+        subscriptions: event.data?.subscriptions
+      });
+      return;
+    }
+
+    if (event.type === 'subscription_error') {
+      this.logger.error('Subscription error', { error: event.data?.error });
+      return;
+    }
+
+    if (event.type === 'service_state_change') {
+      const data = event.data;
+      if (!data?.Name) return;
+
+      // Only create events for stopped/degraded states or recovery
+      const isDown = data.NewState === 'Stopped' || data.NewState === 'Stop Pending';
+      const wasDown = data.PreviousState === 'Stopped' || data.PreviousState === 'Stop Pending';
+      const level = isDown ? 'Error' : (wasDown ? 'Information' : 'Warning');
+
+      const entry: EventLogEntry = {
+        timeCreated: new Date(event.timestamp),
+        id: 7036,
+        level,
+        source: 'Service Control Manager',
+        message: `The ${data.DisplayName || data.Name} service entered the ${data.NewState} state.`,
+        computer: os.hostname(),
+        logName: 'System',
+        raw: { serviceName: data.Name, newState: data.NewState, previousState: data.PreviousState, startMode: data.StartMode, realtime: true }
+      };
+
+      this.logger.info('Real-time service state change', {
+        service: data.Name,
+        from: data.PreviousState,
+        to: data.NewState
+      });
+
+      if (level !== 'Information') {
+        this.processEvent(entry);
+      }
+    }
+
+    if (event.type === 'critical_event') {
+      const data = event.data;
+      if (!data?.EventCode) return;
+
+      const entry: EventLogEntry = {
+        timeCreated: new Date(event.timestamp),
+        id: data.EventCode,
+        level: data.Type === 1 ? 'Critical' : 'Error',
+        source: data.SourceName || 'Unknown',
+        message: data.Message || '',
+        computer: os.hostname(),
+        logName: data.Logfile || 'System',
+        raw: { realtime: true }
+      };
+
+      this.logger.info('Real-time critical event', {
+        eventId: data.EventCode,
+        source: data.SourceName,
+        logfile: data.Logfile
+      });
+
+      this.processEvent(entry);
+    }
   }
 }
 
