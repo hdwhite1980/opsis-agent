@@ -232,8 +232,26 @@ export function validateParamValue(value: string, context: string): string[] {
   return errors;
 }
 
+// Dangerous patterns for diagnostic commands (much less restrictive than playbook validation).
+// Diagnostic requests are HMAC-authenticated, so the server is trusted.
+// Only block patterns that indicate code injection or remote code download.
+const DIAGNOSTIC_DANGEROUS_PATTERNS = [
+  /invoke-expression/i,       // Arbitrary code execution
+  /\biex\s/i,                 // IEX alias
+  /downloadstring/i,          // Web download methods
+  /downloadfile/i,            // File download methods
+  /invoke-webrequest/i,       // Web requests that could download payloads
+  /start-bitstransfer/i,      // BITS download
+  /\x00/,                     // Null byte injection
+  /\x1a/,                     // Ctrl+Z (EOF in Windows)
+  /\.\.[\\/].*\.\.[\\/]/,     // Deep path traversal (2+ levels)
+];
+
 /**
- * Validate a diagnostic request
+ * Validate a diagnostic request.
+ * Diagnostic commands are HMAC-signed by the server, so we only perform
+ * structural validation and block obvious code-injection patterns.
+ * Normal PowerShell syntax (pipes, variables, subexpressions) is allowed.
  */
 export function validateDiagnosticRequest(request: any): ValidationResult {
   const errors: string[] = [];
@@ -255,12 +273,14 @@ export function validateDiagnosticRequest(request: any): ValidationResult {
       errors.push('commands must be an array');
     } else {
       request.commands.forEach((cmd: any, index: number) => {
-        if (typeof cmd === 'string') {
-          const cmdErrors = validateCommand(cmd, `Command ${index + 1}`);
-          errors.push(...cmdErrors);
-        } else if (cmd && typeof cmd === 'object' && cmd.command) {
-          const cmdErrors = validateCommand(cmd.command, `Command ${index + 1}`);
-          errors.push(...cmdErrors);
+        const cmdStr = typeof cmd === 'string' ? cmd : cmd?.command;
+        if (typeof cmdStr === 'string') {
+          for (const pattern of DIAGNOSTIC_DANGEROUS_PATTERNS) {
+            if (pattern.test(cmdStr)) {
+              errors.push(`Command ${index + 1}: contains blocked pattern`);
+              break;
+            }
+          }
         }
       });
     }

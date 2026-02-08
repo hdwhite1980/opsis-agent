@@ -2283,8 +2283,7 @@ class OPSISAgentService {
     // Step 2: Validate diagnostic request structure
     const validation = validateDiagnosticRequest(data);
     if (!validation.valid) {
-      this.logger.error('Diagnostic request validation failed', {
-        errors: validation.errors,
+      this.logger.error('Diagnostic request validation failed: ' + validation.errors.join(', '), {
         session_id: data.session_id
       });
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -2573,10 +2572,28 @@ class OPSISAgentService {
 
     if (!signature) {
       this.logger.warn('add_to_ignore_list missing signature', { data });
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'ignore_list_result',
+          success: false,
+          error: 'Missing signature field',
+          timestamp: new Date().toISOString()
+        }));
+      }
       return;
     }
 
     this.addToLocalIgnoreList(signature, reason || 'Added by server');
+
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'ignore_list_result',
+        success: true,
+        signature,
+        reason: reason || 'Added by server',
+        timestamp: new Date().toISOString()
+      }));
+    }
   }
 
   private addToLocalIgnoreList(signature: string, reason: string): void {
