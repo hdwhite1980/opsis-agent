@@ -130,6 +130,15 @@ export class SelfServiceServer {
 
     this.server.on('upgrade', (req, socket, head) => {
       if (req.url === '/ws') {
+        // SECURITY: Verify Origin header to prevent cross-site WebSocket hijacking
+        const origin = req.headers.origin;
+        if (origin && !origin.match(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/)) {
+          this.logger.warn('Self-service WebSocket rejected: invalid origin', { origin });
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+
         // Check concurrent session limit
         if (this.sessions.size >= MAX_CONCURRENT_SESSIONS) {
           socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
