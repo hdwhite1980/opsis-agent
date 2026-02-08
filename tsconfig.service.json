@@ -18,7 +18,8 @@
   },
   "include": [
     "src/service/**/*",
-    "src/common/**/*"
+    "src/common/**/*",
+    "src/security/**/*"
   ],
   "exclude": [
     "node_modules",

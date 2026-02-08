@@ -30,7 +30,7 @@ function addDefenderExclusions() {
 const svc = new Service({
   name: 'OPSIS Agent Service',
   description: 'OPSIS Autonomous IT Management Agent - Monitors and automatically fixes system issues (Background Service)',
-  script: path.join(__dirname, 'dist', 'index.js'),
+  script: path.join(__dirname, 'dist', 'service', 'agent-service.js'),
   nodeOptions: [
     '--harmony',
     '--max_old_space_size=4096'
