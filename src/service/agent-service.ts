@@ -235,6 +235,7 @@ class OPSISAgentService {
   private pendingRunbooks: Map<string, RunbookMatch> = new Map(); // signature_id -> matched runbook
   private escalationCooldowns: Map<string, number> = new Map(); // signature_id -> last escalated timestamp
   private readonly ESCALATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+  private recentSignatureIds: string[] = []; // Track recent signature_ids for linking server playbooks
   private escalationBatch: Array<{signature: DeviceSignature, runbook: RunbookMatch | null, diagnosticData?: DiagnosticData | null}> = [];
   private batchTimer: NodeJS.Timeout | null = null;
   private readonly BATCH_FLUSH_MS = 10000; // 10 seconds
@@ -1474,6 +1475,10 @@ class OPSISAgentService {
           break;
           
         case 'playbook':
+          // Tag playbook with the most recent signature_id for cache linking
+          if (this.recentSignatureIds.length > 0 && data.playbook) {
+            data.playbook.signatureId = this.recentSignatureIds[0];
+          }
           this.receivePlaybook(data.playbook, 'server');
           break;
           
@@ -3210,6 +3215,42 @@ class OPSISAgentService {
       return;
     }
 
+    // Check for cached server runbook before escalating
+    const cachedServerRunbook = this.findCachedServerRunbook(signature.signature_id);
+    if (cachedServerRunbook) {
+      this.logger.info('Using cached server runbook instead of re-escalating', {
+        signature_id: signature.signature_id,
+        runbook_id: cachedServerRunbook.id,
+        name: cachedServerRunbook.name,
+        previous_successes: cachedServerRunbook.success_count
+      });
+
+      // Build a PlaybookTask from the cached runbook and execute locally
+      const cachedPlaybook: PlaybookTask = {
+        id: cachedServerRunbook.original_id || cachedServerRunbook.id,
+        name: cachedServerRunbook.name,
+        priority: cachedServerRunbook.priority || 'medium',
+        source: 'server',
+        steps: cachedServerRunbook.steps,
+        createdAt: new Date()
+      };
+      (cachedPlaybook as any).signalId = cachedServerRunbook.signal_id;
+
+      // Store signature so saveServerRunbook can update execution counts
+      this.pendingEscalations.set(signature.signature_id, signature);
+
+      const ticketId = this.actionTicketManager.createActionTicket(
+        signature.signature_id,
+        cachedPlaybook.id,
+        `Cached server remediation: ${cachedPlaybook.name}`,
+        cachedPlaybook.steps.length
+      );
+      this.activeTickets.set(cachedPlaybook.id, ticketId);
+      this.actionTicketManager.markInProgress(ticketId, cachedPlaybook.id);
+      this.receivePlaybook(cachedPlaybook, 'server');
+      return;
+    }
+
     this.logger.info('Escalating to server (Tier 2)', {
       signature_id: signature.signature_id,
       has_runbook: !!runbook,
@@ -3224,6 +3265,12 @@ class OPSISAgentService {
 
     // Mark as escalated for dedup cooldown
     this.escalationCooldowns.set(signature.signature_id, now);
+
+    // Track recent signature_id for linking server playbook responses back
+    this.recentSignatureIds.unshift(signature.signature_id);
+    if (this.recentSignatureIds.length > 10) {
+      this.recentSignatureIds = this.recentSignatureIds.slice(0, 10);
+    }
 
     // Run pre-escalation troubleshooting to collect diagnostic data
     let diagnosticData: DiagnosticData | null = null;
@@ -3506,7 +3553,9 @@ class OPSISAgentService {
     }
 
     // FIXED: Use new escalation protocol instead of legacy format
-    this.escalateToServer(signature, null);
+    this.escalateToServer(signature, null).catch(err => {
+      this.logger.error('escalateToServer failed', err);
+    });
   }
 
   private getTicketType(event: EventLogEntry): string {
@@ -4478,6 +4527,20 @@ class OPSISAgentService {
         (rb: any) => rb.id === playbook.id || rb.original_id === playbook.id
       );
 
+      // Find the signature_id that triggered this playbook (for future cache matching)
+      const signalId = (playbook as any).signalId || playbook.id;
+      // Use the most recent escalation signature, or check pending escalations
+      let matchedSignatureId: string | null = (playbook as any).signatureId || null;
+      if (!matchedSignatureId && this.recentSignatureIds.length > 0) {
+        matchedSignatureId = this.recentSignatureIds[0];
+      }
+      if (!matchedSignatureId) {
+        for (const [sigId] of this.pendingEscalations.entries()) {
+          matchedSignatureId = sigId;
+          break;
+        }
+      }
+
       const runbookEntry = {
         id: `server-${playbook.id}`,
         original_id: playbook.id,
@@ -4489,7 +4552,8 @@ class OPSISAgentService {
         execution_count: 1,
         last_executed: new Date().toISOString(),
         success_count: 1,
-        signal_id: (playbook as any).signalId,
+        signal_id: signalId,
+        signature_id: matchedSignatureId,
         triggers: (playbook as any).triggers || []
       };
 
@@ -4663,24 +4727,32 @@ class OPSISAgentService {
   }
 
   /**
-   * Get a saved server runbook by signal ID for local reuse
+   * Find a cached server runbook by signature_id for local reuse.
+   * Returns the runbook with the highest success count for this signature.
    */
-  public getServerRunbookForSignal(signalId: string): any | null {
+  private findCachedServerRunbook(signatureId: string): any | null {
     try {
       if (!fs.existsSync(this.serverRunbooksPath)) return null;
 
       const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
-      const runbook = serverRunbooks.runbooks.find(
-        (rb: any) => rb.signal_id === signalId && !rb.resolved
+      const matching = serverRunbooks.runbooks.filter(
+        (rb: any) => rb.signature_id === signatureId && !rb.resolved && rb.success_count > 0 && rb.steps && rb.steps.length > 0
       );
 
-      if (runbook) {
-        this.logger.debug('Found cached server runbook for signal', { signalId, runbookId: runbook.id });
-        return runbook;
-      }
-      return null;
+      if (matching.length === 0) return null;
+
+      // Pick the one with the best success rate
+      const best = matching.sort((a: any, b: any) => b.success_count - a.success_count)[0];
+      this.logger.info('Found cached server runbook for signature', {
+        signatureId,
+        runbookId: best.id,
+        name: best.name,
+        success_count: best.success_count,
+        execution_count: best.execution_count
+      });
+      return best;
     } catch (error) {
-      this.logger.error('Failed to get server runbook', error);
+      this.logger.error('Failed to find cached server runbook', error);
       return null;
     }
   }
