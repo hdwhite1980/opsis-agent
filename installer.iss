@@ -1,5 +1,5 @@
 ; OPSIS Agent Installer - Inno Setup Script
-; Service: compiled standalone exe (pkg). GUI: Tauri native binary (no Electron).
+; Service: compiled standalone exe (pkg). GUI: localhost web UI served by agent service.
 
 #define AppName "OPSIS Agent"
 #define AppVersion "1.0.0"
@@ -39,7 +39,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "autostart"; Description: "Start Control Panel on Windows startup"; GroupDescription: "Startup Options:"
 
 [Files]
 ; Compiled service executable (standalone - no Node.js needed)
@@ -49,8 +48,9 @@ Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignorevers
 Source: "node_modules\node-windows\bin\winsw\winsw.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
 Source: "node_modules\node-windows\bin\winsw\winsw.exe.config"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe.config"; Flags: ignoreversion
 
-; GUI executable (Tauri - single native binary, no Electron needed)
-Source: "src-tauri\target\release\opsis-agent-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Control panel web UI (served by agent service on localhost:19851)
+Source: "src\gui\index.html"; DestDir: "{app}\dist\gui"; Flags: ignoreversion
+Source: "src\gui\assets\*"; DestDir: "{app}\dist\gui\assets"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; Runbooks (required at runtime)
 Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -58,7 +58,7 @@ Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesub
 ; Self-service portal
 Source: "dist\portal\portal.html"; DestDir: "{app}\dist\portal"; Flags: ignoreversion
 
-; GUI launcher batch file
+; GUI launcher batch file (opens browser to control panel)
 Source: "start-opsis-gui.bat"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Assets
@@ -78,10 +78,12 @@ Name: "{app}\logs"
 Name: "{app}\certs"
 Name: "{app}\service"
 Name: "{app}\dist\portal"
+Name: "{app}\dist\gui"
+Name: "{app}\dist\gui\assets"
 
 [Icons]
-Name: "{group}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"
-Name: "{autodesktop}\OPSIS Control Panel"; Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
+Name: "{group}\OPSIS Control Panel"; Filename: "http://localhost:19851"; IconFilename: "{app}\assets\icon.ico"
+Name: "{autodesktop}\OPSIS Control Panel"; Filename: "http://localhost:19851"; IconFilename: "{app}\assets\icon.ico"; Tasks: desktopicon
 
 [Run]
 ; === SECURITY HARDENING ===
@@ -119,12 +121,10 @@ Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "install"; WorkingDir: "{app}\service"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir: "{app}\service"; StatusMsg: "Starting OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 
-; Offer to launch GUI
-Filename: "{app}\opsis-agent-gui.exe"; WorkingDir: "{app}"; Description: "Launch OPSIS Control Panel"; Flags: nowait postinstall skipifsilent
+; Offer to open control panel in browser
+Filename: "cmd.exe"; Parameters: "/c start http://localhost:19851"; Description: "Open OPSIS Control Panel"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallRun]
-; Kill any running Tauri GUI processes first
-Filename: "powershell.exe"; Parameters: "-Command ""Get-Process -Name opsis-agent-gui -ErrorAction SilentlyContinue | Stop-Process -Force"""; Flags: runhidden waituntilterminated; RunOnceId: "KillGUI"
 ; Stop and uninstall service
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
@@ -138,8 +138,7 @@ Filename: "powershell.exe"; Parameters: "-Command ""Remove-MpPreference -Exclusi
 Filename: "powershell.exe"; Parameters: "-Command ""Remove-EventLog -Source 'OPSIS Agent' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanEventLog"
 
 [Registry]
-; Add to startup for all users (if selected) - uses HKLM since installer runs as admin
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OPSIS Agent"; ValueData: """{app}\opsis-agent-gui.exe"""; Tasks: autostart; Flags: uninsdeletevalue
+; No autostart registry entry needed — the service starts automatically and the control panel is just a web page
 
 [Code]
 var

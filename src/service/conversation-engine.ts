@@ -612,7 +612,16 @@ export class ConversationEngine {
     // Find processes using high CPU (> 30%)
     for (const proc of processes.slice(0, 5)) {
       if (proc.cpu_percent > 30 && proc.name.toLowerCase() !== 'idle' && proc.name.toLowerCase() !== 'system') {
-        const isProtected = ['csrss', 'wininit', 'services', 'lsass', 'svchost', 'dwm', 'explorer'].includes(proc.name.toLowerCase());
+        const protectedNames = new Set([
+          'csrss', 'wininit', 'services', 'lsass', 'svchost', 'dwm', 'explorer',
+          'smss', 'winlogon', 'conhost', 'ntoskrnl', 'spoolsv', 'taskhostw',
+          'sihost', 'fontdrvhost', 'audiodg', 'wuauserv',
+          // Security / antivirus — must never be killed
+          'msmpeng', 'mssense', 'msascuil', 'securityhealthservice',
+          'nissrv', 'mpcmdrun', 'sense', 'cyserver', 'cylancesvc',
+          'avgui', 'avgsvc', 'avastsvc', 'avastui'
+        ]);
+        const isProtected = protectedNames.has(proc.name.toLowerCase());
 
         findings.push({
           severity: proc.cpu_percent > 70 ? 'critical' : 'warning',

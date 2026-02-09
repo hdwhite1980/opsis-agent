@@ -1481,38 +1481,171 @@
     </div>
 
     <script>
-        // Debug: catch all errors and show on screen
+        // Debug: catch all errors
         window.onerror = function(msg, url, line, col, err) {
-            let d = document.createElement('div');
-            d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:red;color:white;padding:10px;z-index:99999;font-size:14px;white-space:pre-wrap;';
-            d.textContent = 'JS ERROR: ' + msg + '\nLine: ' + line + '\nCol: ' + col + '\n\n__TAURI__ keys: ' + (window.__TAURI__ ? Object.keys(window.__TAURI__).join(', ') : 'UNDEFINED');
-            document.body.appendChild(d);
+            console.error('JS ERROR:', msg, 'at', url, 'line', line);
         };
 
-        // Tauri API (withGlobalTauri: true)
-        let invoke, listen, appWindow;
-        try {
-            invoke = window.__TAURI__.core.invoke;
-            listen = window.__TAURI__.event.listen;
-            const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
-            appWindow = getCurrentWebviewWindow();
-        } catch(e) {
-            let d = document.createElement('div');
-            d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:orange;color:black;padding:10px;z-index:99999;font-size:14px;white-space:pre-wrap;';
-            d.textContent = 'TAURI INIT ERROR: ' + e.message + '\n\n__TAURI__ = ' + JSON.stringify(window.__TAURI__ ? Object.keys(window.__TAURI__) : 'undefined');
-            document.body.appendChild(d);
+        // ============================================
+        // WebSocket Connection Management
+        // ============================================
+        let ws = null;
+        let wsConnected = false;
+        let reconnectTimer = null;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_DELAY = 30000;
+        const pendingRequests = new Map(); // id -> { resolve, reject, timer }
+        let requestCounter = 0;
+        const eventListeners = new Map(); // type -> [callback, ...]
+
+        function connectWebSocket() {
+            const wsUrl = 'ws://' + window.location.host + '/ws';
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                wsConnected = true;
+                reconnectAttempts = 0;
+                console.log('Control panel connected');
+                const dot = document.querySelector('.status-dot');
+                const txt = document.querySelector('.status-text');
+                if (dot) dot.style.background = '#4ade80';
+                if (txt) txt.textContent = 'OPSIS Agent Running';
+            };
+
+            ws.onclose = () => {
+                wsConnected = false;
+                console.log('Control panel disconnected');
+                const dot = document.querySelector('.status-dot');
+                const txt = document.querySelector('.status-text');
+                if (dot) dot.style.background = '#ef4444';
+                if (txt) txt.textContent = 'Disconnected - Reconnecting...';
+                // Reject all pending requests
+                for (const [id, req] of pendingRequests) {
+                    clearTimeout(req.timer);
+                    req.reject(new Error('Disconnected'));
+                }
+                pendingRequests.clear();
+                scheduleReconnect();
+            };
+
+            ws.onerror = () => {};
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.id && pendingRequests.has(msg.id)) {
+                        // Response to a request
+                        const { resolve, timer } = pendingRequests.get(msg.id);
+                        clearTimeout(timer);
+                        pendingRequests.delete(msg.id);
+                        resolve(msg.data);
+                    } else {
+                        // Broadcast/push event
+                        handleBroadcast(msg);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse WebSocket message:', e);
+                }
+            };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectTimer) return;
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
+            reconnectAttempts++;
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connectWebSocket();
+            }, delay);
+        }
+
+        /** Send a request to the service and return the response data */
+        function invoke(type, params) {
+            return new Promise((resolve, reject) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    reject(new Error('Not connected'));
+                    return;
+                }
+                // Convert snake_case to kebab-case for IPC compatibility
+                const ipcType = type.replace(/_/g, '-');
+                const id = 'req-' + Date.now() + '-' + (++requestCounter);
+                const timer = setTimeout(() => {
+                    pendingRequests.delete(id);
+                    reject(new Error('Request timeout'));
+                }, 15000);
+                pendingRequests.set(id, { resolve, reject, timer });
+                ws.send(JSON.stringify({ id, type: ipcType, data: params || {} }));
+            });
+        }
+
+        /** Register a broadcast event listener (compatible with Tauri listen API) */
+        function listen(eventType, callback) {
+            if (!eventListeners.has(eventType)) {
+                eventListeners.set(eventType, []);
+            }
+            eventListeners.get(eventType).push(callback);
+            return Promise.resolve(() => {
+                const listeners = eventListeners.get(eventType);
+                if (listeners) {
+                    const idx = listeners.indexOf(callback);
+                    if (idx >= 0) listeners.splice(idx, 1);
+                }
+            });
+        }
+
+        function handleBroadcast(msg) {
+            // Handle initial-data on connect
+            if (msg.type === 'initial-data' && msg.data) {
+                handleInitialData(msg.data);
+                return;
+            }
+            // Dispatch to registered listeners (wrap in Tauri-like event)
+            const event = { payload: msg.data };
+            const listeners = eventListeners.get(msg.type) || [];
+            for (const cb of listeners) {
+                try { cb(event); } catch (e) { console.error('Event handler error:', e); }
+            }
+        }
+
+        function handleInitialData(data) {
+            if (data.stats) {
+                document.getElementById('issuesDetected').textContent = data.stats.issuesDetected || 0;
+                document.getElementById('activeTickets').textContent = data.stats.activeTickets || 0;
+                document.getElementById('issuesEscalated').textContent = data.stats.issuesEscalated || 0;
+                document.getElementById('successRate').textContent = (data.stats.successRate || 0) + '%';
+            }
+            if (data.tickets) {
+                try {
+                    const groups = groupTickets(data.tickets);
+                    renderTicketGroups('dashboardTickets', groups.slice(0, 10));
+                    renderTicketGroups('allTickets', groups);
+                } catch (e) { console.error('Initial tickets error:', e); }
+            }
+            if (data.healthScores) {
+                try {
+                    renderHealthScores(data.healthScores);
+                    renderDashboardHealth(data.healthScores);
+                } catch (e) { console.error('Initial health error:', e); }
+            }
+            if (data.correlations) try { renderCorrelations(data.correlations); } catch (e) {}
+            if (data.patterns) try { renderPatterns(data.patterns); } catch (e) {}
+            if (data.proactiveActions) try { renderDashboardActions(data.proactiveActions); } catch (e) {}
+            if (data.serviceAlerts) {
+                activeServiceAlerts = data.serviceAlerts;
+                renderServiceAlerts();
+            }
         }
 
         // Auto-refresh every 10 seconds
         setInterval(refreshData, 10000);
 
-        // Load data on startup - WITH DELAY FOR DOM
+        // Connect WebSocket on startup
         window.addEventListener('DOMContentLoaded', () => {
+            connectWebSocket();
             setTimeout(() => {
-                loadSettings();  // Load saved settings first
-                refreshData();   // Then load ticket data
+                loadSettings();
                 setupEventListeners();
-            }, 250); // Give DOM time to fully render
+            }, 500);
         });
 
         // Temporary: show errors on screen for debugging
@@ -1537,7 +1670,8 @@
             } catch (e) { showDebugError('Stats', e); }
 
             try {
-                const tickets = await invoke('get_tickets');
+                const result = await invoke('get_tickets');
+                const tickets = result.tickets || result;
                 const groups = groupTickets(tickets);
                 renderTicketGroups('dashboardTickets', groups.slice(0, 10));
                 renderTicketGroups('allTickets', groups);
@@ -1886,13 +2020,11 @@
 
             try {
                 await invoke('submit_manual_ticket', {
-                    ticket: {
-                        serverName,
-                        category,
-                        description,
-                        priority,
-                        submittedAt: new Date().toISOString()
-                    }
+                    serverName,
+                    category,
+                    description,
+                    priority,
+                    submittedAt: new Date().toISOString()
                 });
             } catch (e) { console.error('Submit error:', e); }
 
@@ -1956,9 +2088,8 @@
             const verification = localStorage.getItem('opsis-settings');
             console.log('Verification - what was actually saved:', verification);
             
-            // Send to agent service via Tauri
-            invoke('update_settings', { settings }).catch(e => console.error('Settings save error:', e));
-            console.log('Sent to agent via Tauri');
+            // Send to agent service
+            invoke('update_settings', settings).catch(e => console.error('Settings save error:', e));
             
             // Show success message
             const successMsg = document.createElement('div');
@@ -2138,7 +2269,7 @@
         }
 
         function minimizeWindow() {
-            appWindow.minimize();
+            // No-op in browser mode
         }
     </script>
 </body>

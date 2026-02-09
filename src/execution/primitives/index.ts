@@ -1014,12 +1014,26 @@ export class Primitives {
       }
 
       const script = `
+        $cpuCores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        if (-not $cpuCores -or $cpuCores -lt 1) { $cpuCores = [Environment]::ProcessorCount }
+        $procs = Get-Counter '\\Process(*)\\% Processor Time' -ErrorAction SilentlyContinue
+        $cpuMap = @{}
+        if ($procs) {
+          foreach ($sample in $procs.CounterSamples) {
+            $pname = $sample.InstanceName
+            if ($pname -ne '_total' -and $pname -ne 'idle') {
+              $cpuMap[$pname] = [math]::Round($sample.CookedValue / $cpuCores, 2)
+            }
+          }
+        }
         Get-Process | Sort-Object CPU -Descending | Select-Object -First ${count} |
         ForEach-Object {
+          $pn = $_.ProcessName.ToLower()
+          $cpuPct = if ($cpuMap.ContainsKey($pn)) { $cpuMap[$pn] } else { 0 }
           [PSCustomObject]@{
             name = $_.ProcessName
             pid = $_.Id
-            cpu_percent = [math]::Round($_.CPU, 2)
+            cpu_percent = $cpuPct
             memory_mb = [math]::Round($_.WorkingSet64 / 1MB, 2)
             thread_count = $_.Threads.Count
             handle_count = $_.HandleCount

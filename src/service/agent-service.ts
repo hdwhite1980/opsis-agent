@@ -25,6 +25,7 @@ import { TroubleshootingRunner, DiagnosticData } from './troubleshooting-runner'
 import { StateTracker, StateChangeEvent, SeverityEscalationEvent } from './state-tracker';
 import { MaintenanceWindowManager, MaintenanceWindow } from './maintenance-windows';
 import { SelfServiceServer } from './self-service-server';
+import { ControlPanelServer } from './control-panel-server';
 
 // Security imports
 import {
@@ -275,6 +276,9 @@ class OPSISAgentService {
   // Self-service portal
   private selfServiceServer: SelfServiceServer | null = null;
 
+  // Control panel web server
+  private controlPanelServer: ControlPanelServer | null = null;
+
   // Monitoring trap agent features
   private stateTracker!: StateTracker;
   private maintenanceManager!: MaintenanceWindowManager;
@@ -367,32 +371,24 @@ class OPSISAgentService {
       this.ticketDb,
       this.baseDir
     );
-    
+
+    // Initialize control panel web server
+    this.controlPanelServer = new ControlPanelServer(this.logger, this.baseDir, 19851);
+    this.controlPanelServer.onRequest = async (type: string, data: any) => {
+      return this.handleControlPanelRequest(type, data);
+    };
+    this.controlPanelServer.onClientConnected = (sendFn) => {
+      try {
+        sendFn(this.buildInitialData());
+      } catch (error) {
+        this.logger.error('Error sending initial data to control panel', error);
+      }
+    };
+
     // Send initial data when GUI connects
     this.ipcServer.onClientConnected((socket) => {
       try {
-        const tickets = this.ticketDb.getTickets(100);
-        const stats = this.ticketDb.getStatistics();
-
-        const guiStats = {
-          issuesDetected: stats.totalTickets,
-          issuesEscalated: stats.escalatedTickets,
-          successRate: stats.successRate,
-          activeTickets: stats.openTickets
-        };
-
-        this.ipcServer.sendToClient(socket, {
-          type: 'initial-data',
-          data: {
-            tickets,
-            stats: guiStats,
-            healthScores: this.patternDetector.getHealthScores(),
-            correlations: this.patternDetector.getCorrelations(),
-            patterns: this.patternDetector.getDetectedPatterns(),
-            proactiveActions: this.patternDetector.getPendingActions(),
-            serviceAlerts: this.serviceAlerts
-          }
-        });
+        this.ipcServer.sendToClient(socket, this.buildInitialData());
       } catch (error) {
         this.logger.error('Error sending initial data to GUI', error);
       }
@@ -531,7 +527,7 @@ class OPSISAgentService {
       activeTickets: stats.openTickets
     };
     
-    this.ipcServer.broadcast({
+    this.broadcastToAllClients({
       type: 'ticket-update',
       data: {
         tickets,
@@ -542,6 +538,245 @@ class OPSISAgentService {
         proactiveActions: this.patternDetector.getPendingActions()
       }
     });
+  }
+
+  /** Broadcast to both IPC (Tauri) and web control panel clients */
+  private broadcastToAllClients(message: { type: string; data: any }): void {
+    this.ipcServer.broadcast(message);
+    if (this.controlPanelServer) {
+      this.controlPanelServer.broadcast(message);
+    }
+  }
+
+  /** Check if any GUI client is connected (IPC or web) */
+  private hasAnyGuiClient(): boolean {
+    return this.ipcServer.hasAuthenticatedClients() ||
+      (this.controlPanelServer?.hasConnectedClients() ?? false);
+  }
+
+  /** Build the initial-data payload sent when a GUI client connects */
+  private buildInitialData(): { type: string; data: any } {
+    const tickets = this.ticketDb.getTickets(100);
+    const stats = this.ticketDb.getStatistics();
+    return {
+      type: 'initial-data',
+      data: {
+        tickets,
+        stats: {
+          issuesDetected: stats.totalTickets,
+          issuesEscalated: stats.escalatedTickets,
+          successRate: stats.successRate,
+          activeTickets: stats.openTickets
+        },
+        healthScores: this.patternDetector.getHealthScores(),
+        correlations: this.patternDetector.getCorrelations(),
+        patterns: this.patternDetector.getDetectedPatterns(),
+        proactiveActions: this.patternDetector.getPendingActions(),
+        serviceAlerts: this.serviceAlerts
+      }
+    };
+  }
+
+  /** Handle a control panel WebSocket request and return the response */
+  private async handleControlPanelRequest(type: string, data: any): Promise<{ type: string; data: any } | null> {
+    switch (type) {
+      case 'get-tickets': {
+        const tickets = this.ticketDb.getTickets(100);
+        const stats = this.ticketDb.getStatistics();
+        return { type: 'tickets', data: { tickets, stats: {
+          issuesDetected: stats.totalTickets, issuesEscalated: stats.escalatedTickets,
+          successRate: stats.successRate, activeTickets: stats.openTickets
+        } } };
+      }
+      case 'get-status':
+        return { type: 'status', data: this.getSystemStats() };
+      case 'get-stats': {
+        const ticketStats = this.ticketDb.getStatistics();
+        return { type: 'stats', data: {
+          issuesDetected: ticketStats.totalTickets, issuesEscalated: ticketStats.escalatedTickets,
+          successRate: ticketStats.successRate, activeTickets: ticketStats.openTickets
+        } };
+      }
+      case 'get-health-data':
+        return { type: 'health-data', data: {
+          healthScores: this.patternDetector.getHealthScores(),
+          correlations: this.patternDetector.getCorrelations(),
+          patterns: this.patternDetector.getDetectedPatterns(),
+          proactiveActions: this.patternDetector.getPendingActions()
+        } };
+      case 'get-ticket':
+        return { type: 'ticket-details', data: this.ticketDb.getTicket(data.ticketId) };
+      case 'get-memory-stats': {
+        const summary = this.remediationMemory.getSummary();
+        const memoryData = this.remediationMemory.exportData();
+        return { type: 'memory-stats', data: {
+          summary,
+          dampenedSignals: Object.values(memoryData.signalStats).filter((s: any) => s.dampened),
+          topFailingPlaybooks: Object.values(memoryData.playbookStats)
+            .filter((p: any) => p.totalAttempts >= 3 && p.successRate < 0.5)
+            .sort((a: any, b: any) => a.successRate - b.successRate).slice(0, 10),
+          deviceSensitivity: Object.values(memoryData.deviceSensitivity)
+        } };
+      }
+      case 'reset-dampening':
+        this.remediationMemory.resetDampening(data.signalId, data.deviceId);
+        return { type: 'dampening-reset', data: { success: true, signalId: data.signalId, deviceId: data.deviceId } };
+      case 'get-service-alerts':
+        return { type: 'service-alerts', data: this.serviceAlerts };
+      case 'dismiss-alert':
+        this.serviceAlerts = this.serviceAlerts.filter(a => a.id !== data.alertId);
+        return null;
+      case 'update-config':
+        this.updateConfig(data);
+        return { type: 'config-updated', data: { success: true } };
+      case 'update-settings':
+        this.updateConfig(data);
+        return { type: 'settings-updated', data: { success: true } };
+      case 'get-settings': {
+        try {
+          const configContent = fs.readFileSync(this.configPath, 'utf-8');
+          return { type: 'settings', data: JSON.parse(configContent) };
+        } catch {
+          return { type: 'settings', data: {} };
+        }
+      }
+      case 'clear-old-tickets': {
+        const count = this.ticketDb.deleteOldTickets(1);
+        this.broadcastTicketUpdate();
+        return { type: 'clear-old-tickets-result', data: count };
+      }
+      case 'user-prompt-response': {
+        const { promptId, response } = data;
+        const pending = this.pendingPrompts.get(promptId);
+        if (pending) {
+          if (pending.timer) clearTimeout(pending.timer);
+          this.pendingPrompts.delete(promptId);
+          if (response === 'ok' && pending.action_on_confirm === 'reboot') {
+            const { exec } = require('child_process');
+            exec('shutdown /r /t 30 /c "OPSIS Agent: Restarting to complete remediation"', (err: any) => {
+              if (err) this.logger.error('Failed to initiate reboot', err);
+            });
+          }
+          pending.resolve(response);
+          if (this.ws && this.ws.readyState === 1) {
+            this.ws.send(JSON.stringify({
+              type: 'user-prompt-response', prompt_id: promptId, response,
+              device_id: this.deviceInfo.device_id, timestamp: new Date().toISOString()
+            }));
+          }
+        }
+        return null;
+      }
+      case 'suppress-service': {
+        const { serviceName } = data;
+        if (!OPSISAgentService.SAFE_TO_STOP_SERVICES.has(serviceName)) {
+          return { type: 'suppress-service-result', data: { success: false, error: `Service '${serviceName}' is not safe to stop` } };
+        }
+        try {
+          await execAsync(`powershell -NoProfile -Command "Stop-Service -Name '${serviceName}' -Force"`, { timeout: 30000 });
+          this.suppressedServices.add(serviceName);
+          return { type: 'suppress-service-result', data: { success: true, serviceName, status: 'stopped_and_suppressed' } };
+        } catch (error: any) {
+          return { type: 'suppress-service-result', data: { success: false, error: error.message } };
+        }
+      }
+      case 'unsuppress-service': {
+        const { serviceName: svcName, startService } = data;
+        this.suppressedServices.delete(svcName);
+        if (startService) {
+          try {
+            await execAsync(`powershell -NoProfile -Command "Start-Service -Name '${svcName}'"`, { timeout: 30000 });
+            return { type: 'unsuppress-service-result', data: { success: true, serviceName: svcName, status: 'unsuppressed_and_started' } };
+          } catch (error: any) {
+            return { type: 'unsuppress-service-result', data: { success: true, serviceName: svcName, status: 'unsuppressed_but_start_failed', error: error.message } };
+          }
+        }
+        return { type: 'unsuppress-service-result', data: { success: true, serviceName: svcName, status: 'unsuppressed' } };
+      }
+      case 'get-suppressed-services':
+        return { type: 'suppressed-services', data: {
+          services: Array.from(this.suppressedServices),
+          safeServices: Array.from(OPSISAgentService.SAFE_TO_STOP_SERVICES)
+        } };
+      case 'get-pending-actions': {
+        const actions = Array.from(this.pendingActions.entries()).map(([id, action]) => ({
+          signature_id: id, ticket_id: action.ticket_id,
+          runbook_name: action.runbook?.name, server_message: action.server_message,
+          created_at: action.created_at, signature_name: action.signature.signature_id,
+          severity: action.signature.severity
+        }));
+        return { type: 'pending-actions', data: { actions } };
+      }
+      case 'execute-pending-action':
+        if (data.signature_id && this.pendingActions.has(data.signature_id)) {
+          this.executePendingAction(data.signature_id);
+          return { type: 'execute-pending-action-result', data: { success: true, signature_id: data.signature_id } };
+        }
+        return { type: 'execute-pending-action-result', data: { success: false, signature_id: data.signature_id, error: 'Pending action not found' } };
+      case 'cancel-pending-action':
+        if (data.signature_id && this.pendingActions.has(data.signature_id)) {
+          this.cancelPendingAction(data.signature_id, data.reason);
+          return { type: 'cancel-pending-action-result', data: { success: true, signature_id: data.signature_id } };
+        }
+        return { type: 'cancel-pending-action-result', data: { success: false, signature_id: data.signature_id, error: 'Pending action not found' } };
+      case 'submit-manual-ticket': {
+        try {
+          const ticketId = `manual-${Date.now()}`;
+          const ticket = {
+            ticket_id: ticketId, timestamp: data.submittedAt || new Date().toISOString(),
+            type: 'manual-investigation',
+            description: `[${data.category}] ${data.description} (Server: ${data.serverName}, Priority: ${data.priority})`,
+            status: 'open' as const, source: 'manual' as const,
+            computer_name: data.serverName || os.hostname(), escalated: 1
+          };
+          this.ticketDb.createTicket(ticket);
+          this.ticketDb.markAsEscalated(ticketId);
+          this.broadcastTicketUpdate();
+          return { type: 'submit-manual-ticket-result', data: { success: true, ticketId } };
+        } catch (error: any) {
+          return { type: 'submit-manual-ticket-result', data: { success: false, error: error.message } };
+        }
+      }
+      case 'test-escalation': {
+        const issueType = data.type || 'disk-space-low';
+        const testSignature: DeviceSignature = {
+          signature_id: `test-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+          tenant_id: this.deviceInfo.tenant_id, device_id: this.deviceInfo.device_id,
+          timestamp: new Date().toISOString(), severity: data.severity || 'medium',
+          confidence_local: data.confidence || 65, symptoms: [], targets: [],
+          context: { os_build: os.release(), os_version: `Windows ${os.release()}`, device_role: this.deviceInfo.role || 'workstation' }
+        };
+        this.escalateToServer(testSignature, null);
+        return { type: 'test-escalation-result', data: { success: true, signature_id: testSignature.signature_id, issue_type: issueType, message: 'Test escalation sent to server' } };
+      }
+      case 'create-maintenance-window': {
+        const mw: MaintenanceWindow = {
+          id: `mw-gui-${Date.now()}`, name: data.name || 'Maintenance Window',
+          startTime: data.startTime || new Date().toISOString(), endTime: data.endTime,
+          scope: data.scope || { type: 'all' }, suppressEscalation: data.suppressEscalation !== false,
+          suppressRemediation: data.suppressRemediation !== false, createdBy: 'technician',
+          createdAt: new Date().toISOString()
+        };
+        this.maintenanceManager.addWindow(mw);
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({ type: 'maintenance_window_created', data: mw }));
+        }
+        return { type: 'maintenance-window-created', data: { success: true, window: mw } };
+      }
+      case 'cancel-maintenance-window':
+        this.maintenanceManager.removeWindow(data.id);
+        return { type: 'maintenance-window-cancelled', data: { success: true, id: data.id } };
+      case 'get-maintenance-windows':
+        return { type: 'maintenance-windows', data: {
+          all: this.maintenanceManager.getAllWindows(),
+          active: this.maintenanceManager.getActiveWindows()
+        } };
+      case 'get-state-tracker-summary':
+        return { type: 'state-tracker-summary', data: this.stateTracker.getSummary() };
+      default:
+        this.logger.warn('Unknown control panel request type', { type });
+        return null;
+    }
   }
 
   private setupIPCHandlers(): void {
@@ -1099,6 +1334,12 @@ class OPSISAgentService {
       this.log(`Self-service portal started on http://localhost:${this.selfServiceServer.getPort()}`);
     }
 
+    // Start control panel web server
+    if (this.controlPanelServer) {
+      await this.controlPanelServer.start();
+      this.log(`Control panel started on http://localhost:${this.controlPanelServer.getPort()}`);
+    }
+
     // Load pending actions from disk
     this.loadPendingActions();
 
@@ -1188,6 +1429,10 @@ class OPSISAgentService {
 
     if (this.selfServiceServer) {
       this.selfServiceServer.stop();
+    }
+
+    if (this.controlPanelServer) {
+      this.controlPanelServer.stop();
     }
 
     if (this.ipcServer) {
@@ -1660,8 +1905,8 @@ class OPSISAgentService {
     }
 
     // Broadcast to all connected GUI clients
-    if (this.ipcServer.hasAuthenticatedClients()) {
-      this.ipcServer.broadcast({
+    if (this.hasAnyGuiClient()) {
+      this.broadcastToAllClients({
         type: 'service-alert',
         data: alert
       });
@@ -1684,7 +1929,7 @@ class OPSISAgentService {
     this.logger.info('Service alert resolved', { id: alertId });
     this.serviceAlerts = this.serviceAlerts.filter(a => a.id !== alertId);
 
-    this.ipcServer.broadcast({
+    this.broadcastToAllClients({
       type: 'service-alert-resolved',
       data: { id: alertId }
     });
@@ -1731,9 +1976,9 @@ class OPSISAgentService {
       timer
     });
 
-    if (this.ipcServer.hasAuthenticatedClients()) {
-      // GUI is connected — broadcast via IPC
-      this.ipcServer.broadcast({
+    if (this.hasAnyGuiClient()) {
+      // GUI is connected — broadcast via IPC + web
+      this.broadcastToAllClients({
         type: 'user-prompt',
         data: {
           id: promptId,
@@ -1804,8 +2049,8 @@ class OPSISAgentService {
 
     let response: string;
 
-    if (this.ipcServer.hasAuthenticatedClients()) {
-      // GUI is connected — use IPC prompt
+    if (this.hasAnyGuiClient()) {
+      // GUI is connected — use IPC/WebSocket prompt
       response = await new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           this.logger.info('Reboot prompt timed out, skipping reboot');
@@ -1819,7 +2064,7 @@ class OPSISAgentService {
           timer
         });
 
-        this.ipcServer.broadcast({
+        this.broadcastToAllClients({
           type: 'user-prompt',
           data: {
             id: promptId,
@@ -1902,8 +2147,8 @@ class OPSISAgentService {
 
     let response: string;
 
-    if (this.ipcServer.hasAuthenticatedClients()) {
-      // GUI is connected — use IPC prompt
+    if (this.hasAnyGuiClient()) {
+      // GUI is connected — use IPC/WebSocket prompt
       response = await new Promise<string>((resolve) => {
         const timer = setTimeout(() => {
           this.pendingPrompts.delete(promptId);
@@ -1916,7 +2161,7 @@ class OPSISAgentService {
           timer
         });
 
-        this.ipcServer.broadcast({
+        this.broadcastToAllClients({
           type: 'user-prompt',
           data: {
             id: promptId,
@@ -2129,7 +2374,7 @@ class OPSISAgentService {
     this.savePendingActions();
 
     // Notify GUI of new pending action
-    this.ipcServer.broadcast({
+    this.broadcastToAllClients({
       type: 'pending-action-created',
       data: {
         ticket_id: ticketId,
@@ -4404,14 +4649,14 @@ class OPSISAgentService {
     this.maintenanceManager.addWindow(window);
     this.logger.info('Maintenance window added from server', { id: window.id, name: window.name });
 
-    this.ipcServer.broadcast({ type: 'maintenance-window-added', data: window });
+    this.broadcastToAllClients({ type: 'maintenance-window-added', data: window });
   }
 
   private handleCancelMaintenanceWindow(data: any): void {
     const windowId = data.id || data.window_id;
     if (windowId) {
       this.maintenanceManager.removeWindow(windowId);
-      this.ipcServer.broadcast({ type: 'maintenance-window-removed', data: { id: windowId } });
+      this.broadcastToAllClients({ type: 'maintenance-window-removed', data: { id: windowId } });
     }
   }
 
