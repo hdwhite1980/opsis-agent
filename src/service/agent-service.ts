@@ -236,6 +236,7 @@ class OPSISAgentService {
   private escalationCooldowns: Map<string, number> = new Map(); // signature_id -> last escalated timestamp
   private readonly ESCALATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
   private recentSignatureIds: string[] = []; // Track recent signature_ids for linking server playbooks
+  private pendingRebootCompletedMsg: any = null; // Queued reboot_completed message to send on WS connect
   private escalationBatch: Array<{signature: DeviceSignature, runbook: RunbookMatch | null, diagnosticData?: DiagnosticData | null}> = [];
   private batchTimer: NodeJS.Timeout | null = null;
   private readonly BATCH_FLUSH_MS = 10000; // 10 seconds
@@ -248,6 +249,7 @@ class OPSISAgentService {
 
   // Server runbook storage
   private readonly serverRunbooksPath: string;
+  private readonly pendingRebootPlaybookPath: string;
   private readonly REINVESTIGATION_THRESHOLD = 10; // Escalate for reinvestigation after 10 executions
 
   // Server-provided configuration (received via welcome message)
@@ -292,6 +294,7 @@ class OPSISAgentService {
     this.runbooksDir = path.join(this.baseDir, 'runbooks');
     this.configPath = path.join(this.dataDir, 'agent.config.json');
     this.serverRunbooksPath = path.join(this.dataDir, 'server-runbooks.json');
+    this.pendingRebootPlaybookPath = path.join(this.dataDir, 'pending-reboot-playbook.json');
     this.pendingActionsPath = path.join(this.dataDir, 'pending-actions.json');
 
     // Ensure directories exist
@@ -1099,6 +1102,9 @@ class OPSISAgentService {
     // Load pending actions from disk
     this.loadPendingActions();
 
+    // Resume any playbook interrupted by a reboot
+    await this.resumeRebootPlaybook();
+
     // Launch GUI console in user session
     this.guiLauncher.launchGui();
 
@@ -1303,6 +1309,17 @@ class OPSISAgentService {
           timestamp: new Date().toISOString(),
           system_info: systemInfo
         }));
+
+        // Send pending reboot_completed notification if resuming after reboot
+        if (this.pendingRebootCompletedMsg) {
+          this.ws!.send(JSON.stringify(this.pendingRebootCompletedMsg));
+          this.logger.info('Sent reboot_completed to server', {
+            playbook_id: this.pendingRebootCompletedMsg.playbook_id,
+            authorized_by: this.pendingRebootCompletedMsg.authorized_by,
+            downtime_seconds: this.pendingRebootCompletedMsg.downtime_seconds
+          });
+          this.pendingRebootCompletedMsg = null;
+        }
 
         // Start heartbeat immediately with default interval
         // (will be updated if welcome arrives with custom config)
@@ -1827,8 +1844,27 @@ class OPSISAgentService {
       this.logger.info('Native reboot prompt result', { response: output });
     }
 
+    // Get the logged-on username for authorization tracking
+    const loggedOnUser = process.env.USERNAME || process.env.USER || os.userInfo().username || 'Unknown';
+
     if (response === 'ok') {
-      this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`);
+      this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`, { authorizedBy: loggedOnUser });
+
+      // Notify server of reboot authorization
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'reboot_authorized',
+          device_id: this.deviceInfo.device_id,
+          tenant_id: this.deviceInfo.tenant_id,
+          timestamp: new Date().toISOString(),
+          authorized_by: loggedOnUser,
+          playbook_id: this.playbookQueue.length > 0 ? this.playbookQueue[0]?.id : null,
+          delay_seconds: delay,
+          reason: rawMessage
+        }));
+        this.logger.info('Reboot authorization sent to server');
+      }
+
       const { spawnSync } = require('child_process');
       // SECURITY: Use spawnSync with array args to prevent command injection
       const result = spawnSync('shutdown.exe', [
@@ -1840,7 +1876,20 @@ class OPSISAgentService {
         this.logger.error('Failed to initiate reboot', result.error);
       }
     } else {
-      this.logger.info('User declined or timed out on reboot prompt', { response });
+      this.logger.info('User declined or timed out on reboot prompt', { response, user: loggedOnUser });
+
+      // Notify server that reboot was declined
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'reboot_declined',
+          device_id: this.deviceInfo.device_id,
+          tenant_id: this.deviceInfo.tenant_id,
+          timestamp: new Date().toISOString(),
+          declined_by: loggedOnUser,
+          response,
+          reason: response === 'timeout' ? 'User did not respond within 5 minutes' : 'User declined reboot'
+        }));
+      }
     }
   }
 
@@ -3775,14 +3824,27 @@ class OPSISAgentService {
     this.isExecutingPlaybook = false;
   }
 
-  private async executePlaybook(playbook: PlaybookTask): Promise<void> {
-    for (let i = 0; i < playbook.steps.length; i++) {
+  private async executePlaybook(playbook: PlaybookTask, resumeFromStep: number = 0): Promise<void> {
+    for (let i = resumeFromStep; i < playbook.steps.length; i++) {
       const step = playbook.steps[i];
-      this.log(`  Executing step: ${step.type} - ${step.action}`);
+      this.log(`  Executing step ${i + 1}/${playbook.steps.length}: ${step.type} - ${step.action}`);
 
       if (step.requiresApproval && !this.config.autoRemediation) {
         this.log('  Step requires approval, skipping (auto-remediation disabled)');
         continue;
+      }
+
+      // If this is a reboot step and there are steps after it, save state before rebooting
+      if (step.type === 'reboot' && i < playbook.steps.length - 1) {
+        await this.executeStep(step);
+        // If reboot was confirmed (shutdown is pending), save remaining steps for resume
+        this.saveRebootPlaybookState(playbook, i + 1);
+        this.logger.info('Playbook state saved for post-reboot resume', {
+          playbook_id: playbook.id,
+          resume_step: i + 1,
+          remaining_steps: playbook.steps.length - (i + 1)
+        });
+        return; // Stop execution — machine is about to reboot
       }
 
       const isVerification = step.allowFailure || this.isVerificationStep(step, playbook.steps, i);
@@ -3798,6 +3860,9 @@ class OPSISAgentService {
         throw error;
       }
     }
+
+    // Playbook fully completed — clean up any reboot state file
+    this.clearRebootPlaybookState();
   }
 
   private isVerificationStep(step: PlaybookStep, allSteps: PlaybookStep[], index: number): boolean {
@@ -4497,6 +4562,155 @@ class OPSISAgentService {
     this.config = { ...this.config, ...newConfig };
     this.saveConfig();
     this.logger.info('Configuration updated');
+  }
+
+  // ============================================
+  // REBOOT PLAYBOOK STATE PERSISTENCE
+  // ============================================
+
+  /**
+   * Save playbook state before a reboot so it can resume after restart.
+   */
+  private saveRebootPlaybookState(playbook: PlaybookTask, resumeFromStep: number): void {
+    try {
+      const loggedOnUser = process.env.USERNAME || process.env.USER || os.userInfo().username || 'Unknown';
+      const state = {
+        playbook: {
+          id: playbook.id,
+          name: playbook.name,
+          priority: playbook.priority,
+          source: playbook.source,
+          steps: playbook.steps,
+          signalId: (playbook as any).signalId,
+          signatureId: (playbook as any).signatureId
+        },
+        resumeFromStep,
+        savedAt: new Date().toISOString(),
+        authorizedBy: loggedOnUser,
+        deviceId: os.hostname()
+      };
+      fs.writeFileSync(this.pendingRebootPlaybookPath, JSON.stringify(state, null, 2), 'utf8');
+    } catch (error) {
+      this.logger.error('Failed to save reboot playbook state', error);
+    }
+  }
+
+  /**
+   * Check for and resume a playbook that was interrupted by a reboot.
+   * Sends reboot_completed to server once WebSocket connects.
+   */
+  private async resumeRebootPlaybook(): Promise<void> {
+    try {
+      if (!fs.existsSync(this.pendingRebootPlaybookPath)) return;
+
+      const raw = fs.readFileSync(this.pendingRebootPlaybookPath, 'utf8');
+      const state = JSON.parse(raw);
+
+      // Validate state
+      if (!state.playbook || !state.playbook.steps || typeof state.resumeFromStep !== 'number') {
+        this.logger.warn('Invalid reboot playbook state file, removing');
+        this.clearRebootPlaybookState();
+        return;
+      }
+
+      // Check age — don't resume if saved more than 1 hour ago
+      const savedAt = new Date(state.savedAt).getTime();
+      if (Date.now() - savedAt > 60 * 60 * 1000) {
+        this.logger.warn('Reboot playbook state is too old (>1 hour), discarding', {
+          savedAt: state.savedAt,
+          playbookId: state.playbook.id
+        });
+        this.clearRebootPlaybookState();
+        return;
+      }
+
+      this.logger.info('Resuming playbook after reboot', {
+        playbook_id: state.playbook.id,
+        playbook_name: state.playbook.name,
+        resume_step: state.resumeFromStep,
+        total_steps: state.playbook.steps.length,
+        authorized_by: state.authorizedBy,
+        saved_at: state.savedAt
+      });
+
+      // Queue reboot_completed notification to send once WebSocket connects
+      const rebootCompletedMsg = {
+        type: 'reboot_completed',
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        timestamp: new Date().toISOString(),
+        reboot_requested_at: state.savedAt,
+        authorized_by: state.authorizedBy || 'Unknown',
+        playbook_id: state.playbook.id,
+        playbook_name: state.playbook.name,
+        resume_step: state.resumeFromStep,
+        total_steps: state.playbook.steps.length,
+        downtime_seconds: Math.round((Date.now() - savedAt) / 1000)
+      };
+      this.pendingRebootCompletedMsg = rebootCompletedMsg;
+
+      // Rebuild PlaybookTask
+      const playbook: PlaybookTask = {
+        id: state.playbook.id,
+        name: state.playbook.name,
+        priority: state.playbook.priority || 'medium',
+        source: state.playbook.source || 'server',
+        steps: state.playbook.steps,
+        createdAt: new Date()
+      };
+      if (state.playbook.signalId) (playbook as any).signalId = state.playbook.signalId;
+      if (state.playbook.signatureId) (playbook as any).signatureId = state.playbook.signatureId;
+
+      // Execute remaining steps
+      const startTime = Date.now();
+      const signalId = (playbook as any).signalId || playbook.id;
+      const deviceId = os.hostname();
+
+      try {
+        await this.executePlaybook(playbook, state.resumeFromStep);
+        const duration = Date.now() - startTime;
+
+        this.logger.info('Post-reboot playbook completed', {
+          playbook_id: playbook.id,
+          duration_ms: duration
+        });
+        this.reportPlaybookResult(playbook.id, 'success');
+        this.sendPlaybookResult(playbook, 'success', duration);
+
+        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'success', duration);
+
+        if (playbook.source === 'server') {
+          this.saveServerRunbook(playbook);
+        }
+      } catch (error) {
+        const duration = Date.now() - startTime;
+
+        this.logger.error('Post-reboot playbook failed', { playbook_id: playbook.id, error });
+        this.reportPlaybookResult(playbook.id, 'failed', error);
+        this.sendPlaybookResult(playbook, 'failed', duration, error);
+
+        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'failure', duration, error?.toString());
+      }
+
+      // Always clean up state file after attempting resume
+      this.clearRebootPlaybookState();
+    } catch (error) {
+      this.logger.error('Failed to resume reboot playbook', error);
+      this.clearRebootPlaybookState();
+    }
+  }
+
+  /**
+   * Delete the reboot playbook state file.
+   */
+  private clearRebootPlaybookState(): void {
+    try {
+      if (fs.existsSync(this.pendingRebootPlaybookPath)) {
+        fs.unlinkSync(this.pendingRebootPlaybookPath);
+      }
+    } catch (error) {
+      this.logger.error('Failed to clear reboot playbook state', error);
+    }
   }
 
   // ============================================
