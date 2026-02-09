@@ -1666,15 +1666,13 @@ class OPSISAgentService {
         data: alert
       });
     } else {
-      // No GUI connected — show native Windows notification
-      this.logger.info('No GUI connected, using native Windows dialog for service alert');
-      const { spawn } = require('child_process');
-      const title = `Service Alert: ${String(alert.service || 'Unknown Service').replace(/[`$&|;<>\r\n"]/g, '')}`;
-      const severity = alert.severity || 'info';
-      const msg = String(alert.message || alert.description || `${alert.service} is experiencing issues`).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
-      const icon = severity === 'critical' ? 'Error' : severity === 'warning' ? 'Warning' : 'Information';
-      const psScript = `Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('${msg}', '${title.replace(/'/g, "''")}', 'OK', '${icon}')`;
-      spawn('powershell.exe', ['-NoProfile', '-Command', psScript], { detached: true, stdio: 'ignore' });
+      // No GUI connected — log only, no popup (suppresses Windows Script Host dialogs)
+      this.logger.info('No GUI connected, service alert logged only', {
+        id: alert.id,
+        service: alert.service,
+        severity: alert.severity,
+        message: alert.message || alert.description
+      });
     }
   }
 
