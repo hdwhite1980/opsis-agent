@@ -1186,6 +1186,11 @@
                     <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
                 </svg>
             </div>
+            <div class="nav-item" data-view="lists" title="Protection Lists">
+                <svg viewBox="0 0 24 24">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                </svg>
+            </div>
             <div class="nav-item" data-view="settings" title="Settings">
                 <svg viewBox="0 0 24 24">
                     <circle cx="12" cy="12" r="3"></circle>
@@ -1439,6 +1444,59 @@
                                     <span class="status-indicator-dot status-ok"></span>
                                     <span>Active (17 monitors)</span>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Lists View -->
+                <div class="view" id="lists-view">
+                    <h1 class="page-title">Protection Lists</h1>
+
+                    <!-- Protected Applications -->
+                    <div class="settings-section" style="border-left: 3px solid #10b981;">
+                        <div class="settings-title" style="color: #10b981; cursor: pointer;" onclick="toggleListSection('protected-apps-content')">
+                            Protected Applications
+                            <span style="font-size: 10px; font-weight: 400; color: #888; margin-left: 8px;">Apps that will never be auto-remediated</span>
+                        </div>
+                        <div id="protected-apps-content">
+                            <div id="protected-apps-list" style="padding: 8px 0;">
+                                <div style="color: #888; font-size: 11px; padding: 12px;">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Exclusions (Restricted) -->
+                    <div class="settings-section" style="border-left: 3px solid #f59e0b;">
+                        <div class="settings-title" style="color: #f59e0b; cursor: pointer;" onclick="toggleListSection('exclusions-content')">
+                            Exclusions (Restricted)
+                            <span style="font-size: 10px; font-weight: 400; color: #888; margin-left: 8px;">Services, processes, and signatures excluded from monitoring</span>
+                        </div>
+                        <div id="exclusions-content">
+                            <div id="exclusions-services" style="padding: 8px 0;">
+                                <div style="font-weight: 600; font-size: 11px; color: #ccc; margin-bottom: 6px; padding: 0 4px;">Services</div>
+                                <div id="exclusions-services-list"></div>
+                            </div>
+                            <div id="exclusions-processes" style="padding: 8px 0; border-top: 1px solid #333;">
+                                <div style="font-weight: 600; font-size: 11px; color: #ccc; margin-bottom: 6px; padding: 0 4px;">Processes</div>
+                                <div id="exclusions-processes-list"></div>
+                            </div>
+                            <div id="exclusions-signatures" style="padding: 8px 0; border-top: 1px solid #333;">
+                                <div style="font-weight: 600; font-size: 11px; color: #ccc; margin-bottom: 6px; padding: 0 4px;">Signatures</div>
+                                <div id="exclusions-signatures-list"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Ignore List -->
+                    <div class="settings-section" style="border-left: 3px solid #6b7280;">
+                        <div class="settings-title" style="color: #9ca3af; cursor: pointer;" onclick="toggleListSection('ignore-list-content')">
+                            Ignore List
+                            <span style="font-size: 10px; font-weight: 400; color: #888; margin-left: 8px;">Signatures marked as false positives or intentionally ignored</span>
+                        </div>
+                        <div id="ignore-list-content">
+                            <div id="ignore-list-items" style="padding: 8px 0;">
+                                <div style="color: #888; font-size: 11px; padding: 12px;">Loading...</div>
                             </div>
                         </div>
                     </div>
@@ -1721,6 +1779,11 @@
             if (data.serviceAlerts) {
                 activeServiceAlerts = data.serviceAlerts;
                 renderServiceAlerts();
+            }
+            if (data.protectedApplications || data.exclusions || data.ignoreList) {
+                try {
+                    renderListsData(data.protectedApplications, data.exclusions, data.ignoreList);
+                } catch (e) { console.error('Initial lists error:', e); }
             }
         }
 
@@ -2249,6 +2312,100 @@
             setTimeout(refreshData, 1000);
         }
 
+        // ============================================
+        // PROTECTION LISTS
+        // ============================================
+
+        function toggleListSection(id) {
+            var el = document.getElementById(id);
+            if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+        }
+
+        async function loadListsData() {
+            try {
+                var results = await Promise.allSettled([
+                    invoke('get_protected_applications'),
+                    invoke('get_exclusions'),
+                    invoke('get_ignore_list')
+                ]);
+                var protectedApps = results[0].status === 'fulfilled' ? results[0].value : [];
+                var exclusions = results[1].status === 'fulfilled' ? results[1].value : { services: [], processes: [], signatures: [] };
+                var ignoreList = results[2].status === 'fulfilled' ? results[2].value : { ignored_signatures: [] };
+                renderListsData(protectedApps, exclusions, ignoreList);
+            } catch (e) {
+                console.error('Failed to load lists data:', e);
+            }
+        }
+
+        function renderListsData(protectedApps, exclusions, ignoreList) {
+            // Protected Applications
+            var paContainer = document.getElementById('protected-apps-list');
+            if (paContainer) {
+                var apps = protectedApps || [];
+                if (apps.length === 0) {
+                    paContainer.innerHTML = '<div style="color: #666; font-size: 11px; padding: 12px; text-align: center;">No protected applications configured. The server can push protected applications via config updates.</div>';
+                } else {
+                    var html = '<table style="width: 100%; border-collapse: collapse; font-size: 11px;">';
+                    html += '<tr style="color: #10b981; border-bottom: 1px solid #333;"><th style="text-align: left; padding: 6px 8px;">Display Name</th><th style="text-align: left; padding: 6px 8px;">Process</th><th style="text-align: left; padding: 6px 8px;">Service</th></tr>';
+                    for (var i = 0; i < apps.length; i++) {
+                        var a = apps[i];
+                        html += '<tr style="border-bottom: 1px solid #2a2a2a;">';
+                        html += '<td style="padding: 6px 8px; color: #e0e0e0;">' + escapeHtml(a.display_name || '-') + '</td>';
+                        html += '<td style="padding: 6px 8px; color: #aaa;">' + escapeHtml(a.process_name || '-') + '</td>';
+                        html += '<td style="padding: 6px 8px; color: #aaa;">' + escapeHtml(a.service_name || '-') + '</td>';
+                        html += '</tr>';
+                    }
+                    html += '</table>';
+                    paContainer.innerHTML = html;
+                }
+            }
+
+            // Exclusions
+            if (exclusions) {
+                renderExclusionSublist('exclusions-services-list', exclusions.services, '#f59e0b');
+                renderExclusionSublist('exclusions-processes-list', exclusions.processes, '#f59e0b');
+                renderExclusionSublist('exclusions-signatures-list', exclusions.signatures, '#f59e0b');
+            }
+
+            // Ignore List
+            var igContainer = document.getElementById('ignore-list-items');
+            if (igContainer) {
+                var items = (ignoreList && ignoreList.ignored_signatures) || [];
+                if (items.length === 0) {
+                    igContainer.innerHTML = '<div style="color: #666; font-size: 11px; padding: 12px; text-align: center;">No ignored signatures. Signatures are added here when marked as false positives.</div>';
+                } else {
+                    var html = '<table style="width: 100%; border-collapse: collapse; font-size: 11px;">';
+                    html += '<tr style="color: #9ca3af; border-bottom: 1px solid #333;"><th style="text-align: left; padding: 6px 8px;">Signature</th><th style="text-align: left; padding: 6px 8px;">Reason</th><th style="text-align: left; padding: 6px 8px;">Added</th></tr>';
+                    for (var i = 0; i < items.length; i++) {
+                        var item = items[i];
+                        html += '<tr style="border-bottom: 1px solid #2a2a2a;">';
+                        html += '<td style="padding: 6px 8px; color: #e0e0e0; font-family: monospace;">' + escapeHtml(item.signature || '') + '</td>';
+                        html += '<td style="padding: 6px 8px; color: #aaa;">' + escapeHtml(item.reason || '-') + '</td>';
+                        html += '<td style="padding: 6px 8px; color: #888;">' + (item.added_at ? formatTimeAgo(item.added_at) : '-') + '</td>';
+                        html += '</tr>';
+                    }
+                    html += '</table>';
+                    igContainer.innerHTML = html;
+                }
+            }
+        }
+
+        function renderExclusionSublist(containerId, items, color) {
+            var container = document.getElementById(containerId);
+            if (!container) return;
+            items = items || [];
+            if (items.length === 0) {
+                container.innerHTML = '<div style="color: #555; font-size: 10px; padding: 4px 8px; font-style: italic;">None</div>';
+                return;
+            }
+            var html = '<div style="display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 4px;">';
+            for (var i = 0; i < items.length; i++) {
+                html += '<span style="background: #2a2a2a; color: ' + color + '; padding: 3px 8px; border-radius: 3px; font-size: 10px; font-family: monospace;">' + escapeHtml(items[i]) + '</span>';
+            }
+            html += '</div>';
+            container.innerHTML = html;
+        }
+
         // Navigation
         function switchView(viewName, el) {
             // Update nav items
@@ -2263,6 +2420,9 @@
             });
             var target = document.getElementById(viewName + '-view');
             if (target) target.classList.add('active');
+
+            // Load lists data when switching to lists tab
+            if (viewName === 'lists') loadListsData();
         }
 
         // Bind nav items via addEventListener (CSP-safe)

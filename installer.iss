@@ -2,7 +2,7 @@
 ; Service: compiled standalone exe (pkg). GUI: localhost web UI served by agent service.
 
 #define AppName "OPSIS Agent"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "OPSIS"
 #define AppURL "https://opsis.io"
 #define ServiceName "OPSIS Agent Service"
@@ -57,9 +57,6 @@ Source: "runbooks\*"; DestDir: "{app}\runbooks"; Flags: ignoreversion recursesub
 
 ; Self-service portal
 Source: "dist\portal\portal.html"; DestDir: "{app}\dist\portal"; Flags: ignoreversion
-
-; GUI launcher batch file (opens browser to control panel)
-Source: "start-opsis-gui.bat"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Assets
 Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist

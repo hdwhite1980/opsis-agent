@@ -594,7 +594,9 @@ class OPSISAgentService {
         serviceAlerts: this.serviceAlerts,
         capabilityMode: this.capabilityMode,
         deploymentHealth: this.compatibilityReport,
-        protectedApplications: this.protectedApplications
+        protectedApplications: this.protectedApplications,
+        exclusions: this.loadExclusionsFile(),
+        ignoreList: this.loadIgnoreListFile()
       }
     };
   }
@@ -803,6 +805,12 @@ class OPSISAgentService {
         } };
       case 'get-state-tracker-summary':
         return { type: 'state-tracker-summary', data: this.stateTracker.getSummary() };
+      case 'get-exclusions':
+        return { type: 'exclusions', data: this.loadExclusionsFile() };
+      case 'get-ignore-list':
+        return { type: 'ignore-list', data: this.loadIgnoreListFile() };
+      case 'get-protected-applications':
+        return { type: 'protected-applications', data: this.protectedApplications };
       default:
         this.logger.warn('Unknown control panel request type', { type });
         return null;
@@ -3107,6 +3115,36 @@ class OPSISAgentService {
       this.logger.error('Failed to check ignore list', error);
       return false;
     }
+  }
+
+  private loadExclusionsFile(): { services: string[]; processes: string[]; signatures: string[] } {
+    try {
+      const exclusionsPath = path.join(process.cwd(), 'config', 'exclusions.json');
+      if (fs.existsSync(exclusionsPath)) {
+        const data = JSON.parse(fs.readFileSync(exclusionsPath, 'utf8'));
+        return {
+          services: data.services || [],
+          processes: data.processes || [],
+          signatures: data.signatures || []
+        };
+      }
+    } catch (error) {
+      this.logger.warn('Failed to load exclusions file', { error: String(error) });
+    }
+    return { services: [], processes: [], signatures: [] };
+  }
+
+  private loadIgnoreListFile(): { ignored_signatures: Array<{ signature: string; reason: string; added_at: string; verified_by: string }> } {
+    try {
+      const ignoreListPath = path.join(process.cwd(), 'data', 'ignore-list.json');
+      if (fs.existsSync(ignoreListPath)) {
+        const data = JSON.parse(fs.readFileSync(ignoreListPath, 'utf8'));
+        return { ignored_signatures: data.ignored_signatures || [] };
+      }
+    } catch (error) {
+      this.logger.warn('Failed to load ignore list file', { error: String(error) });
+    }
+    return { ignored_signatures: [] };
   }
 
   private sendPlaybookResult(playbook: PlaybookTask, status: string, durationMs: number, error?: any): void {
