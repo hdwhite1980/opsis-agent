@@ -37,6 +37,17 @@ export interface EscalationPayload {
   local_confidence: number;
   requested_outcome: 'recommend_playbook' | 'diagnose_root_cause' | 'needs_approval' | 'needs_outage_correlation';
 
+  // Baseline comparison showing deviation from normal state
+  baseline_comparison?: {
+    cpu_change: number | null;
+    memory_change: number | null;
+    disk_changes: Array<{ drive: string; change: number }>;
+    new_processes: string[];
+    missing_services: string[];
+    new_software: string[];
+    removed_software: string[];
+  };
+
   // Pre-escalation diagnostic data collected by troubleshooting runbooks
   pre_escalation_diagnostics?: {
     runbook_id: string;

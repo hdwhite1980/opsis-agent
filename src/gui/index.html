@@ -1666,7 +1666,7 @@
             });
         }
 
-        /** Register a broadcast event listener (compatible with Tauri listen API) */
+        /** Register a broadcast event listener */
         function listen(eventType, callback) {
             if (!eventListeners.has(eventType)) {
                 eventListeners.set(eventType, []);
@@ -1687,7 +1687,7 @@
                 handleInitialData(msg.data);
                 return;
             }
-            // Dispatch to registered listeners (wrap in Tauri-like event)
+            // Dispatch to registered listeners
             const event = { payload: msg.data };
             const listeners = eventListeners.get(msg.type) || [];
             for (const cb of listeners) {

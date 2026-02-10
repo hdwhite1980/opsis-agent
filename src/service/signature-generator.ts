@@ -207,8 +207,35 @@ export class SignatureGenerator {
   }
   
   private calculateSignalConfidence(signal: SystemSignal): number {
-    if (signal.value >= signal.threshold * 1.5) return 95;
-    if (signal.value >= signal.threshold * 1.2) return 85;
+    const value = signal.value;
+    const threshold = signal.threshold;
+
+    // Non-numeric or missing/zero threshold — use severity-based confidence
+    if (typeof value !== 'number' || typeof threshold !== 'number' || threshold === 0) {
+      return signal.severity === 'critical' ? 90 : 75;
+    }
+
+    // Inverted metrics (lower = worse): disk_free
+    if (signal.metric === 'disk_free') {
+      const breach = (threshold - value) / threshold;
+      if (breach >= 0.5) return 95;  // e.g., 5% free when threshold is 10%
+      if (breach >= 0.2) return 85;  // e.g., 8% free when threshold is 10%
+      return 70;
+    }
+
+    // Bounded metrics (0-100%): cpu_usage, memory_usage
+    if (signal.metric === 'cpu_usage' || signal.metric === 'memory_usage') {
+      const headroom = 100 - threshold;
+      if (headroom <= 0) return 90; // threshold at or above 100% — always high confidence
+      const breach = (value - threshold) / headroom;
+      if (breach >= 0.5) return 95;  // e.g., CPU 95% with threshold 90% → 50% of headroom
+      if (breach >= 0.2) return 85;  // e.g., CPU 92% with threshold 90% → 20% of headroom
+      return 70;
+    }
+
+    // Unbounded metrics (process count, error count, MB, ms, etc.): use ratio
+    if (value >= threshold * 1.5) return 95;
+    if (value >= threshold * 1.2) return 85;
     return 70;
   }
   

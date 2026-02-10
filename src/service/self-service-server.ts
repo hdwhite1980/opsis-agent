@@ -111,7 +111,7 @@ export class SelfServiceServer {
             this.portalHtml = fs.readFileSync(relativePath, 'utf-8');
           } else {
             this.logger.error('Portal HTML not found', { tried: [portalPath, distPath, relativePath] });
-            return;
+            this.portalHtml = '<!DOCTYPE html><html><body><h1>OPSIS Self-Service Portal</h1><p>Portal files not found. Please reinstall the OPSIS Agent or contact your administrator.</p></body></html>';
           }
         }
       }

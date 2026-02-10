@@ -13,7 +13,7 @@ import { TicketDatabase, Ticket } from './ticket-database';
 import { SystemMonitor, SystemSignal } from './system-monitor';
 import { IPCServer } from './ipc-server';
 import { RemediationMemory } from './remediation-memory';
-import { GuiLauncher } from './gui-launcher';
+
 import { PatternDetector } from './pattern-detector';
 
 // NEW IMPORTS - Tiered Intelligence Components
@@ -26,6 +26,8 @@ import { StateTracker, StateChangeEvent, SeverityEscalationEvent } from './state
 import { MaintenanceWindowManager, MaintenanceWindow } from './maintenance-windows';
 import { SelfServiceServer } from './self-service-server';
 import { ControlPanelServer } from './control-panel-server';
+import { BaselineManager } from './baseline-manager';
+import { CompatibilityChecker, CompatibilityReport, CapabilityMode } from './compatibility-checker';
 
 // Security imports
 import {
@@ -206,7 +208,6 @@ class OPSISAgentService {
   private systemMonitor: SystemMonitor;
   private ticketDb: TicketDatabase;
   private ipcServer: IPCServer;
-  private guiLauncher: GuiLauncher;
   private remediationMemory: RemediationMemory;
   private serviceAlerts: any[] = [];
   private patternDetector: PatternDetector;
@@ -279,6 +280,21 @@ class OPSISAgentService {
   // Control panel web server
   private controlPanelServer: ControlPanelServer | null = null;
 
+  // System baseline manager
+  private baselineManager: BaselineManager;
+
+  // Compatibility checker and capability mode
+  private compatibilityChecker: CompatibilityChecker;
+  private capabilityMode: CapabilityMode = 'full';
+  private compatibilityReport: CompatibilityReport | null = null;
+
+  // Protected applications (server-pushed, scoped by client)
+  private protectedApplications: Array<{
+    process_name?: string;
+    service_name?: string;
+    display_name: string;
+  }> = [];
+
   // Monitoring trap agent features
   private stateTracker!: StateTracker;
   private maintenanceManager!: MaintenanceWindowManager;
@@ -311,9 +327,6 @@ class OPSISAgentService {
     // Initialize logger
     this.logger = getServiceLogger(this.logsDir);
     
-    // Initialize GUI launcher
-    this.guiLauncher = new GuiLauncher(this.logger, this.baseDir);
-
     // Initialize ticket database
     const dbPath = path.join(this.dataDir, 'tickets.json');
     this.ticketDb = new TicketDatabase(this.logger, dbPath);
@@ -384,6 +397,12 @@ class OPSISAgentService {
         this.logger.error('Error sending initial data to control panel', error);
       }
     };
+
+    // Initialize baseline manager
+    this.baselineManager = new BaselineManager(this.logger, this.dataDir);
+
+    // Initialize compatibility checker
+    this.compatibilityChecker = new CompatibilityChecker(this.logger);
 
     // Send initial data when GUI connects
     this.ipcServer.onClientConnected((socket) => {
@@ -540,7 +559,7 @@ class OPSISAgentService {
     });
   }
 
-  /** Broadcast to both IPC (Tauri) and web control panel clients */
+  /** Broadcast to both IPC and web control panel clients */
   private broadcastToAllClients(message: { type: string; data: any }): void {
     this.ipcServer.broadcast(message);
     if (this.controlPanelServer) {
@@ -572,7 +591,10 @@ class OPSISAgentService {
         correlations: this.patternDetector.getCorrelations(),
         patterns: this.patternDetector.getDetectedPatterns(),
         proactiveActions: this.patternDetector.getPendingActions(),
-        serviceAlerts: this.serviceAlerts
+        serviceAlerts: this.serviceAlerts,
+        capabilityMode: this.capabilityMode,
+        deploymentHealth: this.compatibilityReport,
+        protectedApplications: this.protectedApplications
       }
     };
   }
@@ -1242,84 +1264,29 @@ class OPSISAgentService {
   // ============================================
 
   /**
-   * Detect OS-level policy restrictions that may block agent operations.
-   * Logs warnings so operators know what won't work on this endpoint.
+   * Run full compatibility check, determine capability mode, and log results.
+   * Replaces the old detectPolicyRestrictions() with comprehensive checks.
    */
   private async detectPolicyRestrictions(): Promise<void> {
-    this.logger.info('Checking endpoint policy restrictions...');
+    this.compatibilityReport = await this.compatibilityChecker.runFullCheck();
+    this.capabilityMode = this.compatibilityReport.capability_mode;
 
-    // 1. Check PowerShell execution policy
-    try {
-      const { stdout } = await execAsync(
-        'powershell -Command "Get-ExecutionPolicy"',
-        { timeout: 10000 }
-      );
-      const policy = stdout.trim();
-      if (policy === 'Restricted' || policy === 'AllSigned') {
-        this.logger.warn('PowerShell execution policy may block scripts', { policy });
+    // Log each check result
+    for (const check of this.compatibilityReport.checks) {
+      if (check.status === 'red') {
+        this.logger.warn(`[COMPAT] ${check.name}: ${check.detail}`, { impact: check.impact });
+      } else if (check.status === 'yellow') {
+        this.logger.warn(`[COMPAT] ${check.name}: ${check.detail}`, { impact: check.impact });
       } else {
-        this.logger.info('PowerShell execution policy', { policy });
+        this.logger.info(`[COMPAT] ${check.name}: ${check.detail}`);
       }
-    } catch {
-      this.logger.warn('Cannot determine PowerShell execution policy');
     }
 
-    // 2. Check if AppLocker is active
-    try {
-      const { stdout } = await execAsync(
-        'powershell -Command "(Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue).RuleCollections.Count"',
-        { timeout: 10000 }
-      );
-      const ruleCount = parseInt(stdout.trim() || '0');
-      if (ruleCount > 0) {
-        this.logger.warn('AppLocker is active with rules — some operations may be blocked', { ruleCount });
-      }
-    } catch {
-      // AppLocker cmdlets not available — likely not enforced
+    if (this.capabilityMode !== 'full') {
+      this.logger.warn(`Agent operating in ${this.capabilityMode.toUpperCase()} mode`, {
+        disabled_categories: this.compatibilityReport.disabled_categories
+      });
     }
-
-    // 3. Check Windows Defender Tamper Protection
-    try {
-      const { stdout } = await execAsync(
-        'powershell -Command "(Get-MpComputerStatus).IsTamperProtected"',
-        { timeout: 10000 }
-      );
-      if (stdout.trim() === 'True') {
-        this.logger.info('Defender Tamper Protection is enabled (security settings cannot be modified by agent)');
-      }
-    } catch {
-      // Defender not available or insufficient permissions
-    }
-
-    // 4. Check if Defender exclusion is in place for this directory
-    try {
-      const { stdout } = await execAsync(
-        `powershell -Command "(Get-MpPreference).ExclusionPath -contains '${this.baseDir}'  "`,
-        { timeout: 10000 }
-      );
-      if (stdout.trim() !== 'True') {
-        this.logger.warn('Agent install directory is NOT excluded from Defender — PowerShell operations may be flagged');
-      }
-    } catch {
-      // Non-fatal
-    }
-
-    // 5. Check if running as SYSTEM / elevated
-    try {
-      const { stdout } = await execAsync(
-        'powershell -Command "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name"',
-        { timeout: 10000 }
-      );
-      const identity = stdout.trim();
-      this.logger.info('Service running as', { identity });
-      if (!identity.includes('SYSTEM') && !identity.includes('Administrator')) {
-        this.logger.warn('Agent is NOT running as SYSTEM or Administrator — some operations will fail');
-      }
-    } catch {
-      this.logger.warn('Cannot determine service identity');
-    }
-
-    this.logger.info('Policy restriction check complete');
   }
 
   public async start(): Promise<void> {
@@ -1351,11 +1318,11 @@ class OPSISAgentService {
     // Load pending actions from disk
     this.loadPendingActions();
 
+    // Load protected applications from local config
+    this.loadProtectedApplications();
+
     // Resume any playbook interrupted by a reboot
     await this.resumeRebootPlaybook();
-
-    // Launch GUI console in user session
-    this.guiLauncher.launchGui();
 
     // Start event monitoring
     this.eventMonitor.startMonitoring(30);
@@ -1368,6 +1335,10 @@ class OPSISAgentService {
     // Initialize baseline health scores for hardware components
     await this.patternDetector.initializeBaselineHealthScores();
     this.log('Hardware health scores initialized');
+
+    // Capture system baseline (first run or refresh after 24h)
+    await this.baselineManager.captureIfNeeded();
+    this.log('System baseline check complete');
 
     // Connect to server if configured
     const serverUrl = this.deviceInfo.websocket_url || this.config.serverUrl;
@@ -1429,11 +1400,6 @@ class OPSISAgentService {
 
   public stop(): void {
     this.log('OPSIS Agent Service Stopping...');
-
-    // Kill GUI before stopping IPC
-    if (this.guiLauncher) {
-      this.guiLauncher.killGui();
-    }
 
     if (this.selfServiceServer) {
       this.selfServiceServer.stop();
@@ -1560,7 +1526,9 @@ class OPSISAgentService {
           agent_version: '1.0.0',
           os: `${os.platform()} ${os.release()}`,
           timestamp: new Date().toISOString(),
-          system_info: systemInfo
+          system_info: systemInfo,
+          capability_mode: this.capabilityMode,
+          deployment_health: this.compatibilityReport
         }));
 
         // Send pending reboot_completed notification if resuming after reboot
@@ -1685,7 +1653,8 @@ class OPSISAgentService {
         disk_percent: diskStats.usedPercent,
         disk_free_gb: diskStats.freeGB,
         active_issues: ticketStats.openTickets,
-        process_count: processCount
+        process_count: processCount,
+        capability_mode: this.capabilityMode
       }));
     } catch (error) {
       this.logger.error('Failed to send telemetry heartbeat', error);
@@ -1792,6 +1761,10 @@ class OPSISAgentService {
 
         case 'config-update':
           this.updateConfig(data.config);
+          // Handle protected applications list from server
+          if (data.protected_applications) {
+            this.saveProtectedApplications(data.protected_applications);
+          }
           break;
 
         case 'session_expired':
@@ -3210,6 +3183,11 @@ class OPSISAgentService {
     if (sc?.flap_detection) {
       this.stateTracker.updateFlapConfig(sc.flap_detection);
     }
+
+    // Apply protected applications list from server (pushed on registration)
+    if (data.protected_applications) {
+      this.saveProtectedApplications(data.protected_applications);
+    }
   }
 
   // ============================================
@@ -3413,22 +3391,41 @@ class OPSISAgentService {
     const playbook = this.createPlaybookForSystemSignal(signal);
     
     if (playbook && signature.confidence_local >= 85) {
-      // High confidence - execute locally
-      const diagSummary = `${signal.category} issue detected: ${signal.metric || signal.id}\nConfidence: ${signature.confidence_local}% | Severity: ${signature.severity}`;
-      const recAction = `Running playbook "${playbook.name}" (${playbook.steps.length} step${playbook.steps.length !== 1 ? 's' : ''})`;
-      const ticketId = this.actionTicketManager.createActionTicket(
-        signature.signature_id,
-        playbook.id,
-        `System remediation: ${playbook.name}`,
-        playbook.steps.length,
-        diagSummary,
-        recAction
-      );
+      // Capability mode gate: monitor-only and limited modes cannot auto-execute
+      if (this.capabilityMode === 'monitor-only' || this.capabilityMode === 'limited') {
+        this.logger.info(`Capability mode '${this.capabilityMode}' — escalating instead of auto-executing`, {
+          playbook_name: playbook.name,
+          signature_id: signature.signature_id
+        });
+        this.escalateSystemIssueToServer(signature, playbook);
 
-      this.activeTickets.set(playbook.id, ticketId);
-      this.actionTicketManager.markInProgress(ticketId, playbook.id);
-      this.receivePlaybook(playbook, 'local');
-      
+      } else if (this.isTargetProtectedApp(signal)) {
+        // Protected application gate: always escalate, never auto-remediate
+        this.logger.info('Target is a protected application — escalating instead of auto-executing', {
+          playbook_name: playbook.name,
+          signal_id: signal.id,
+          metadata: signal.metadata
+        });
+        this.escalateSystemIssueToServer(signature, playbook);
+
+      } else {
+        // High confidence + full mode - execute locally
+        const diagSummary = `${signal.category} issue detected: ${signal.metric || signal.id}\nConfidence: ${signature.confidence_local}% | Severity: ${signature.severity}`;
+        const recAction = `Running playbook "${playbook.name}" (${playbook.steps.length} step${playbook.steps.length !== 1 ? 's' : ''})`;
+        const ticketId = this.actionTicketManager.createActionTicket(
+          signature.signature_id,
+          playbook.id,
+          `System remediation: ${playbook.name}`,
+          playbook.steps.length,
+          diagSummary,
+          recAction
+        );
+
+        this.activeTickets.set(playbook.id, ticketId);
+        this.actionTicketManager.markInProgress(ticketId, playbook.id);
+        this.receivePlaybook(playbook, 'local');
+      }
+
     } else if (playbook) {
       // Low confidence - escalate
       this.escalateSystemIssueToServer(signature, playbook);
@@ -3446,6 +3443,16 @@ class OPSISAgentService {
 
   // NEW METHOD: Execute Local Remediation (Class A)
   private executeLocalRemediation(signature: DeviceSignature, runbook: RunbookMatch): void {
+    // Capability mode gate
+    if (this.capabilityMode === 'monitor-only' || this.capabilityMode === 'limited') {
+      this.logger.info(`Capability mode '${this.capabilityMode}' — escalating Class A to server`, {
+        signature_id: signature.signature_id,
+        runbook_id: runbook.runbookId
+      });
+      this.escalateToServer(signature, runbook);
+      return;
+    }
+
     this.logger.info('Executing local Class A remediation', {
       signature_id: signature.signature_id,
       runbook_id: runbook.runbookId,
@@ -3633,6 +3640,16 @@ class OPSISAgentService {
       this.recentActions,
       diagnosticData
     );
+
+    // Attach baseline comparison if available
+    const symptomDetails = signature.symptoms[0]?.details || {};
+    const baselineDiff = this.baselineManager.getBaselineDiff({
+      cpu: symptomDetails.metric === 'cpu_usage' ? symptomDetails.value : undefined,
+      memory: symptomDetails.metric === 'memory_usage' ? symptomDetails.value : undefined
+    });
+    if (baselineDiff) {
+      (escalationPayload as any).baseline_comparison = baselineDiff;
+    }
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({
@@ -4275,10 +4292,16 @@ class OPSISAgentService {
       throw new Error(`Invalid service name: ${serviceName}`);
     }
 
-    // Block actions on protected services
+    // Block actions on protected services (OS-critical)
     if (isProtectedService(serviceName) && (action === 'stop' || action === 'restart')) {
       this.logger.error('Blocked action on protected service', { serviceName, action });
       throw new Error(`Cannot ${action} protected service: ${serviceName}`);
+    }
+
+    // Block actions on client-protected applications
+    if (this.isProtectedAppByName(serviceName) && (action === 'stop' || action === 'restart')) {
+      this.logger.error('Blocked action on client-protected application', { serviceName, action });
+      throw new Error(`Cannot ${action} client-protected application: ${serviceName} — requires manual approval`);
     }
 
     if (action === 'restart') {
@@ -4842,6 +4865,85 @@ class OPSISAgentService {
   }
 
   // ============================================
+  // PROTECTED APPLICATIONS
+  // ============================================
+
+  /**
+   * Check if a signal targets a protected application.
+   * Protected apps are never auto-remediated — always escalated with diagnostics.
+   */
+  private isTargetProtectedApp(signal: SystemSignal): boolean {
+    if (this.protectedApplications.length === 0) return false;
+
+    const serviceName = signal.metadata?.serviceName?.toLowerCase();
+    const processName = signal.metadata?.processName?.toLowerCase();
+
+    return this.protectedApplications.some(app => {
+      if (app.service_name && serviceName && app.service_name.toLowerCase() === serviceName) return true;
+      if (app.process_name && processName && app.process_name.toLowerCase() === processName) return true;
+      return false;
+    });
+  }
+
+  /**
+   * Check if a process or service name is in the protected applications list.
+   */
+  private isProtectedAppByName(name: string): boolean {
+    if (!name || this.protectedApplications.length === 0) return false;
+    const lower = name.toLowerCase();
+    return this.protectedApplications.some(app =>
+      (app.service_name && app.service_name.toLowerCase() === lower) ||
+      (app.process_name && app.process_name.toLowerCase() === lower)
+    );
+  }
+
+  /**
+   * Load protected applications from local config file.
+   * These are synced from the server via config-update messages.
+   */
+  private loadProtectedApplications(): void {
+    try {
+      const protectedPath = path.join(this.baseDir, 'config', 'protected-applications.json');
+      if (fs.existsSync(protectedPath)) {
+        const data = JSON.parse(fs.readFileSync(protectedPath, 'utf8'));
+        this.protectedApplications = data.applications || [];
+        this.logger.info('Loaded protected applications', { count: this.protectedApplications.length });
+      }
+    } catch (error) {
+      this.logger.warn('Failed to load protected applications', { error: String(error) });
+    }
+  }
+
+  /**
+   * Save protected applications to local config and merge into exclusions.
+   */
+  private saveProtectedApplications(applications: Array<{ process_name?: string; service_name?: string; display_name: string }>): void {
+    this.protectedApplications = applications;
+
+    try {
+      const configDir = path.join(this.baseDir, 'config');
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      fs.writeFileSync(
+        path.join(configDir, 'protected-applications.json'),
+        JSON.stringify({ applications, updated_at: new Date().toISOString() }, null, 2),
+        'utf8'
+      );
+
+      // Also merge into exclusions.json for backward compatibility
+      for (const app of applications) {
+        if (app.service_name) this.addToExclusionList(app.service_name, 'services');
+        if (app.process_name) this.addToExclusionList(app.process_name, 'processes');
+      }
+
+      this.logger.info('Protected applications saved', { count: applications.length });
+    } catch (error) {
+      this.logger.error('Failed to save protected applications', error);
+    }
+  }
+
+  // ============================================
   // REBOOT PLAYBOOK STATE PERSISTENCE
   // ============================================
 
@@ -4938,6 +5040,22 @@ class OPSISAgentService {
       if (state.playbook.signalId) (playbook as any).signalId = state.playbook.signalId;
       if (state.playbook.signatureId) (playbook as any).signatureId = state.playbook.signatureId;
 
+      // Validate that the original issue still exists before resuming
+      const issueStillPresent = await this.isOriginalIssueStillPresent(state);
+      if (!issueStillPresent) {
+        this.logger.info('Original issue resolved after reboot, skipping playbook resume', {
+          playbook_id: playbook.id,
+          playbook_name: playbook.name,
+          signal_id: state.playbook.signalId
+        });
+        this.reportPlaybookResult(playbook.id, 'success');
+        this.sendPlaybookResult(playbook, 'success', 0);
+        const signalId = (playbook as any).signalId || playbook.id;
+        this.remediationMemory.recordAttempt(playbook.id, signalId, os.hostname(), 'success', 0);
+        this.clearRebootPlaybookState();
+        return;
+      }
+
       // Execute remaining steps
       const startTime = Date.now();
       const signalId = (playbook as any).signalId || playbook.id;
@@ -4988,6 +5106,100 @@ class OPSISAgentService {
     } catch (error) {
       this.logger.error('Failed to clear reboot playbook state', error);
     }
+  }
+
+  /**
+   * Check whether the original issue that triggered a playbook still exists after reboot.
+   * Returns true if the issue is still present (or if we can't determine), false if resolved.
+   * Fail-open: on any error or timeout, returns true to allow resume.
+   */
+  private async isOriginalIssueStillPresent(state: any): Promise<boolean> {
+    const signalId: string = state.playbook.signalId || '';
+    const playbookName: string = state.playbook.name || '';
+
+    // Playbooks that should always resume (verification/cleanup after reboot)
+    const alwaysResumePatterns = ['reboot-verification', 'disk-cleanup', 'diagnostic', 'verify'];
+    if (alwaysResumePatterns.some(p => playbookName.toLowerCase().includes(p))) {
+      return true;
+    }
+
+    try {
+      // Service signals — check if the service is still stopped
+      if (signalId.includes('service') || playbookName.toLowerCase().includes('service')) {
+        const serviceName = state.playbook.steps?.[0]?.parameters?.serviceName
+          || state.playbook.signalId?.replace(/^service[-_]stopped[-_]/i, '');
+        if (serviceName) {
+          const { stdout } = await execAsync(
+            `powershell -Command "(Get-Service -Name '${serviceName.replace(/'/g, "''")}' -ErrorAction SilentlyContinue).Status"`,
+            { timeout: 10000 }
+          );
+          const status = stdout.trim().toLowerCase();
+          if (status === 'running') {
+            this.logger.info('Service is already running after reboot, issue resolved', { serviceName, status });
+            return false;
+          }
+        }
+      }
+
+      // CPU signals — check if CPU is still breaching
+      if (signalId.includes('cpu') || playbookName.toLowerCase().includes('cpu')) {
+        const { stdout } = await execAsync(
+          'powershell -Command "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average"',
+          { timeout: 10000 }
+        );
+        const cpuUsage = parseFloat(stdout.trim());
+        if (!isNaN(cpuUsage) && cpuUsage < 75) {
+          this.logger.info('CPU usage normal after reboot, issue resolved', { cpuUsage });
+          return false;
+        }
+      }
+
+      // Memory signals — check if memory is still breaching
+      if (signalId.includes('memory') || playbookName.toLowerCase().includes('memory')) {
+        const { stdout } = await execAsync(
+          'powershell -Command "$os = Get-CimInstance Win32_OperatingSystem; [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize * 100, 1)"',
+          { timeout: 10000 }
+        );
+        const memUsage = parseFloat(stdout.trim());
+        if (!isNaN(memUsage) && memUsage < 80) {
+          this.logger.info('Memory usage normal after reboot, issue resolved', { memUsage });
+          return false;
+        }
+      }
+
+      // Network signals — check basic connectivity
+      if (signalId.includes('network') || signalId.includes('dns') || playbookName.toLowerCase().includes('network')) {
+        const { stdout } = await execAsync(
+          'powershell -Command "Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet"',
+          { timeout: 10000 }
+        );
+        if (stdout.trim().toLowerCase() === 'true') {
+          this.logger.info('Network connectivity restored after reboot, issue resolved');
+          return false;
+        }
+      }
+
+      // Disk signals — check if free space is still low
+      if (signalId.includes('disk') && !signalId.includes('health')) {
+        const { stdout } = await execAsync(
+          'powershell -Command "$d = Get-PSDrive C; [math]::Round($d.Free / ($d.Used + $d.Free) * 100, 1)"',
+          { timeout: 10000 }
+        );
+        const freePercent = parseFloat(stdout.trim());
+        if (!isNaN(freePercent) && freePercent > 20) {
+          this.logger.info('Disk space adequate after reboot, issue resolved', { freePercent });
+          return false;
+        }
+      }
+
+    } catch (error) {
+      // Fail-open: if we can't check, assume issue still exists and resume
+      this.logger.warn('Pre-resume validation failed, proceeding with resume', { error: String(error) });
+      return true;
+    }
+
+    // Default: assume issue still exists
+    return true;
   }
 
   // ============================================
