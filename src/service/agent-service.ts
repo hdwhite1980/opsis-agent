@@ -645,6 +645,11 @@ class OPSISAgentService {
         this.broadcastTicketUpdate();
         return { type: 'clear-old-tickets-result', data: count };
       }
+      case 'clear-all-tickets': {
+        const count = this.ticketDb.deleteAllTickets();
+        this.broadcastTicketUpdate();
+        return { type: 'clear-all-tickets-result', data: { deleted: count } };
+      }
       case 'user-prompt-response': {
         const { promptId, response } = data;
         const pending = this.pendingPrompts.get(promptId);
@@ -727,7 +732,10 @@ class OPSISAgentService {
             type: 'manual-investigation',
             description: `[${data.category}] ${data.description} (Server: ${data.serverName}, Priority: ${data.priority})`,
             status: 'open' as const, source: 'manual' as const,
-            computer_name: data.serverName || os.hostname(), escalated: 1
+            computer_name: data.serverName || os.hostname(), escalated: 1,
+            diagnostic_summary: `User-reported issue: ${data.category}\n${data.description}`,
+            recommended_action: 'Submitted for manual investigation',
+            resolution_category: 'escalated' as const
           };
           this.ticketDb.createTicket(ticket);
           this.ticketDb.markAsEscalated(ticketId);
@@ -2360,7 +2368,10 @@ class OPSISAgentService {
       signature_id: signatureId,
       runbook_id: runbook?.runbookId,
       runbook_name: runbook?.name,
-      server_message: serverMessage
+      server_message: serverMessage,
+      diagnostic_summary: `Signal: ${signatureId}\nServer message: ${serverMessage || 'Creating ticket for review'}`,
+      recommended_action: runbook ? `Awaiting technician approval to run "${runbook.name}"` : 'Awaiting technician review',
+      resolution_category: 'pending'
     });
 
     this.logger.info('Created pending action awaiting technician review', {
@@ -3403,13 +3414,17 @@ class OPSISAgentService {
     
     if (playbook && signature.confidence_local >= 85) {
       // High confidence - execute locally
+      const diagSummary = `${signal.category} issue detected: ${signal.metric || signal.id}\nConfidence: ${signature.confidence_local}% | Severity: ${signature.severity}`;
+      const recAction = `Running playbook "${playbook.name}" (${playbook.steps.length} step${playbook.steps.length !== 1 ? 's' : ''})`;
       const ticketId = this.actionTicketManager.createActionTicket(
         signature.signature_id,
         playbook.id,
         `System remediation: ${playbook.name}`,
-        playbook.steps.length
+        playbook.steps.length,
+        diagSummary,
+        recAction
       );
-      
+
       this.activeTickets.set(playbook.id, ticketId);
       this.actionTicketManager.markInProgress(ticketId, playbook.id);
       this.receivePlaybook(playbook, 'local');
@@ -3438,11 +3453,15 @@ class OPSISAgentService {
     });
 
     // Create action ticket with signature_id stored
+    const diagSummary = `Signature ${signature.signature_id} detected\nConfidence: ${signature.confidence_local}% | Severity: ${signature.severity}\nClass A remediation triggered`;
+    const recAction = `Running playbook "${runbook.name}" (${runbook.steps.length} step${runbook.steps.length !== 1 ? 's' : ''})`;
     const ticketId = this.actionTicketManager.createActionTicket(
       signature.signature_id,
       runbook.runbookId,
       `Auto-remediation: ${runbook.name}`,
-      runbook.steps.length
+      runbook.steps.length,
+      diagSummary,
+      recAction
     );
 
     // Store signature in pending escalations for potential failure escalation
@@ -3696,6 +3715,9 @@ class OPSISAgentService {
       `${s.type}:${s.severity}`
     ).join(', ')} affecting ${signature.targets.map(t => t.name).join(', ')}`;
     
+    const symptoms = signature.symptoms.map(s => `${s.type}: ${s.severity}`).join(', ');
+    const targets = signature.targets.map(t => t.name).join(', ');
+
     const ticket: Ticket = {
       ticket_id: ticketId,
       timestamp: new Date().toISOString(),
@@ -3704,15 +3726,18 @@ class OPSISAgentService {
       status: 'open',
       source: 'monitoring',
       computer_name: os.hostname(),
-      escalated: 1
+      escalated: 1,
+      diagnostic_summary: `Detected symptoms: ${symptoms}\nAffected targets: ${targets}\nConfidence: ${signature.confidence_local}%`,
+      recommended_action: 'Manual review required — no automated remediation available',
+      resolution_category: 'escalated'
     };
 
     this.ticketDb.createTicket(ticket);
     this.ticketDb.markAsEscalated(ticketId);
-    
-    this.logger.info('Manual ticket created', { 
-      ticketId, 
-      signature_id: signature.signature_id 
+
+    this.logger.info('Manual ticket created', {
+      ticketId,
+      signature_id: signature.signature_id
     });
     
     this.broadcastTicketUpdate();
@@ -3832,7 +3857,10 @@ class OPSISAgentService {
       computer_name: os.hostname(),
       event_id: event.id,
       event_source: event.source,
-      escalated: 1
+      escalated: 1,
+      diagnostic_summary: `Event ID ${event.id} from ${event.source}\n${event.message}`,
+      recommended_action: `Escalated to server — ${reason}`,
+      resolution_category: 'escalated'
     };
 
     try {
@@ -4308,26 +4336,32 @@ class OPSISAgentService {
           this.ticketDb.closeTicket(
             ticketId,
             `Auto-resolved by playbook: ${playbookId}`,
-            'success'
+            'success',
+            'fixed'
           );
           this.logger.info('Ticket auto-resolved', { ticketId, playbookId });
         } else {
           // ADDED: Escalate failed Class A remediations to server
-          this.logger.warn('Class A remediation failed - escalating to server', { 
-            ticketId, 
+          this.logger.warn('Class A remediation failed - escalating to server', {
+            ticketId,
             playbookId,
             error: error?.toString()
           });
-          
+
           // Escalate the failed remediation
           this.escalateFailedRemediation(ticketId, playbookId, error);
-          
+
+          // Check if this is a safety validation block
+          const errorStr = error?.toString() || '';
+          const isProtected = errorStr.includes('Safety validation') || errorStr.includes('protected service');
+
           // Still mark ticket as failed locally
           this.ticketDb.updateTicketStatus(ticketId, 'failed');
           this.ticketDb.closeTicket(
             ticketId,
-            `Playbook failed: ${error?.toString() || 'Unknown error'}`,
-            'failure'
+            `Playbook failed: ${errorStr || 'Unknown error'}`,
+            'failure',
+            isProtected ? 'protected' : 'escalated'
           );
           this.logger.error('Ticket marked as failed', { ticketId, playbookId, error });
         }

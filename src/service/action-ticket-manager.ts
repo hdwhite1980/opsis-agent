@@ -31,11 +31,13 @@ export class ActionTicketManager {
     signatureId: string,
     playbookId: string,
     description: string,
-    totalSteps: number
+    totalSteps: number,
+    diagnosticSummary?: string,
+    recommendedAction?: string
   ): string {
     // SECURITY: Use cryptographically secure random ID
     const ticketId = `action-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
-    
+
     const ticket: ActionTicket = {
       ticket_id: ticketId,
       timestamp: new Date().toISOString(),
@@ -49,7 +51,9 @@ export class ActionTicketManager {
       playbook_id: playbookId,
       signature_id: signatureId,
       steps_completed: 0,
-      steps_total: totalSteps
+      steps_total: totalSteps,
+      diagnostic_summary: diagnosticSummary,
+      recommended_action: recommendedAction
     };
     
     this.ticketDb.createTicket(ticket);

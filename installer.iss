@@ -91,19 +91,21 @@ Name: "{autodesktop}\OPSIS Control Panel"; Filename: "http://localhost:19851"; I
 ; 1. Set PowerShell execution policy (required for agent monitoring commands)
 Filename: "powershell.exe"; Parameters: "-Command ""Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force"""; StatusMsg: "Configuring PowerShell execution policy..."; Flags: runhidden waituntilterminated shellexec
 
-; 2. Add Defender exclusions for install directory and service exe
-Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe'"""; StatusMsg: "Adding Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
+; 2. Add Defender exclusions for install directory, service exe, and WinSW wrapper
+Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe'; Add-MpPreference -ExclusionProcess '{app}\service\OpsisAgentService.exe'"""; StatusMsg: "Adding Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
 
-; 3. Lock down NTFS permissions: SYSTEM + Administrators full control, Users read+execute only
-Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'BUILTIN\Users:(OI)(CI)RX' /T /Q"""; StatusMsg: "Setting directory permissions..."; Flags: runhidden waituntilterminated shellexec
+; 3. Lock down sensitive directories only (data, logs, certs)
+; The main {app} directory inherits default Program Files permissions which are already secure
+; (Administrators: Full, Users: Read+Execute). Stripping inheritance on {app} was causing
+; permission issues with the uninstaller and service wrapper.
 
-; 4. Lock down data directory: SYSTEM + Administrators only (contains API key, tickets)
+; 3a. Lock down data directory: SYSTEM + Administrators only (contains API key, tickets)
 Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\data'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing data directory..."; Flags: runhidden waituntilterminated shellexec
 
-; 5. Lock down logs directory: SYSTEM + Administrators only
+; 3b. Lock down logs directory: SYSTEM + Administrators only
 Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\logs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing logs directory..."; Flags: runhidden waituntilterminated shellexec
 
-; 6. Lock down certs directory: SYSTEM + Administrators only
+; 3c. Lock down certs directory: SYSTEM + Administrators only
 Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\certs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing certificate directory..."; Flags: runhidden waituntilterminated shellexec
 
 ; 7. Register Windows Event Log source for OPSIS
@@ -133,7 +135,7 @@ Filename: "powershell.exe"; Parameters: "-Command ""cmdkey /delete:OPSISAgent_Ap
 ; Remove OPSIS registry keys
 Filename: "powershell.exe"; Parameters: "-Command ""Remove-Item -Path 'HKLM:\SOFTWARE\OPSIS' -Recurse -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanRegistry"
 ; Remove Defender exclusions
-Filename: "powershell.exe"; Parameters: "-Command ""Remove-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanDefender"
+Filename: "powershell.exe"; Parameters: "-Command ""Remove-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess '{app}\service\OpsisAgentService.exe' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanDefender"
 ; Remove Event Log source
 Filename: "powershell.exe"; Parameters: "-Command ""Remove-EventLog -Source 'OPSIS Agent' -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanEventLog"
 
@@ -147,6 +149,32 @@ var
 function InitializeSetup(): Boolean;
 begin
   Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  ServiceExe: string;
+begin
+  Result := '';
+  NeedsRestart := False;
+  ServiceExe := ExpandConstant('{app}\service\OpsisAgentService.exe');
+
+  // If OpsisAgentService.exe exists from a previous install, stop and uninstall it first
+  if FileExists(ServiceExe) then
+  begin
+    // Stop the service (ignore errors if already stopped)
+    Exec(ServiceExe, 'stop', ExpandConstant('{app}\service'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Small delay to let the process release
+    Sleep(2000);
+    // Uninstall the service
+    Exec(ServiceExe, 'uninstall', ExpandConstant('{app}\service'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(1000);
+  end;
+
+  // Also kill any lingering opsis-agent-service.exe process
+  Exec('taskkill.exe', '/F /IM opsis-agent-service.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(500);
 end;
 
 procedure InitializeWizard;
@@ -234,8 +262,25 @@ begin
 end;
 
 function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
 begin
   Result := True;
+
+  // If not running elevated, re-launch the uninstaller with admin rights
+  if not IsAdmin then
+  begin
+    if ShellExec('runas', ExpandConstant('{uninstallexe}'), '', '', SW_SHOWNORMAL, ewNoWait, ResultCode) then
+    begin
+      // Elevated instance launched — close this non-elevated one
+      Result := False;
+    end
+    else
+    begin
+      MsgBox('Administrator privileges are required to uninstall OPSIS Agent. Please right-click and select "Run as administrator".', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

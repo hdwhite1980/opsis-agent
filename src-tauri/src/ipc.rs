@@ -160,6 +160,37 @@ pub fn clear_old_tickets() -> i64 {
     (original_count - new_count) as i64
 }
 
+// ---------- Clear ALL tickets ----------
+
+#[tauri::command]
+pub fn clear_all_tickets() -> serde_json::Value {
+    let path = get_data_dir().join("tickets.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return serde_json::json!({"deleted": 0}),
+    };
+
+    let mut data: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(d) => d,
+        Err(_) => return serde_json::json!({"deleted": 0}),
+    };
+
+    let count = if let Some(tickets) = data.get_mut("tickets").and_then(|t| t.as_array_mut()) {
+        let len = tickets.len();
+        tickets.clear();
+        len
+    } else {
+        0
+    };
+
+    // Write back
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(&path, json);
+    }
+
+    serde_json::json!({"deleted": count as i64})
+}
+
 // ---------- Submit manual ticket ----------
 
 #[derive(Deserialize)]

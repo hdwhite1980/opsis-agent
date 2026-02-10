@@ -26,6 +26,10 @@ export interface Ticket {
   signature_id?: string;
   runbook_name?: string;
   server_message?: string;
+  // Diagnostic and resolution detail fields
+  diagnostic_summary?: string;
+  recommended_action?: string;
+  resolution_category?: 'fixed' | 'ignored' | 'protected' | 'escalated' | 'pending';
 }
 
 export class TicketDatabase {
@@ -186,9 +190,10 @@ export class TicketDatabase {
   }
 
   public closeTicket(
-    ticketId: string, 
-    resolution: string, 
-    result: 'success' | 'failure'
+    ticketId: string,
+    resolution: string,
+    result: 'success' | 'failure',
+    resolutionCategory?: 'fixed' | 'ignored' | 'protected' | 'escalated' | 'pending'
   ): void {
     try {
       const ticket = this.tickets.find(t => t.ticket_id === ticketId);
@@ -197,6 +202,9 @@ export class TicketDatabase {
         ticket.resolution_method = resolution;
         ticket.result = result;
         ticket.resolved_at = new Date().toISOString();
+        if (resolutionCategory) {
+          ticket.resolution_category = resolutionCategory;
+        }
         
         this.save();
 
@@ -222,6 +230,20 @@ export class TicketDatabase {
       }
     } catch (error) {
       this.logger.error('Error marking ticket as escalated', error);
+    }
+  }
+
+  public deleteAllTickets(): number {
+    try {
+      const count = this.tickets.length;
+      this.tickets = [];
+      this.nextId = 1;
+      this.save();
+      this.logger.info('All tickets deleted', { count });
+      return count;
+    } catch (error) {
+      this.logger.error('Error deleting all tickets', error);
+      return 0;
     }
   }
 

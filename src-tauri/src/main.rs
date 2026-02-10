@@ -103,6 +103,7 @@ fn main() {
             ipc::get_stats,
             ipc::get_tickets,
             ipc::clear_old_tickets,
+            ipc::clear_all_tickets,
             ipc::submit_manual_ticket,
             ipc::update_settings,
             ipc::get_settings,

@@ -364,6 +364,90 @@
             color: #ef4444;
         }
 
+        .status-protected {
+            background: rgba(96, 165, 250, 0.2);
+            color: #60a5fa;
+        }
+
+        .status-failed {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+
+        /* Ticket Detail Panel */
+        .ticket-item { cursor: pointer; }
+
+        .ticket-detail {
+            display: none;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #333;
+        }
+
+        .ticket-detail.expanded { display: block; }
+
+        .detail-section {
+            margin-bottom: 12px;
+        }
+
+        .detail-label {
+            font-size: 9px;
+            font-weight: 700;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .detail-content {
+            font-size: 12px;
+            color: #ccc;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .detail-meta {
+            font-size: 10px;
+            color: #555;
+            margin-top: 8px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .detail-meta span { display: inline-flex; align-items: center; gap: 4px; }
+
+        .resolution-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+
+        .resolution-fixed { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+        .resolution-ignored { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+        .resolution-protected { background: rgba(96, 165, 250, 0.2); color: #60a5fa; }
+        .resolution-escalated { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .resolution-pending { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            padding: 6px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.25);
+        }
+
         /* System Health */
         .health-item {
             display: flex;
@@ -1167,6 +1251,7 @@
                             <div class="panel-header">
                                 <div class="panel-title">Recent Activity</div>
                                 <button class="btn-secondary" onclick="clearOldTickets()">Clear Old</button>
+                                <button class="btn-danger" onclick="clearAllTickets()">Clear All</button>
                             </div>
                             <div class="panel-body">
                                 <div class="tickets-list" id="dashboardTickets">
@@ -1265,7 +1350,10 @@
                     <div class="panel">
                         <div class="panel-header">
                             <div class="panel-title">All Tickets (Grouped)</div>
-                            <button class="btn-secondary" onclick="refreshData()">Refresh</button>
+                            <div style="display:flex;gap:8px;">
+                                <button class="btn-secondary" onclick="refreshData()">Refresh</button>
+                                <button class="btn-danger" onclick="clearAllTickets()">Clear All</button>
+                            </div>
                         </div>
                         <div class="panel-body">
                             <div class="tickets-list" id="allTickets">
@@ -1880,6 +1968,117 @@
             }
         }
 
+        function getResolutionCategory(ticket) {
+            if (ticket.resolution_category) return ticket.resolution_category;
+            // Derive from existing fields for backward compatibility
+            const rm = ticket.resolution_method || '';
+            if (rm.includes('Safety validation') || rm.includes('protected service')) return 'protected';
+            if (ticket.result === 'success') return 'fixed';
+            if (ticket.result === 'failure') return 'escalated';
+            if (ticket.escalated === 1 && ticket.status === 'open') return 'escalated';
+            if (ticket.status === 'pending-review') return 'pending';
+            return 'pending';
+        }
+
+        function getResolutionLabel(cat) {
+            const labels = { fixed: 'Fixed', ignored: 'Ignored', protected: 'Protected', escalated: 'Escalated', pending: 'Pending' };
+            return labels[cat] || 'Open';
+        }
+
+        function formatTimestamp(ts) {
+            const d = new Date(ts);
+            return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' +
+                   String(d.getDate()).padStart(2,'0') + ' ' +
+                   String(d.getHours()).padStart(2,'0') + ':' +
+                   String(d.getMinutes()).padStart(2,'0') + ':' +
+                   String(d.getSeconds()).padStart(2,'0');
+        }
+
+        function escapeHtml(str) {
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        function toggleTicketDetail(detailId) {
+            const el = document.getElementById(detailId);
+            if (el) el.classList.toggle('expanded');
+        }
+
+        function buildTicketDetail(ticket, gid) {
+            const resCat = getResolutionCategory(ticket);
+            const resLabel = getResolutionLabel(resCat);
+
+            // Diagnostic section
+            let diagContent = '';
+            if (ticket.diagnostic_summary) {
+                diagContent = escapeHtml(ticket.diagnostic_summary);
+            } else {
+                // Fallback: show full description + event info
+                let parts = [];
+                if (ticket.event_id && ticket.event_source) {
+                    parts.push('Event ID ' + ticket.event_id + ' from ' + ticket.event_source);
+                }
+                parts.push(ticket.description || 'No details available');
+                diagContent = escapeHtml(parts.join('\n'));
+            }
+
+            // Action section
+            let actionContent = '';
+            if (ticket.recommended_action) {
+                actionContent = escapeHtml(ticket.recommended_action);
+            } else if (ticket.playbook_id || ticket.runbook_id) {
+                const pbId = ticket.playbook_id || ticket.runbook_id;
+                const steps = ticket.steps_total ? ' (' + ticket.steps_total + ' steps)' : '';
+                actionContent = 'Ran playbook ' + escapeHtml(pbId) + steps;
+            } else if (ticket.escalated) {
+                actionContent = 'Escalated for manual review';
+            } else {
+                actionContent = 'No automated action taken';
+            }
+
+            // Resolution section
+            let resContent = '';
+            if (ticket.resolution_method) {
+                resContent = escapeHtml(ticket.resolution_method);
+            } else if (resCat === 'escalated') {
+                resContent = 'Awaiting technician review';
+            } else if (resCat === 'pending') {
+                resContent = 'Awaiting approval';
+            } else {
+                resContent = 'In progress';
+            }
+
+            // Time info
+            let resolvedInfo = '';
+            if (ticket.resolved_at) {
+                resolvedInfo = 'Resolved: ' + formatTimestamp(ticket.resolved_at);
+                if (ticket.resolution_time_seconds) {
+                    resolvedInfo += ' (' + ticket.resolution_time_seconds + 's)';
+                }
+            }
+
+            return `
+                <div class="ticket-detail" id="detail-${gid}">
+                    <div class="detail-section">
+                        <div class="detail-label">Diagnostic</div>
+                        <div class="detail-content">${diagContent}</div>
+                    </div>
+                    <div class="detail-section">
+                        <div class="detail-label">Action Taken</div>
+                        <div class="detail-content">${actionContent}</div>
+                    </div>
+                    <div class="detail-section">
+                        <div class="detail-label">Resolution <span class="resolution-badge resolution-${resCat}">${resLabel}</span></div>
+                        <div class="detail-content">${resContent}</div>
+                    </div>
+                    <div class="detail-meta">
+                        <span>ID: ${ticket.ticket_id}</span>
+                        <span>Created: ${formatTimestamp(ticket.timestamp || ticket.created_at)}</span>
+                        ${resolvedInfo ? '<span>' + resolvedInfo + '</span>' : ''}
+                        ${ticket.signature_id ? '<span>Sig: ' + ticket.signature_id + '</span>' : ''}
+                    </div>
+                </div>`;
+        }
+
         function renderTicketGroups(containerId, groups) {
             const container = document.getElementById(containerId);
 
@@ -1899,13 +2098,12 @@
 
             container.innerHTML = groups.map((group, gi) => {
                 const ticket = group.latest;
-                const status = ticket.result === 'success' ? 'success' :
-                              ticket.status === 'resolved' ? 'success' :
-                              ticket.escalated ? 'escalated' : 'pending';
-                const statusText = ticket.result === 'success' ? 'Resolved' :
-                                  ticket.status === 'resolved' ? 'Resolved' :
-                                  ticket.status === 'failed' ? 'Failed' :
-                                  ticket.escalated ? 'Escalated' : 'Open';
+                const resCat = getResolutionCategory(ticket);
+                const status = resCat === 'fixed' ? 'success' :
+                              resCat === 'protected' ? 'protected' :
+                              resCat === 'escalated' ? 'escalated' :
+                              resCat === 'pending' ? 'pending' : 'pending';
+                const statusText = getResolutionLabel(resCat);
                 const time = formatTimeAgo(ticket.timestamp || ticket.created_at);
                 const ticketType = formatTicketType(ticket.type || ticket.issue_type || 'unknown');
                 const desc = formatDescription(ticket.description || 'No description');
@@ -1916,13 +2114,8 @@
                 let occurrencesHtml = '';
                 if (group.count > 1) {
                     const occRows = group.tickets.map(t => {
-                        const ts = t.timestamp || t.created_at;
-                        const d = new Date(ts);
-                        const timeStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0') + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
-                        const s = t.result === 'success' ? 'Resolved' :
-                                  t.status === 'resolved' ? 'Resolved' :
-                                  t.status === 'failed' ? 'Failed' :
-                                  t.escalated ? 'Escalated' : 'Open';
+                        const timeStr = formatTimestamp(t.timestamp || t.created_at);
+                        const s = getResolutionLabel(getResolutionCategory(t));
                         return `<div class="occurrence-item"><span class="occ-time">${timeStr}</span><span class="occ-status">${s}</span></div>`;
                     }).join('');
                     occurrencesHtml = `
@@ -1932,11 +2125,13 @@
                         </div>`;
                 }
 
-                const expandBtn = group.count > 1 ? `<button class="expand-btn" id="btn-${gid}" onclick="toggleOccurrences('${gid}')">+</button>` : '<span style="display:inline-block;width:30px;"></span>';
+                const expandBtn = group.count > 1 ? `<button class="expand-btn" id="btn-${gid}" onclick="event.stopPropagation(); toggleOccurrences('${gid}')">+</button>` : '<span style="display:inline-block;width:30px;"></span>';
+
+                const detailHtml = buildTicketDetail(ticket, gid);
 
                 return `
                     <div class="ticket-group">
-                        <div class="ticket-item">
+                        <div class="ticket-item" onclick="toggleTicketDetail('detail-${gid}')">
                             <div class="ticket-header">
                                 <span class="ticket-type" style="display:flex;align-items:center;">
                                     ${expandBtn}${ticketType}${countBadge}${source}
@@ -1944,12 +2139,13 @@
                                 <span class="ticket-time">${time}</span>
                             </div>
                             <div class="ticket-description">${desc}</div>
-                            <div style="display:flex;align-items:center;gap:8px;">
+                            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                                 <span class="ticket-status status-${status}">${statusText}</span>
                                 ${ticket.computer_name ? '<span style="font-size:9px;color:#555;">' + ticket.computer_name + '</span>' : ''}
-                                ${ticket.runbook_id ? '<span style="font-size:9px;color:#1FB6A6;">' + ticket.runbook_id + '</span>' : ''}
+                                ${ticket.runbook_id || ticket.playbook_id ? '<span style="font-size:9px;color:#1FB6A6;">' + (ticket.runbook_id || ticket.playbook_id) + '</span>' : ''}
                             </div>
                             ${occurrencesHtml}
+                            ${detailHtml}
                         </div>
                     </div>`;
             }).join('');
@@ -2005,6 +2201,19 @@
                     refreshData();
                 } catch (e) {
                     console.error('Clear tickets error:', e);
+                }
+            }
+        }
+
+        async function clearAllTickets() {
+            if (confirm('Clear ALL tickets? This cannot be undone.')) {
+                try {
+                    const result = await invoke('clear_all_tickets');
+                    const count = result && result.deleted !== undefined ? result.deleted : result;
+                    alert(`Cleared ${count} tickets`);
+                    refreshData();
+                } catch (e) {
+                    console.error('Clear all tickets error:', e);
                 }
             }
         }
