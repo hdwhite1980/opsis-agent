@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import * as crypto from 'crypto';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import WebSocket from 'ws';
 import { getServiceLogger, Logger } from '../common/logger';
@@ -1864,6 +1864,22 @@ class OPSISAgentService {
           }
           break;
 
+        case 'baseline_capture':
+          this.handleBaselineCapture(data);
+          break;
+
+        case 'baseline_stored':
+          this.logger.info('Server confirmed baseline stored', {
+            status: data.status,
+            baseline_name: data.baseline_name,
+            summary: data.summary
+          });
+          this.broadcastToAllClients({
+            type: 'baseline-stored',
+            data: { status: data.status, baseline_name: data.baseline_name, summary: data.summary }
+          });
+          break;
+
         default:
           this.logger.warn('Unknown message type', { type: data.type, raw: JSON.stringify(data) });
       }
@@ -1921,6 +1937,165 @@ class OPSISAgentService {
     this.broadcastToAllClients({
       type: 'service-alert-resolved',
       data: { id: alertId }
+    });
+  }
+
+  /**
+   * Handle baseline_capture message from server.
+   * Writes the server-provided PowerShell script to a temp file,
+   * executes it, parses the JSON output, and sends baseline_result back.
+   */
+  private async handleBaselineCapture(message: any): Promise<void> {
+    this.logger.info('Baseline capture requested by server');
+
+    const script = message.script;
+    if (!script) {
+      this.logger.error('No capture script in baseline_capture message');
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'baseline_result',
+          status: 'error',
+          error: 'No capture script provided'
+        }));
+      }
+      return;
+    }
+
+    const scriptPath = path.join(os.tmpdir(), 'opsis_baseline_capture.ps1');
+
+    try {
+      // Write script to temp file
+      fs.writeFileSync(scriptPath, script, 'utf8');
+      this.logger.info('Baseline script written to temp file', { path: scriptPath });
+
+      // Notify control panel that capture is in progress
+      this.broadcastToAllClients({
+        type: 'baseline-progress',
+        data: { status: 'running', message: 'Capturing system baseline...' }
+      });
+
+      // Execute PowerShell with extended timeout (2 minutes)
+      const output = await this.runPowerShellScript(scriptPath, 120000);
+
+      // Clean up temp file
+      try { fs.unlinkSync(scriptPath); } catch (_) { /* ignore */ }
+
+      // Parse the JSON output — script outputs a single JSON blob
+      let baselineData: any;
+      try {
+        const lines = output.trim().split('\n');
+        let jsonLine = '';
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (line.startsWith('{')) {
+            jsonLine = line;
+            break;
+          }
+        }
+        if (!jsonLine) {
+          throw new Error('No JSON found in script output');
+        }
+        baselineData = JSON.parse(jsonLine);
+      } catch (parseErr: any) {
+        this.logger.error('Failed to parse baseline output', { error: parseErr.message });
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify({
+            type: 'baseline_result',
+            status: 'error',
+            error: `Parse failed: ${parseErr.message}`,
+            raw_output: output.substring(0, 2000)
+          }));
+        }
+        return;
+      }
+
+      const swCount = (baselineData.installed_software || []).length;
+      const prCount = (baselineData.printers || []).length;
+      const drCount = (baselineData.mapped_drives || []).length;
+      const svcCount = (baselineData.running_services || []).length;
+
+      this.logger.info('Baseline capture complete', {
+        software: swCount, printers: prCount, mapped_drives: drCount, services: svcCount
+      });
+
+      // Send results back to server
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'baseline_result',
+          status: 'success',
+          baseline_name: message.baseline_name || 'auto',
+          is_template: message.is_template || false,
+          template_name: message.template_name || null,
+          notes: message.notes || null,
+          data: baselineData
+        }));
+      }
+
+      // Notify control panel
+      this.broadcastToAllClients({
+        type: 'baseline-captured',
+        data: {
+          status: 'complete',
+          baseline_name: message.baseline_name,
+          summary: { software: swCount, printers: prCount, mapped_drives: drCount, services: svcCount }
+        }
+      });
+
+    } catch (err: any) {
+      this.logger.error('Baseline capture failed', { error: err.message });
+      try { fs.unlinkSync(scriptPath); } catch (_) { /* ignore */ }
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'baseline_result',
+          status: 'error',
+          error: err.message
+        }));
+      }
+
+      this.broadcastToAllClients({
+        type: 'baseline-captured',
+        data: { status: 'failed', error: err.message }
+      });
+    }
+  }
+
+  /**
+   * Run a PowerShell script file and return stdout.
+   */
+  private runPowerShellScript(scriptPath: string, timeoutMs: number = 120000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
+
+      const proc = spawn('powershell.exe', args, {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+      proc.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
+
+      const timer = setTimeout(() => {
+        proc.kill('SIGTERM');
+        reject(new Error(`Baseline script timed out after ${timeoutMs / 1000}s`));
+      }, timeoutMs);
+
+      proc.on('close', (code: number | null) => {
+        clearTimeout(timer);
+        if (code === 0 || stdout.includes('"system"')) {
+          resolve(stdout);
+        } else {
+          reject(new Error(`PowerShell exited with code ${code}: ${stderr.substring(0, 500)}`));
+        }
+      });
+
+      proc.on('error', (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
