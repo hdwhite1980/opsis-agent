@@ -7,6 +7,25 @@ import * as crypto from 'crypto';
 import { getHmacSecret } from './credential-manager';
 
 const HMAC_ALGORITHM = 'sha256';
+
+/**
+ * Recursively sort all object keys alphabetically.
+ * Matches Python's json.dumps(sort_keys=True) behavior.
+ * Arrays are preserved in order; only object keys are sorted.
+ */
+function sortKeysRecursive(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(sortKeysRecursive);
+  }
+  if (obj !== null && typeof obj === 'object') {
+    const sorted: Record<string, any> = {};
+    for (const key of Object.keys(obj).sort()) {
+      sorted[key] = sortKeysRecursive(obj[key]);
+    }
+    return sorted;
+  }
+  return obj;
+}
 const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000; // 5 minutes - replay protection
 
 // Track used nonces to prevent replay attacks
@@ -83,8 +102,8 @@ export async function verifyServerMessage(message: any): Promise<VerificationRes
   const payloadObj = { ...message };
   delete payloadObj._signature;
 
-  // Sort keys for consistent ordering
-  const sortedPayload = JSON.stringify(payloadObj, Object.keys(payloadObj).sort());
+  // Recursive key sort to match server's json.dumps(sort_keys=True)
+  const sortedPayload = JSON.stringify(sortKeysRecursive(payloadObj));
 
   // Compute expected signature
   const hmac = crypto.createHmac(HMAC_ALGORITHM, hmacSecret);
@@ -158,8 +177,8 @@ export async function signMessage(message: object): Promise<object | null> {
     _nonce: nonce
   };
 
-  // Sort keys for consistent ordering
-  const sortedPayload = JSON.stringify(payload, Object.keys(payload).sort());
+  // Recursive key sort to match server's json.dumps(sort_keys=True)
+  const sortedPayload = JSON.stringify(sortKeysRecursive(payload));
 
   // Compute signature
   const hmac = crypto.createHmac(HMAC_ALGORITHM, hmacSecret);

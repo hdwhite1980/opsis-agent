@@ -33,6 +33,7 @@ import { CompatibilityChecker, CompatibilityReport, CapabilityMode } from './com
 import {
   getApiKey,
   getHmacSecret,
+  storeHmacSecret,
   storeCredentialsFromSetup,
   verifyPlaybook,
   verifyDiagnosticRequest,
@@ -1695,7 +1696,7 @@ class OPSISAgentService {
   }
 
   // UPDATED: Handle server messages including decisions
-  private handleServerMessage(message: string): void {
+  private async handleServerMessage(message: string): Promise<void> {
     // SECURITY: Use safe JSON parsing
     const { parsed: data, error: parseError } = tryParseJSON(message);
     if (parseError || !data) {
@@ -1725,13 +1726,46 @@ class OPSISAgentService {
           this.handleServerDecision(data.data);
           break;
           
-        case 'playbook':
-          // Tag playbook with the most recent signature_id for cache linking
-          if (this.recentSignatureIds.length > 0 && data.playbook) {
-            data.playbook.signatureId = this.recentSignatureIds[0];
+        case 'playbook': {
+          // Server may send playbook nested under data.playbook or as the root object itself
+          const playbook = data.playbook || data;
+
+          // SECURITY: Verify HMAC signature BEFORE any mutation/normalization
+          if (playbook._signature) {
+            const verification = await verifyPlaybook(playbook);
+            if (!verification.valid) {
+              this.logger.error(`Playbook signature verification failed: ${verification.error}`, {
+                playbookId: playbook.playbook_id || playbook.id,
+                hasTimestamp: !!playbook._timestamp,
+                hasNonce: !!playbook._nonce
+              });
+              break; // Reject
+            }
+            this.logger.info('Playbook signature verified', { playbookId: playbook.playbook_id || playbook.id });
+          } else {
+            const hmacRequired = await isHmacConfigured();
+            if (hmacRequired) {
+              this.logger.error('SECURITY: Server playbook missing signature, rejecting', {
+                playbookId: playbook.playbook_id || playbook.id
+              });
+              break;
+            }
           }
-          this.receivePlaybook(data.playbook, 'server');
+
+          // Normalize server field names: playbook_id -> id, title -> name
+          if (!playbook.id && playbook.playbook_id) playbook.id = playbook.playbook_id;
+          if (!playbook.name && playbook.title) playbook.name = playbook.title;
+          if (!playbook || !playbook.id) {
+            this.logger.warn('Received playbook message with no valid playbook data', { raw: JSON.stringify(data).slice(0, 500) });
+            break;
+          }
+          // Tag playbook with the most recent signature_id for cache linking
+          if (this.recentSignatureIds.length > 0) {
+            playbook.signatureId = this.recentSignatureIds[0];
+          }
+          this.receivePlaybook(playbook, 'server');
           break;
+        }
           
         case 'execute_playbook':
           // Server requested playbook execution
@@ -3349,7 +3383,7 @@ class OPSISAgentService {
   }
 
   // Handle Welcome Message from Server (heartbeat already running from on('open'))
-  private handleWelcome(data: any): void {
+  private async handleWelcome(data: any): Promise<void> {
     // Clear welcome timeout — server responded
     if (this.welcomeTimeout) { clearTimeout(this.welcomeTimeout); this.welcomeTimeout = null; }
 
@@ -3404,6 +3438,19 @@ class OPSISAgentService {
     // Apply protected applications list from server (pushed on registration)
     if (data.protected_applications) {
       this.saveProtectedApplications(data.protected_applications);
+    }
+
+    // Provision HMAC secret from server (initial setup over authenticated wss:// connection)
+    if (data.hmac_secret) {
+      const hmacConfigured = await isHmacConfigured();
+      if (!hmacConfigured) {
+        try {
+          await storeHmacSecret(data.hmac_secret);
+          this.logger.info('HMAC secret provisioned from server welcome');
+        } catch (err) {
+          this.logger.error('Failed to store HMAC secret from welcome', err);
+        }
+      }
     }
   }
 
@@ -4147,29 +4194,9 @@ class OPSISAgentService {
     this.log(`Received playbook: ${playbook.name} (${source} - ${playbook.priority})`);
 
     // SECURITY: Verify and validate server playbooks
+    // NOTE: HMAC signature verification is now done BEFORE this method is called
+    // (in the 'playbook' case handler) to avoid mutation before verification.
     if (source === 'server') {
-      // Step 1: Verify HMAC signature if present
-      const pbAny = playbook as any;
-      if (pbAny._signature) {
-        const verification = await verifyPlaybook(playbook);
-        if (!verification.valid) {
-          this.logger.error('Playbook signature verification failed', {
-            error: verification.error,
-            playbookId: playbook.id
-          });
-          return; // Reject the playbook
-        }
-        this.logger.info('Playbook signature verified', { playbookId: playbook.id });
-      } else {
-        // No signature - REJECT if HMAC is configured (strict enforcement)
-        const hmacRequired = await isHmacConfigured();
-        if (hmacRequired) {
-          this.logger.error('SECURITY: Server playbook missing signature - HMAC is configured, rejecting unsigned playbook', {
-            playbookId: playbook.id
-          });
-          return; // Reject the playbook
-        }
-      }
 
       // Step 2: Validate playbook structure and step types
       const validation = validatePlaybook(playbook);
@@ -4295,6 +4322,9 @@ class OPSISAgentService {
         this.log(`Playbook completed: ${playbook.name}`);
         this.reportPlaybookResult(playbook.id, 'success');
         this.sendPlaybookResult(playbook, 'success', duration);
+
+        // Refresh software inventory after successful playbook (may have installed/removed software)
+        setTimeout(() => this.sendSoftwareInventory(), 5000);
 
         this.remediationMemory.recordAttempt(
           playbook.id,
@@ -4479,19 +4509,41 @@ class OPSISAgentService {
       }
     }
 
-    let command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${effectiveScript}"`;
+    let stdout: string;
+    let stderr: string;
 
-    if (params && Object.keys(params).length > 0) {
-      const paramString = Object.entries(params)
-        .map(([key, value]) => {
-          const sanitized = String(value).replace(/'/g, "''");
-          return `-${key} '${sanitized}'`;
-        })
-        .join(' ');
-      command += ` ${paramString}`;
+    // Multi-line scripts: write to temp .ps1 file and execute with -File
+    // Uses {app}/data/temp/ under the agent install directory (owned by SYSTEM + Admins)
+    if (effectiveScript.includes('\n') || effectiveScript.includes('"')) {
+      const tempDir = path.join(this.dataDir, 'temp');
+      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+      const tempFile = path.join(tempDir, `pb-${Date.now()}.ps1`);
+      try {
+        fs.writeFileSync(tempFile, effectiveScript, 'utf8');
+        const result = await execAsync(
+          `powershell -NoProfile -ExecutionPolicy Bypass -File "${tempFile}"`,
+          { timeout }
+        );
+        stdout = result.stdout;
+        stderr = result.stderr;
+      } finally {
+        try { fs.unlinkSync(tempFile); } catch {}
+      }
+    } else {
+      let command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${effectiveScript}"`;
+      if (params && Object.keys(params).length > 0) {
+        const paramString = Object.entries(params)
+          .map(([key, value]) => {
+            const sanitized = String(value).replace(/'/g, "''");
+            return `-${key} '${sanitized}'`;
+          })
+          .join(' ');
+        command += ` ${paramString}`;
+      }
+      const result = await execAsync(command, { timeout });
+      stdout = result.stdout;
+      stderr = result.stderr;
     }
-
-    const { stdout, stderr } = await execAsync(command, { timeout });
     
     if (stderr) {
       this.log(`PowerShell stderr: ${stderr}`);
