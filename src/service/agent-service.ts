@@ -453,7 +453,11 @@ class OPSISAgentService {
   private loadConfig(): AgentConfig {
     try {
       if (fs.existsSync(this.configPath)) {
-        const data = fs.readFileSync(this.configPath, 'utf8');
+        let data = fs.readFileSync(this.configPath, 'utf8');
+        // Strip UTF-8 BOM if present (PowerShell can write these)
+        if (data.charCodeAt(0) === 0xFEFF) {
+          data = data.slice(1);
+        }
         return JSON.parse(data);
       }
     } catch (err) {

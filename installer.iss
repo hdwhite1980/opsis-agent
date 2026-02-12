@@ -91,19 +91,23 @@ Filename: "powershell.exe"; Parameters: "-Command ""Set-ExecutionPolicy RemoteSi
 ; 2. Add Defender exclusions for install directory, service exe, and WinSW wrapper
 Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe'; Add-MpPreference -ExclusionProcess '{app}\service\OpsisAgentService.exe'"""; StatusMsg: "Adding Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
 
-; 3. Lock down sensitive directories only (data, logs, certs)
-; The main {app} directory inherits default Program Files permissions which are already secure
-; (Administrators: Full, Users: Read+Execute). Stripping inheritance on {app} was causing
-; permission issues with the uninstaller and service wrapper.
+; 3. Set directory permissions
+; First reset inheritance on the entire app directory to ensure clean state on reinstall,
+; then grant SYSTEM + Administrators full control and Users read+execute on the app root.
+; Sensitive subdirectories (data, logs, certs) are then locked to SYSTEM + Admins only.
+; The service directory must be readable by SYSTEM for WinSW to load its XML config.
 
-; 3a. Lock down data directory: SYSTEM + Administrators only (contains API key, tickets)
-Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\data'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing data directory..."; Flags: runhidden waituntilterminated shellexec
+; 3a. Reset and set base permissions on entire install directory
+Filename: "powershell.exe"; Parameters: "-Command ""icacls '{app}' /reset /T /Q; icacls '{app}' /grant 'NT AUTHORITY\SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' 'BUILTIN\Users:(OI)(CI)RX' /T /Q"""; StatusMsg: "Setting base directory permissions..."; Flags: runhidden waituntilterminated shellexec
 
-; 3b. Lock down logs directory: SYSTEM + Administrators only
-Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\logs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing logs directory..."; Flags: runhidden waituntilterminated shellexec
+; 3b. Lock down data directory: SYSTEM + Administrators only (contains API key, tickets)
+Filename: "powershell.exe"; Parameters: "-Command ""icacls '{app}\data' /inheritance:r /grant:r 'NT AUTHORITY\SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing data directory..."; Flags: runhidden waituntilterminated shellexec
 
-; 3c. Lock down certs directory: SYSTEM + Administrators only
-Filename: "powershell.exe"; Parameters: "-Command ""$path = '{app}\certs'; icacls $path /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing certificate directory..."; Flags: runhidden waituntilterminated shellexec
+; 3c. Lock down logs directory: SYSTEM + Administrators only
+Filename: "powershell.exe"; Parameters: "-Command ""icacls '{app}\logs' /inheritance:r /grant:r 'NT AUTHORITY\SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing logs directory..."; Flags: runhidden waituntilterminated shellexec
+
+; 3d. Lock down certs directory: SYSTEM + Administrators only
+Filename: "powershell.exe"; Parameters: "-Command ""icacls '{app}\certs' /inheritance:r /grant:r 'NT AUTHORITY\SYSTEM:(OI)(CI)F' 'BUILTIN\Administrators:(OI)(CI)F' /T /Q"""; StatusMsg: "Securing certificate directory..."; Flags: runhidden waituntilterminated shellexec
 
 ; 7. Register Windows Event Log source for OPSIS
 Filename: "powershell.exe"; Parameters: "-Command ""if (-not [System.Diagnostics.EventLog]::SourceExists('OPSIS Agent')) {{ New-EventLog -LogName Application -Source 'OPSIS Agent' -ErrorAction SilentlyContinue }}"""; StatusMsg: "Registering event log source..."; Flags: runhidden waituntilterminated shellexec
@@ -232,29 +236,33 @@ begin
     // Create WinSW service configuration
     CreateServiceConfig();
 
-    // Create agent.config.json with server URL if provided
+    // Create agent.config.json only if it doesn't exist or user provided new values.
+    // On reinstall/upgrade, preserve the existing config (already has serverUrl + apiKey).
     ConfigFile := ExpandConstant('{app}\data\agent.config.json');
 
-    ConfigContent := '{' + #13#10;
+    if (not FileExists(ConfigFile)) or (ServerURLPage.Values[0] <> '') or (ServerURLPage.Values[1] <> '') then
+    begin
+      ConfigContent := '{' + #13#10;
 
-    if ServerURLPage.Values[0] <> '' then
-      ConfigContent := ConfigContent + '  "serverUrl": "' + ServerURLPage.Values[0] + '",' + #13#10
-    else
-      ConfigContent := ConfigContent + '  "serverUrl": null,' + #13#10;
+      if ServerURLPage.Values[0] <> '' then
+        ConfigContent := ConfigContent + '  "serverUrl": "' + ServerURLPage.Values[0] + '",' + #13#10
+      else
+        ConfigContent := ConfigContent + '  "serverUrl": null,' + #13#10;
 
-    if ServerURLPage.Values[1] <> '' then
-      ConfigContent := ConfigContent + '  "apiKey": "' + ServerURLPage.Values[1] + '",' + #13#10
-    else
-      ConfigContent := ConfigContent + '  "apiKey": "",' + #13#10;
+      if ServerURLPage.Values[1] <> '' then
+        ConfigContent := ConfigContent + '  "apiKey": "' + ServerURLPage.Values[1] + '",' + #13#10
+      else
+        ConfigContent := ConfigContent + '  "apiKey": "",' + #13#10;
 
-    ConfigContent := ConfigContent + '  "autoConnect": true,' + #13#10;
-    ConfigContent := ConfigContent + '  "autoRemediation": true,' + #13#10;
-    ConfigContent := ConfigContent + '  "autoUpdate": false,' + #13#10;
-    ConfigContent := ConfigContent + '  "confidenceThreshold": 75,' + #13#10;
-    ConfigContent := ConfigContent + '  "updateCheckInterval": 60' + #13#10;
-    ConfigContent := ConfigContent + '}';
+      ConfigContent := ConfigContent + '  "autoConnect": true,' + #13#10;
+      ConfigContent := ConfigContent + '  "autoRemediation": true,' + #13#10;
+      ConfigContent := ConfigContent + '  "autoUpdate": false,' + #13#10;
+      ConfigContent := ConfigContent + '  "confidenceThreshold": 75,' + #13#10;
+      ConfigContent := ConfigContent + '  "updateCheckInterval": 60' + #13#10;
+      ConfigContent := ConfigContent + '}';
 
-    SaveStringToFile(ConfigFile, ConfigContent, False);
+      SaveStringToFile(ConfigFile, ConfigContent, False);
+    end;
   end;
 end;
 
