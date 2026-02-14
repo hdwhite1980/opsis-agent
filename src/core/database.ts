@@ -62,7 +62,32 @@ export class Database {
     await this.run(`CREATE INDEX IF NOT EXISTS idx_tickets_signature ON local_tickets(signature)`);
     await this.run(`CREATE INDEX IF NOT EXISTS idx_tickets_status ON local_tickets(status)`);
     await this.run(`CREATE INDEX IF NOT EXISTS idx_tickets_created ON local_tickets(created_at)`);
-    
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS behavioral_profiles (
+        metric_key TEXT NOT NULL,
+        hour_of_day INTEGER NOT NULL,
+        is_weekday INTEGER NOT NULL,
+        sample_count INTEGER DEFAULT 0,
+        mean REAL DEFAULT 0,
+        m2 REAL DEFAULT 0,
+        min_value REAL,
+        max_value REAL,
+        last_updated TEXT,
+        PRIMARY KEY (metric_key, hour_of_day, is_weekday)
+      )
+    `);
+
+    await this.run(`CREATE INDEX IF NOT EXISTS idx_profiles_metric ON behavioral_profiles(metric_key)`);
+
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS process_frequency (
+        process_name TEXT PRIMARY KEY,
+        occurrence_count INTEGER DEFAULT 0,
+        last_seen TEXT
+      )
+    `);
+
     this.logger.info('Database initialized');
   }
   

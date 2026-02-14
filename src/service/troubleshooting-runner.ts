@@ -8,6 +8,7 @@ import { Primitives, DiagnosticResult } from '../execution/primitives';
 import { DeviceSignature } from './signature-generator';
 import * as fs from 'fs';
 import * as path from 'path';
+import { verifyRunbookIntegrity, registerRunbookHash } from '../security';
 
 // Issue categories for routing to troubleshooting runbooks
 export type IssueCategory = 'cpu' | 'memory' | 'disk' | 'service' | 'network' | 'general';
@@ -128,27 +129,43 @@ export class TroubleshootingRunner {
     this.dataDir = dataDir;
     this.primitives = new Primitives(logger);
     this.runbooks = new Map();
-    this.loadRunbooks();
+    this.loadRunbooks().catch(err => {
+      this.logger.error('Failed to load troubleshooting runbooks', err);
+    });
   }
 
   /**
    * Load runbooks from file or use defaults
    */
-  private loadRunbooks(): void {
+  private async loadRunbooks(): Promise<void> {
     const runbookPath = path.join(this.dataDir, 'troubleshooting-runbooks.json');
 
     try {
       if (fs.existsSync(runbookPath)) {
         const fileContent = fs.readFileSync(runbookPath, 'utf-8');
-        const data = JSON.parse(fileContent);
 
-        if (data.runbooks && Array.isArray(data.runbooks)) {
-          for (const runbook of data.runbooks) {
-            if (this.validateRunbook(runbook)) {
-              this.runbooks.set(runbook.category as IssueCategory, runbook);
-            }
+        // Verify integrity before trusting file contents
+        const integrity = await verifyRunbookIntegrity('troubleshooting:runbooks', fileContent);
+        if (integrity.reason === 'hash_mismatch') {
+          this.logger.error('SECURITY: Troubleshooting runbooks file tampered, using defaults only', {
+            expected_hash: integrity.expected_hash,
+            actual_hash: integrity.actual_hash,
+          });
+          // Fall through to load defaults below
+        } else {
+          if (integrity.reason === 'no_stored_hash') {
+            await registerRunbookHash('troubleshooting:runbooks', fileContent);
           }
-          this.logger.info('Loaded troubleshooting runbooks from file', { count: this.runbooks.size });
+
+          const data = JSON.parse(fileContent);
+          if (data.runbooks && Array.isArray(data.runbooks)) {
+            for (const runbook of data.runbooks) {
+              if (this.validateRunbook(runbook)) {
+                this.runbooks.set(runbook.category as IssueCategory, runbook);
+              }
+            }
+            this.logger.info('Loaded troubleshooting runbooks from file', { count: this.runbooks.size });
+          }
         }
       }
     } catch (error: any) {

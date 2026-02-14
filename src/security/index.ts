@@ -60,6 +60,15 @@ export {
   createRotationError
 } from './key-rotation';
 
+// Re-export runbook integrity verification functions
+export {
+  computeRunbookHash,
+  registerRunbookHash,
+  verifyRunbookIntegrity,
+  removeRunbookHash,
+  canonicalizeServerRunbook,
+} from './runbook-integrity';
+
 // ===========================================
 // SCHEMA VALIDATION (lightweight Zod-like)
 // ===========================================

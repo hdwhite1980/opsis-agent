@@ -27,6 +27,7 @@ import { MaintenanceWindowManager, MaintenanceWindow } from './maintenance-windo
 import { SelfServiceServer } from './self-service-server';
 import { ControlPanelServer } from './control-panel-server';
 import { BaselineManager } from './baseline-manager';
+import { BehavioralProfiler } from './behavioral-profiler';
 import { CompatibilityChecker, CompatibilityReport, CapabilityMode } from './compatibility-checker';
 
 // Security imports
@@ -43,7 +44,10 @@ import {
   createRotationAck,
   createRotationError,
   isHmacConfigured,
-  tryParseJSON
+  tryParseJSON,
+  registerRunbookHash,
+  verifyRunbookIntegrity,
+  canonicalizeServerRunbook,
 } from '../security';
 
 const execAsync = promisify(exec);
@@ -284,6 +288,9 @@ class OPSISAgentService {
   // System baseline manager
   private baselineManager: BaselineManager;
 
+  // Behavioral profiler for temporal anomaly detection
+  private behavioralProfiler: BehavioralProfiler;
+
   // Compatibility checker and capability mode
   private compatibilityChecker: CompatibilityChecker;
   private capabilityMode: CapabilityMode = 'full';
@@ -372,6 +379,10 @@ class OPSISAgentService {
       this.logger,
       (issue) => this.handleSystemIssue(issue)
     );
+
+    // Initialize behavioral profiler for temporal anomaly detection
+    this.behavioralProfiler = new BehavioralProfiler(this.dataDir, this.logger);
+    this.systemMonitor.setProfiler(this.behavioralProfiler);
 
     // Initialize IPC server for GUI communication
     this.ipcServer = new IPCServer(this.logger);
@@ -1411,7 +1422,7 @@ class OPSISAgentService {
     this.log('OPSIS Agent Service Started Successfully');
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.log('OPSIS Agent Service Stopping...');
 
     if (this.selfServiceServer) {
@@ -1473,6 +1484,12 @@ class OPSISAgentService {
 
     if (this.maintenanceManager) {
       this.maintenanceManager.stopExpirationChecks();
+    }
+
+    // Flush and stop behavioral profiler
+    if (this.behavioralProfiler) {
+      await this.behavioralProfiler.flush();
+      this.behavioralProfiler.stop();
     }
 
     this.log('OPSIS Agent Service Stopped');
@@ -3382,6 +3399,24 @@ class OPSISAgentService {
     }
   }
 
+  /**
+   * Send a security alert to the server (e.g. runbook tampering detected)
+   */
+  private sendSecurityAlert(alertType: string, details: Record<string, any>): void {
+    const alert = {
+      type: 'security_alert',
+      alert_type: alertType,
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo?.device_id,
+      tenant_id: this.deviceInfo?.tenant_id,
+      details
+    };
+    this.logger.error('SECURITY ALERT', alert);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(alert));
+    }
+  }
+
   // Handle Welcome Message from Server (heartbeat already running from on('open'))
   private async handleWelcome(data: any): Promise<void> {
     // Clear welcome timeout — server responded
@@ -3798,7 +3833,7 @@ class OPSISAgentService {
     }
 
     // Check for cached server runbook before escalating
-    const cachedServerRunbook = this.findCachedServerRunbook(signature.signature_id);
+    const cachedServerRunbook = await this.findCachedServerRunbook(signature.signature_id);
     if (cachedServerRunbook) {
       this.logger.info('Using cached server runbook instead of re-escalating', {
         signature_id: signature.signature_id,
@@ -4336,7 +4371,7 @@ class OPSISAgentService {
 
         // Save successful server runbooks for future local use
         if (playbook.source === 'server') {
-          this.saveServerRunbook(playbook);
+          await this.saveServerRunbook(playbook);
         }
       } catch (error) {
         const duration = Date.now() - startTime;
@@ -5344,7 +5379,7 @@ class OPSISAgentService {
         this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'success', duration);
 
         if (playbook.source === 'server') {
-          this.saveServerRunbook(playbook);
+          await this.saveServerRunbook(playbook);
         }
       } catch (error) {
         const duration = Date.now() - startTime;
@@ -5478,7 +5513,7 @@ class OPSISAgentService {
   /**
    * Save a successful server runbook for future local use
    */
-  private saveServerRunbook(playbook: PlaybookTask): void {
+  private async saveServerRunbook(playbook: PlaybookTask): Promise<void> {
     try {
       let serverRunbooks: { runbooks: Array<any>; version: string } = {
         runbooks: [],
@@ -5548,6 +5583,14 @@ class OPSISAgentService {
           id: runbookEntry.id,
           name: runbookEntry.name
         });
+      }
+
+      // Register integrity hash BEFORE writing to disk
+      try {
+        const canonicalContent = canonicalizeServerRunbook(runbookEntry);
+        await registerRunbookHash('server:' + runbookEntry.id, canonicalContent);
+      } catch (hashError) {
+        this.logger.warn('Failed to register runbook integrity hash (continuing)', hashError);
       }
 
       fs.writeFileSync(this.serverRunbooksPath, JSON.stringify(serverRunbooks, null, 2), 'utf8');
@@ -5702,25 +5745,81 @@ class OPSISAgentService {
    * Find a cached server runbook by signature_id for local reuse.
    * Returns the runbook with the highest success count for this signature.
    */
-  private findCachedServerRunbook(signatureId: string): any | null {
+  private async findCachedServerRunbook(signatureId: string): Promise<any | null> {
     try {
       if (!fs.existsSync(this.serverRunbooksPath)) return null;
 
-      const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
-      const matching = serverRunbooks.runbooks.filter(
-        (rb: any) => rb.signature_id === signatureId && !rb.resolved && rb.success_count > 0 && rb.steps && rb.steps.length > 0
-      );
+      const findBestMatch = (): any | null => {
+        const serverRunbooks = JSON.parse(fs.readFileSync(this.serverRunbooksPath, 'utf8'));
+        const matching = serverRunbooks.runbooks.filter(
+          (rb: any) => rb.signature_id === signatureId && !rb.resolved && rb.success_count > 0 && rb.steps && rb.steps.length > 0
+        );
+        if (matching.length === 0) return null;
+        return matching.sort((a: any, b: any) => b.success_count - a.success_count)[0];
+      };
 
-      if (matching.length === 0) return null;
+      const best = findBestMatch();
+      if (!best) return null;
 
-      // Pick the one with the best success rate
-      const best = matching.sort((a: any, b: any) => b.success_count - a.success_count)[0];
+      // Verify integrity before trusting cached runbook
+      const canonicalContent = canonicalizeServerRunbook(best);
+      const integrity = await verifyRunbookIntegrity('server:' + best.id, canonicalContent);
+
+      if (integrity.reason === 'hash_mismatch') {
+        // Race condition guard: saveServerRunbook() may have updated the hash
+        // while we were reading. Re-read the file and verify once more.
+        this.logger.warn('Runbook hash mismatch on first check, retrying (possible race condition)', {
+          runbook_id: best.id,
+          signature_id: signatureId,
+        });
+
+        const retryBest = findBestMatch();
+        if (!retryBest) return null;
+
+        const retryCanonical = canonicalizeServerRunbook(retryBest);
+        const retryIntegrity = await verifyRunbookIntegrity('server:' + retryBest.id, retryCanonical);
+
+        if (retryIntegrity.reason === 'hash_mismatch') {
+          // Still mismatches after retry — genuine tampering
+          this.logger.error('SECURITY: Cached server runbook tampered — refusing execution', {
+            runbook_id: retryBest.id,
+            signature_id: signatureId,
+            expected_hash: retryIntegrity.expected_hash,
+            actual_hash: retryIntegrity.actual_hash,
+          });
+          this.sendSecurityAlert('runbook_tampering', {
+            runbook_id: retryBest.id,
+            file_path: this.serverRunbooksPath,
+            signature_id: signatureId,
+            expected_hash: retryIntegrity.expected_hash,
+            actual_hash: retryIntegrity.actual_hash,
+          });
+          return null;
+        }
+
+        // Retry passed — was a race condition, not tampering
+        this.logger.info('Runbook hash verified on retry (was race condition)', {
+          runbook_id: retryBest.id,
+        });
+        return retryBest;
+      }
+
+      if (integrity.reason === 'no_stored_hash') {
+        // Migration: first load after upgrade — register hash and proceed
+        try {
+          await registerRunbookHash('server:' + best.id, canonicalContent);
+        } catch (hashError) {
+          this.logger.warn('Failed to register runbook hash during migration', hashError);
+        }
+      }
+
       this.logger.info('Found cached server runbook for signature', {
         signatureId,
         runbookId: best.id,
         name: best.name,
         success_count: best.success_count,
-        execution_count: best.execution_count
+        execution_count: best.execution_count,
+        integrity: integrity.reason,
       });
       return best;
     } catch (error) {

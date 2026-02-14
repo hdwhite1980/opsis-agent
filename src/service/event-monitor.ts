@@ -5,6 +5,7 @@ import * as os from 'os';
 import { Logger } from '../common/logger';
 import * as fs from 'fs';
 import * as path from 'path';
+import { verifyRunbookIntegrity, registerRunbookHash } from '../security';
 
 const execAsync = promisify(exec);
 
@@ -80,15 +81,17 @@ export class EventMonitor {
     this.lastCheckedTime = today;
     this.onIssueDetected = onIssueDetected;
     this.onEscalationNeeded = onEscalationNeeded;
-    
-    this.loadRunbooks();
+
+    this.loadRunbooks().catch(err => {
+      this.logger.error('Failed to load runbooks', err);
+    });
   }
 
   // ============================================
   // RUNBOOK MANAGEMENT
   // ============================================
 
-  private loadRunbooks(): void {
+  private async loadRunbooks(): Promise<void> {
     try {
       if (!fs.existsSync(this.runbooksPath)) {
         fs.mkdirSync(this.runbooksPath, { recursive: true });
@@ -96,7 +99,7 @@ export class EventMonitor {
 
       const files = fs.readdirSync(this.runbooksPath);
       const jsonFiles = files.filter(f => f.endsWith('.json'));
-      
+
       // Create default runbooks if none exist
       if (jsonFiles.length === 0) {
         this.logger.info('No runbooks found, creating defaults...');
@@ -107,6 +110,21 @@ export class EventMonitor {
           if (file.endsWith('.json')) {
             const filePath = path.join(this.runbooksPath, file);
             const content = fs.readFileSync(filePath, 'utf8');
+
+            // Verify integrity of local runbook file
+            const integrity = await verifyRunbookIntegrity('local:' + file, content);
+            if (integrity.reason === 'hash_mismatch') {
+              this.logger.error('SECURITY: Local runbook tampered, skipping', {
+                file,
+                expected_hash: integrity.expected_hash,
+                actual_hash: integrity.actual_hash,
+              });
+              continue;
+            }
+            if (integrity.reason === 'no_stored_hash') {
+              await registerRunbookHash('local:' + file, content);
+            }
+
             const runbook: Runbook = JSON.parse(content);
             this.runbooks.set(runbook.id, runbook);
             this.logger.info(`Loaded runbook: ${runbook.name}`, { id: runbook.id });
@@ -117,6 +135,21 @@ export class EventMonitor {
         for (const file of jsonFiles) {
           const filePath = path.join(this.runbooksPath, file);
           const content = fs.readFileSync(filePath, 'utf8');
+
+          // Verify integrity of local runbook file
+          const integrity = await verifyRunbookIntegrity('local:' + file, content);
+          if (integrity.reason === 'hash_mismatch') {
+            this.logger.error('SECURITY: Local runbook tampered, skipping', {
+              file,
+              expected_hash: integrity.expected_hash,
+              actual_hash: integrity.actual_hash,
+            });
+            continue;
+          }
+          if (integrity.reason === 'no_stored_hash') {
+            await registerRunbookHash('local:' + file, content);
+          }
+
           const runbook: Runbook = JSON.parse(content);
           this.runbooks.set(runbook.id, runbook);
           this.logger.info(`Loaded runbook: ${runbook.name}`, { id: runbook.id });

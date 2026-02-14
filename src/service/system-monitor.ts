@@ -5,6 +5,7 @@ import * as os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { Logger } from '../common/logger';
+import { BehavioralProfiler } from './behavioral-profiler';
 
 const execAsync = promisify(exec);
 
@@ -42,6 +43,14 @@ export class SystemMonitor {
   private consecutiveBreaches: Map<string, number> = new Map();
   private readonly SUSTAINED_THRESHOLD_COUNT = 3; // Require 3 consecutive breaches
 
+  // Behavioral profiler for temporal anomaly detection
+  private profiler: BehavioralProfiler | null = null;
+
+  // Absolute critical ceilings — never suppressed regardless of profile
+  private readonly CRITICAL_CEILING_CPU = 98;
+  private readonly CRITICAL_CEILING_MEMORY = 95;
+  private readonly CRITICAL_CEILING_DISK_FREE = 3;
+
   // Server-configurable thresholds (defaults overridden by welcome message)
   private thresholds = {
     cpu_warning: 75,
@@ -63,6 +72,16 @@ export class SystemMonitor {
     if (newThresholds.disk_warning != null) this.thresholds.disk_warning = newThresholds.disk_warning;
     if (newThresholds.disk_critical != null) this.thresholds.disk_critical = newThresholds.disk_critical;
     this.logger.info('Thresholds updated from server', this.thresholds);
+  }
+
+  /**
+   * Attach a behavioral profiler for temporal anomaly detection.
+   * When set, the monitor feeds samples to the profiler and consults it
+   * before emitting signals to suppress false positives.
+   */
+  public setProfiler(profiler: BehavioralProfiler): void {
+    this.profiler = profiler;
+    this.logger.info('Behavioral profiler attached to system monitor');
   }
 
   constructor(logger: Logger, onSignalDetected: MonitorCallback) {
@@ -141,40 +160,63 @@ export class SystemMonitor {
     try {
       // Overall CPU usage
       const cpuUsage = await this.getCPUUsage();
-      
+
+      // Feed behavioral profiler
+      this.profiler?.recordSample('system:cpu', cpuUsage);
+
       // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
       if (this.isSustainedBreach('cpu-critical', cpuUsage > this.thresholds.cpu_critical)) {
-        this.emitSignal({
-          id: 'cpu-critical',
-          category: 'performance',
-          severity: 'critical',
-          metric: 'cpu_usage',
-          value: cpuUsage,
-          threshold: this.thresholds.cpu_critical,
-          message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
-          timestamp: new Date(),
-          eventId: 2001,
-          eventSource: 'OPSIS-SystemMonitor'
-        });
+        // Critical ceiling: always emit at >= 98% regardless of profile
+        if (cpuUsage >= this.CRITICAL_CEILING_CPU || this.isProfileAnomalous('system:cpu', cpuUsage)) {
+          this.emitSignal({
+            id: 'cpu-critical',
+            category: 'performance',
+            severity: 'critical',
+            metric: 'cpu_usage',
+            value: cpuUsage,
+            threshold: this.thresholds.cpu_critical,
+            message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
+            timestamp: new Date(),
+            eventId: 2001,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else {
+          this.logger.debug('CPU critical breach suppressed by behavioral profile', { cpuUsage });
+        }
       } else if (this.isSustainedBreach('cpu-high', cpuUsage > this.thresholds.cpu_warning)) {
-        this.emitSignal({
-          id: 'cpu-high',
-          category: 'performance',
-          severity: 'warning',
-          metric: 'cpu_usage',
-          value: cpuUsage,
-          threshold: this.thresholds.cpu_warning,
-          message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
-          timestamp: new Date(),
-          eventId: 2002,
-          eventSource: 'OPSIS-SystemMonitor'
-        });
+        if (cpuUsage >= this.CRITICAL_CEILING_CPU || this.isProfileAnomalous('system:cpu', cpuUsage)) {
+          this.emitSignal({
+            id: 'cpu-high',
+            category: 'performance',
+            severity: 'warning',
+            metric: 'cpu_usage',
+            value: cpuUsage,
+            threshold: this.thresholds.cpu_warning,
+            message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
+            timestamp: new Date(),
+            eventId: 2002,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else {
+          this.logger.debug('CPU warning breach suppressed by behavioral profile', { cpuUsage });
+        }
       }
 
       // Per-process CPU monitoring
       const topProcesses = await this.getTopCPUProcesses();
+
+      // Feed process snapshots to profiler
+      this.profiler?.recordProcessSnapshot(
+        topProcesses.map(p => ({ name: p.name, cpu: p.cpu, memoryMB: 0 }))
+      );
+
       for (const proc of topProcesses.slice(0, 3)) {
         if (proc.cpu > 50) {
+          // Check per-process behavioral profile before alerting
+          if (!this.isProfileAnomalous(`process:${proc.name.toLowerCase()}:cpu`, proc.cpu)) {
+            this.logger.debug('Process CPU alert suppressed by behavioral profile', { process: proc.name, cpu: proc.cpu });
+            continue;
+          }
           this.emitSignal({
             id: `process-cpu-${proc.pid}`,
             category: 'performance',
@@ -238,44 +280,66 @@ export class SystemMonitor {
       const usedMem = totalMem - freeMem;
       const usedPercent = (usedMem / totalMem) * 100;
 
+      // Feed behavioral profiler
+      this.profiler?.recordSample('system:memory', usedPercent);
+
       // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
       if (this.isSustainedBreach('memory-critical', usedPercent > this.thresholds.memory_critical)) {
-        this.emitSignal({
-          id: 'memory-critical',
-          category: 'performance',
-          severity: 'critical',
-          metric: 'memory_usage',
-          value: usedPercent,
-          threshold: this.thresholds.memory_critical,
-          message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
-          timestamp: new Date(),
-          metadata: {
-            totalGB: (totalMem / 1024 / 1024 / 1024).toFixed(2),
-            freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
-            usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
-          },
-          eventId: 2010,
-          eventSource: 'OPSIS-SystemMonitor'
-        });
+        if (usedPercent >= this.CRITICAL_CEILING_MEMORY || this.isProfileAnomalous('system:memory', usedPercent)) {
+          this.emitSignal({
+            id: 'memory-critical',
+            category: 'performance',
+            severity: 'critical',
+            metric: 'memory_usage',
+            value: usedPercent,
+            threshold: this.thresholds.memory_critical,
+            message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
+            timestamp: new Date(),
+            metadata: {
+              totalGB: (totalMem / 1024 / 1024 / 1024).toFixed(2),
+              freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
+              usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
+            },
+            eventId: 2010,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else {
+          this.logger.debug('Memory critical breach suppressed by behavioral profile', { usedPercent });
+        }
       } else if (this.isSustainedBreach('memory-high', usedPercent > this.thresholds.memory_warning)) {
-        this.emitSignal({
-          id: 'memory-high',
-          category: 'performance',
-          severity: 'warning',
-          metric: 'memory_usage',
-          value: usedPercent,
-          threshold: this.thresholds.memory_warning,
-          message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
-          timestamp: new Date(),
-          eventId: 2011,
-          eventSource: 'OPSIS-SystemMonitor'
-        });
+        if (usedPercent >= this.CRITICAL_CEILING_MEMORY || this.isProfileAnomalous('system:memory', usedPercent)) {
+          this.emitSignal({
+            id: 'memory-high',
+            category: 'performance',
+            severity: 'warning',
+            metric: 'memory_usage',
+            value: usedPercent,
+            threshold: this.thresholds.memory_warning,
+            message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
+            timestamp: new Date(),
+            eventId: 2011,
+            eventSource: 'OPSIS-SystemMonitor'
+          });
+        } else {
+          this.logger.debug('Memory warning breach suppressed by behavioral profile', { usedPercent });
+        }
       }
 
       // Memory pressure detection
       const topMemProcesses = await this.getTopMemoryProcesses();
+
+      // Feed process memory snapshots to profiler
+      this.profiler?.recordProcessSnapshot(
+        topMemProcesses.map(p => ({ name: p.name, cpu: 0, memoryMB: p.memoryMB }))
+      );
+
       for (const proc of topMemProcesses.slice(0, 3)) {
         if (proc.memoryMB > 2000) {
+          // Check per-process behavioral profile before alerting
+          if (!this.isProfileAnomalous(`process:${proc.name.toLowerCase()}:memory`, proc.memoryMB)) {
+            this.logger.debug('Process memory alert suppressed by behavioral profile', { process: proc.name, memoryMB: proc.memoryMB });
+            continue;
+          }
           this.emitSignal({
             id: `process-memory-${proc.pid}`,
             category: 'performance',
@@ -331,42 +395,54 @@ export class SystemMonitor {
 
       for (const drive of driveArray) {
         if (!drive.Used || !drive.Free) continue;
-        
+
         const total = drive.Used + drive.Free;
         const freePercent = (drive.Free / total) * 100;
 
+        // Feed behavioral profiler with disk free %
+        this.profiler?.recordSample(`system:disk:${drive.Name}`, freePercent);
+
         if (freePercent < 10) {
-          this.emitSignal({
-            id: `disk-critical-${drive.Name}`,
-            category: 'storage',
-            severity: 'critical',
-            metric: 'disk_free',
-            value: freePercent,
-            threshold: 10,
-            message: `Drive ${drive.Name}: critically low space (${freePercent.toFixed(1)}% free, ${(drive.Free / 1024 / 1024 / 1024).toFixed(2)}GB remaining)`,
-            timestamp: new Date(),
-            metadata: {
-              drive: drive.Name,
-              freeGB: (drive.Free / 1024 / 1024 / 1024).toFixed(2),
-              totalGB: (total / 1024 / 1024 / 1024).toFixed(2)
-            },
-            eventId: 2020,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
+          // Critical ceiling: always emit at < 3% free regardless of profile
+          if (freePercent < this.CRITICAL_CEILING_DISK_FREE || this.isProfileAnomalous(`system:disk:${drive.Name}`, freePercent)) {
+            this.emitSignal({
+              id: `disk-critical-${drive.Name}`,
+              category: 'storage',
+              severity: 'critical',
+              metric: 'disk_free',
+              value: freePercent,
+              threshold: 10,
+              message: `Drive ${drive.Name}: critically low space (${freePercent.toFixed(1)}% free, ${(drive.Free / 1024 / 1024 / 1024).toFixed(2)}GB remaining)`,
+              timestamp: new Date(),
+              metadata: {
+                drive: drive.Name,
+                freeGB: (drive.Free / 1024 / 1024 / 1024).toFixed(2),
+                totalGB: (total / 1024 / 1024 / 1024).toFixed(2)
+              },
+              eventId: 2020,
+              eventSource: 'OPSIS-SystemMonitor'
+            });
+          } else {
+            this.logger.debug('Disk critical alert suppressed by behavioral profile', { drive: drive.Name, freePercent });
+          }
         } else if (freePercent < 20) {
-          this.emitSignal({
-            id: `disk-low-${drive.Name}`,
-            category: 'storage',
-            severity: 'warning',
-            metric: 'disk_free',
-            value: freePercent,
-            threshold: 20,
-            message: `Drive ${drive.Name}: low space (${freePercent.toFixed(1)}% free)`,
-            timestamp: new Date(),
-            metadata: { drive: drive.Name },
-            eventId: 2021,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
+          if (this.isProfileAnomalous(`system:disk:${drive.Name}`, freePercent)) {
+            this.emitSignal({
+              id: `disk-low-${drive.Name}`,
+              category: 'storage',
+              severity: 'warning',
+              metric: 'disk_free',
+              value: freePercent,
+              threshold: 20,
+              message: `Drive ${drive.Name}: low space (${freePercent.toFixed(1)}% free)`,
+              timestamp: new Date(),
+              metadata: { drive: drive.Name },
+              eventId: 2021,
+              eventSource: 'OPSIS-SystemMonitor'
+            });
+          } else {
+            this.logger.debug('Disk warning alert suppressed by behavioral profile', { drive: drive.Name, freePercent });
+          }
         }
       }
 
@@ -997,6 +1073,24 @@ export class SystemMonitor {
     } else {
       this.baselines.set(key, value);
     }
+  }
+
+  /**
+   * Check if a metric value is anomalous according to the behavioral profile.
+   * Returns true if the signal SHOULD be emitted (anomalous or insufficient data).
+   * Returns false if the signal should be suppressed (within normal behavior).
+   */
+  private isProfileAnomalous(metricKey: string, value: number): boolean {
+    if (!this.profiler) return true; // No profiler → emit signal (current behavior)
+
+    const result = this.profiler.isAnomalous(metricKey, value);
+
+    if (result.reason === 'within_normal') {
+      return false; // Suppress: this is normal for this time of day
+    }
+
+    // 'anomalous' or 'insufficient_data' → emit signal
+    return true;
   }
 
   /**
