@@ -1082,6 +1082,7 @@ export class SystemMonitor {
     const result = this.profiler.isAnomalous(metricKey, value);
 
     if (result.reason === 'within_normal') {
+      this.profiler.recordSuppression(metricKey);
       return false; // Suppress: this is normal for this time of day
     }
 

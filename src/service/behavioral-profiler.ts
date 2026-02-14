@@ -82,15 +82,30 @@ export class BehavioralProfiler {
   private readonly FLUSH_INTERVAL_MS = 300_000; // 5 minutes
   private readonly MAX_TRACKED_PROCESSES = 20;
 
+  // Suppression tracking for dashboard reporting
+  private suppressedThisMonth: number = 0;
+  private suppressedTotal: number = 0;
+  private suppressedByMetric: Map<string, number> = new Map();
+  private currentMonth: string = '';
+  private firstBucketSeen: string = '';
+
+  // Core system metrics used for learning progress calculation
+  private static readonly CORE_METRICS = ['system:cpu', 'system:memory', 'system:disk:C'];
+  private static readonly LEARNING_DAYS_TARGET = 7;
+  private static readonly ACTIVE_COVERAGE_THRESHOLD = 0.70;
+
   // File paths for persistence
   private readonly profilesPath: string;
   private readonly processFreqPath: string;
+  private readonly statsPath: string;
 
   constructor(dataDir: string, logger: Logger) {
     this.dataDir = dataDir;
     this.logger = logger;
     this.profilesPath = path.join(dataDir, 'behavioral-profiles.json');
     this.processFreqPath = path.join(dataDir, 'process-frequency.json');
+    this.statsPath = path.join(dataDir, 'profiler-stats.json');
+    this.currentMonth = new Date().toISOString().slice(0, 7); // "2026-02"
 
     // Load existing profiles from disk on startup
     this.loadProfiles();
@@ -126,9 +141,28 @@ export class BehavioralProfiler {
         this.rebuildTopProcesses();
       }
 
+      // Load suppression stats
+      if (fs.existsSync(this.statsPath)) {
+        const raw = fs.readFileSync(this.statsPath, 'utf8');
+        const stats = JSON.parse(raw);
+        this.suppressedTotal = stats.suppressed_total || 0;
+        this.firstBucketSeen = stats.first_bucket_seen || '';
+
+        // If same month, restore monthly counters; otherwise start fresh
+        if (stats.current_month === this.currentMonth) {
+          this.suppressedThisMonth = stats.suppressed_this_month || 0;
+          if (stats.suppressed_by_metric) {
+            for (const [metric, count] of Object.entries(stats.suppressed_by_metric)) {
+              this.suppressedByMetric.set(metric, count as number);
+            }
+          }
+        }
+      }
+
       this.logger.info('Behavioral profiles loaded', {
         profile_buckets: this.profiles.size,
         tracked_processes: this.processFrequency.size,
+        suppressed_total: this.suppressedTotal,
       });
     } catch (error) {
       this.logger.warn('Could not load behavioral profiles (files may not exist yet)', error);
@@ -142,6 +176,11 @@ export class BehavioralProfiler {
    */
   recordSample(metricKey: string, value: number): void {
     if (!isFinite(value)) return;
+
+    // Track when profiling first started (for learning day calculation)
+    if (!this.firstBucketSeen) {
+      this.firstBucketSeen = new Date().toISOString();
+    }
 
     const { hour, isWeekday } = getCurrentBucket();
     const key = bucketKey(metricKey, hour, isWeekday);
@@ -326,6 +365,94 @@ export class BehavioralProfiler {
     return this.cachedTopProcesses.slice(0, limit);
   }
 
+  /**
+   * Record that a signal was suppressed by the behavioral profile.
+   * Called by SystemMonitor when isProfileAnomalous returns false.
+   */
+  recordSuppression(metricKey: string): void {
+    // Monthly rotation: if the month changed, reset monthly counters
+    const now = new Date().toISOString().slice(0, 7);
+    if (now !== this.currentMonth) {
+      this.suppressedThisMonth = 0;
+      this.suppressedByMetric.clear();
+      this.currentMonth = now;
+    }
+
+    this.suppressedThisMonth++;
+    this.suppressedTotal++;
+    this.suppressedByMetric.set(metricKey, (this.suppressedByMetric.get(metricKey) || 0) + 1);
+  }
+
+  /**
+   * Get a dashboard-friendly summary of profiler status.
+   * Included in the telemetry heartbeat for server/dashboard display.
+   */
+  getDashboardSummary(): Record<string, any> {
+    // Compute learning coverage for core system metrics
+    let weekdayReady = 0;
+    let weekendReady = 0;
+    const weekdayTotal = BehavioralProfiler.CORE_METRICS.length * 24; // 3 metrics × 24 hours
+    const weekendTotal = weekdayTotal;
+
+    for (const metric of BehavioralProfiler.CORE_METRICS) {
+      for (let hour = 0; hour < 24; hour++) {
+        const wdKey = bucketKey(metric, hour, 1);
+        const wdBucket = this.profiles.get(wdKey);
+        if (wdBucket && wdBucket.sample_count >= this.MIN_SAMPLES) weekdayReady++;
+
+        const weKey = bucketKey(metric, hour, 0);
+        const weBucket = this.profiles.get(weKey);
+        if (weBucket && weBucket.sample_count >= this.MIN_SAMPLES) weekendReady++;
+      }
+    }
+
+    const weekdayCoverage = weekdayTotal > 0 ? weekdayReady / weekdayTotal : 0;
+    const weekendCoverage = weekendTotal > 0 ? weekendReady / weekendTotal : 0;
+    const status = weekdayCoverage >= BehavioralProfiler.ACTIVE_COVERAGE_THRESHOLD ? 'active' : 'learning';
+
+    // Learning day: days since first profile data appeared
+    let learningDay = 0;
+    const firstSeen = this.firstBucketSeen || this.findEarliestBucket();
+    if (firstSeen) {
+      learningDay = Math.max(1, Math.ceil((Date.now() - new Date(firstSeen).getTime()) / (1000 * 60 * 60 * 24)));
+      learningDay = Math.min(learningDay, BehavioralProfiler.LEARNING_DAYS_TARGET);
+      if (!this.firstBucketSeen) this.firstBucketSeen = firstSeen;
+    }
+
+    // Top suppressed metrics this month (top 3)
+    const topSuppressed = [...this.suppressedByMetric.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([metric, count]) => ({ metric, count }));
+
+    return {
+      status,
+      learning_progress: Math.round(weekdayCoverage * 100) / 100,
+      learning_day: learningDay,
+      learning_days_target: BehavioralProfiler.LEARNING_DAYS_TARGET,
+      weekday_coverage: Math.round(weekdayCoverage * 100) / 100,
+      weekend_coverage: Math.round(weekendCoverage * 100) / 100,
+      total_buckets: weekdayTotal + weekendTotal,
+      ready_buckets: weekdayReady + weekendReady,
+      suppressed_this_month: this.suppressedThisMonth,
+      suppressed_total: this.suppressedTotal,
+      top_suppressed_metrics: topSuppressed,
+    };
+  }
+
+  /**
+   * Find the earliest last_updated timestamp across all profile buckets.
+   */
+  private findEarliestBucket(): string {
+    let earliest = '';
+    for (const bucket of this.profiles.values()) {
+      if (!earliest || bucket.last_updated < earliest) {
+        earliest = bucket.last_updated;
+      }
+    }
+    return earliest;
+  }
+
   private rebuildTopProcesses(): void {
     this.cachedTopProcesses = [...this.processFrequency.entries()]
       .sort((a, b) => b[1] - a[1])
@@ -334,22 +461,37 @@ export class BehavioralProfiler {
   }
 
   /**
-   * Flush all dirty profile buckets to JSON files on disk.
+   * Flush all dirty profile buckets and stats to JSON files on disk.
    */
   async flush(): Promise<void> {
-    if (this.dirty.size === 0 && this.processFrequency.size === 0) return;
-
     try {
       // Flush profile buckets — write all profiles (not just dirty ones) for consistency
-      const allBuckets = [...this.profiles.values()];
-      fs.writeFileSync(this.profilesPath, JSON.stringify(allBuckets), 'utf8');
+      if (this.dirty.size > 0 || this.profiles.size > 0) {
+        const allBuckets = [...this.profiles.values()];
+        fs.writeFileSync(this.profilesPath, JSON.stringify(allBuckets), 'utf8');
+      }
 
       // Flush process frequency
-      const freqObj: Record<string, number> = {};
-      for (const [name, count] of this.processFrequency.entries()) {
-        freqObj[name] = count;
+      if (this.processFrequency.size > 0) {
+        const freqObj: Record<string, number> = {};
+        for (const [name, count] of this.processFrequency.entries()) {
+          freqObj[name] = count;
+        }
+        fs.writeFileSync(this.processFreqPath, JSON.stringify(freqObj), 'utf8');
       }
-      fs.writeFileSync(this.processFreqPath, JSON.stringify(freqObj), 'utf8');
+
+      // Flush suppression stats
+      const statsObj: Record<string, any> = {
+        suppressed_total: this.suppressedTotal,
+        suppressed_this_month: this.suppressedThisMonth,
+        current_month: this.currentMonth,
+        first_bucket_seen: this.firstBucketSeen,
+        suppressed_by_metric: {} as Record<string, number>,
+      };
+      for (const [metric, count] of this.suppressedByMetric.entries()) {
+        statsObj.suppressed_by_metric[metric] = count;
+      }
+      fs.writeFileSync(this.statsPath, JSON.stringify(statsObj), 'utf8');
 
       const flushedCount = this.dirty.size;
       this.dirty.clear();

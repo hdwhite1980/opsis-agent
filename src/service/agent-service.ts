@@ -1684,7 +1684,8 @@ class OPSISAgentService {
         disk_free_gb: diskStats.freeGB,
         active_issues: ticketStats.openTickets,
         process_count: processCount,
-        capability_mode: this.capabilityMode
+        capability_mode: this.capabilityMode,
+        behavioral_profile: this.behavioralProfiler.getDashboardSummary()
       }));
     } catch (error) {
       this.logger.error('Failed to send telemetry heartbeat', error);
