@@ -164,42 +164,40 @@ export class SystemMonitor {
       // Feed behavioral profiler
       this.profiler?.recordSample('system:cpu', cpuUsage);
 
-      // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
-      if (this.isSustainedBreach('cpu-critical', cpuUsage > this.thresholds.cpu_critical)) {
-        // Critical ceiling: always emit at >= 98% regardless of profile
-        if (cpuUsage >= this.CRITICAL_CEILING_CPU || this.isProfileAnomalous('system:cpu', cpuUsage)) {
-          this.emitSignal({
-            id: 'cpu-critical',
-            category: 'performance',
-            severity: 'critical',
-            metric: 'cpu_usage',
-            value: cpuUsage,
-            threshold: this.thresholds.cpu_critical,
-            message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
-            timestamp: new Date(),
-            eventId: 2001,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
-        } else {
-          this.logger.debug('CPU critical breach suppressed by behavioral profile', { cpuUsage });
-        }
-      } else if (this.isSustainedBreach('cpu-high', cpuUsage > this.thresholds.cpu_warning)) {
-        if (cpuUsage >= this.CRITICAL_CEILING_CPU || this.isProfileAnomalous('system:cpu', cpuUsage)) {
-          this.emitSignal({
-            id: 'cpu-high',
-            category: 'performance',
-            severity: 'warning',
-            metric: 'cpu_usage',
-            value: cpuUsage,
-            threshold: this.thresholds.cpu_warning,
-            message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
-            timestamp: new Date(),
-            eventId: 2002,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
-        } else {
-          this.logger.debug('CPU warning breach suppressed by behavioral profile', { cpuUsage });
-        }
+      // Profiler check happens BEFORE sustained breach counting.
+      // If the profiler says "within_normal", the sample doesn't count as a breach
+      // at all — the consecutive counter resets, preserving sustained detection integrity.
+      const cpuProfileAnomalous = cpuUsage >= this.CRITICAL_CEILING_CPU || this.isProfileAnomalous('system:cpu', cpuUsage);
+
+      const cpuCriticalBreach = cpuUsage > this.thresholds.cpu_critical && cpuProfileAnomalous;
+      const cpuWarningBreach = cpuUsage > this.thresholds.cpu_warning && cpuProfileAnomalous;
+
+      if (this.isSustainedBreach('cpu-critical', cpuCriticalBreach)) {
+        this.emitSignal({
+          id: 'cpu-critical',
+          category: 'performance',
+          severity: 'critical',
+          metric: 'cpu_usage',
+          value: cpuUsage,
+          threshold: this.thresholds.cpu_critical,
+          message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2001,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      } else if (this.isSustainedBreach('cpu-high', cpuWarningBreach)) {
+        this.emitSignal({
+          id: 'cpu-high',
+          category: 'performance',
+          severity: 'warning',
+          metric: 'cpu_usage',
+          value: cpuUsage,
+          threshold: this.thresholds.cpu_warning,
+          message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2002,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
       }
 
       // Per-process CPU monitoring
@@ -283,46 +281,44 @@ export class SystemMonitor {
       // Feed behavioral profiler
       this.profiler?.recordSample('system:memory', usedPercent);
 
-      // Only alert after sustained threshold breaches (3 consecutive checks = ~90s)
-      if (this.isSustainedBreach('memory-critical', usedPercent > this.thresholds.memory_critical)) {
-        if (usedPercent >= this.CRITICAL_CEILING_MEMORY || this.isProfileAnomalous('system:memory', usedPercent)) {
-          this.emitSignal({
-            id: 'memory-critical',
-            category: 'performance',
-            severity: 'critical',
-            metric: 'memory_usage',
-            value: usedPercent,
-            threshold: this.thresholds.memory_critical,
-            message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
-            timestamp: new Date(),
-            metadata: {
-              totalGB: (totalMem / 1024 / 1024 / 1024).toFixed(2),
-              freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
-              usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
-            },
-            eventId: 2010,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
-        } else {
-          this.logger.debug('Memory critical breach suppressed by behavioral profile', { usedPercent });
-        }
-      } else if (this.isSustainedBreach('memory-high', usedPercent > this.thresholds.memory_warning)) {
-        if (usedPercent >= this.CRITICAL_CEILING_MEMORY || this.isProfileAnomalous('system:memory', usedPercent)) {
-          this.emitSignal({
-            id: 'memory-high',
-            category: 'performance',
-            severity: 'warning',
-            metric: 'memory_usage',
-            value: usedPercent,
-            threshold: this.thresholds.memory_warning,
-            message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
-            timestamp: new Date(),
-            eventId: 2011,
-            eventSource: 'OPSIS-SystemMonitor'
-          });
-        } else {
-          this.logger.debug('Memory warning breach suppressed by behavioral profile', { usedPercent });
-        }
+      // Profiler check before sustained breach counting — if "within_normal",
+      // the sample doesn't count as a breach and the consecutive counter resets.
+      const memProfileAnomalous = usedPercent >= this.CRITICAL_CEILING_MEMORY || this.isProfileAnomalous('system:memory', usedPercent);
+
+      const memCriticalBreach = usedPercent > this.thresholds.memory_critical && memProfileAnomalous;
+      const memWarningBreach = usedPercent > this.thresholds.memory_warning && memProfileAnomalous;
+
+      if (this.isSustainedBreach('memory-critical', memCriticalBreach)) {
+        this.emitSignal({
+          id: 'memory-critical',
+          category: 'performance',
+          severity: 'critical',
+          metric: 'memory_usage',
+          value: usedPercent,
+          threshold: this.thresholds.memory_critical,
+          message: `Memory usage sustained critical: ${usedPercent.toFixed(1)}% (${(freeMem / 1024 / 1024 / 1024).toFixed(2)}GB free)`,
+          timestamp: new Date(),
+          metadata: {
+            totalGB: (totalMem / 1024 / 1024 / 1024).toFixed(2),
+            freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
+            usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
+          },
+          eventId: 2010,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
+      } else if (this.isSustainedBreach('memory-high', memWarningBreach)) {
+        this.emitSignal({
+          id: 'memory-high',
+          category: 'performance',
+          severity: 'warning',
+          metric: 'memory_usage',
+          value: usedPercent,
+          threshold: this.thresholds.memory_warning,
+          message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
+          timestamp: new Date(),
+          eventId: 2011,
+          eventSource: 'OPSIS-SystemMonitor'
+        });
       }
 
       // Memory pressure detection
