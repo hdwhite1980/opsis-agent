@@ -26,6 +26,7 @@ export interface RunbookMatch {
   confidence: number;
   trigger: string;
   steps: RunbookStep[];
+  fallback_chains?: any[];
 }
 
 export interface RunbookStep {
@@ -996,7 +997,8 @@ ConvertTo-Json -Depth 3
         name: bestMatch.runbook.name,
         confidence: bestMatch.confidence,
         trigger: bestMatch.trigger,
-        steps: bestMatch.runbook.steps
+        steps: bestMatch.runbook.steps,
+        fallback_chains: (bestMatch.runbook as any).fallback_chains
       };
     }
 

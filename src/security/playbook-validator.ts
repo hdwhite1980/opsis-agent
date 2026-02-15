@@ -122,6 +122,20 @@ export function validatePlaybook(playbook: any): ValidationResult {
     });
   }
 
+  // Validate fallback chains if present
+  if (playbook.fallback_chains && Array.isArray(playbook.fallback_chains)) {
+    playbook.fallback_chains.forEach((chain: any, chainIndex: number) => {
+      if (!chain.fallback_steps || !Array.isArray(chain.fallback_steps)) {
+        errors.push(`Fallback chain ${chainIndex + 1}: must have a fallback_steps array`);
+      } else {
+        chain.fallback_steps.forEach((step: any, stepIndex: number) => {
+          const stepErrors = validateStep(step, stepIndex);
+          errors.push(...stepErrors.map(e => `Fallback chain ${chainIndex + 1}: ${e}`));
+        });
+      }
+    });
+  }
+
   return {
     valid: errors.length === 0,
     errors

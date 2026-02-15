@@ -2,7 +2,7 @@
 ; Service: compiled standalone exe (pkg). GUI: localhost web UI served by agent service.
 
 #define AppName "OPSIS Agent"
-#define AppVersion "1.2.0"
+#define AppVersion "1.3.0"
 #define AppPublisher "OPSIS"
 #define AppURL "https://opsis.io"
 #define ServiceName "OPSIS Agent Service"

@@ -403,8 +403,8 @@ function securePowerShell(script: string, options: SecureExecOptions = {}): { st
 // PROTECTED RESOURCES
 // ===========================================
 
-// Protected processes that must NEVER be killed
-const PROTECTED_PROCESSES = new Set([
+// Tier 1: Core protected resources — hardcoded, immutable
+const CORE_PROTECTED_PROCESSES: ReadonlySet<string> = new Set([
   'svchost.exe', 'lsass.exe', 'csrss.exe', 'winlogon.exe',
   'dwm.exe', 'explorer.exe', 'services.exe', 'smss.exe',
   'wininit.exe', 'system', 'system idle process',
@@ -412,12 +412,106 @@ const PROTECTED_PROCESSES = new Set([
   'taskhostw.exe', 'sihost.exe', 'fontdrvhost.exe', 'audiodg.exe'
 ]);
 
-const PROTECTED_SERVICES = new Set([
+const CORE_PROTECTED_SERVICES: ReadonlySet<string> = new Set([
   'rpcss', 'dcomlaunch', 'lsm', 'samss', 'eventlog',
   'plugplay', 'power', 'winmgmt', 'cryptsvc', 'bits',
   'lanmanserver', 'lanmanworkstation', 'schedule', 'w32time',
   'dnscache', 'dhcp', 'netlogon', 'wuauserv', 'trustedinstaller'
 ]);
+
+// Tier 2: Server-managed protections (MSP-defined, pushed via config-update)
+const serverProtectedProcesses: Set<string> = new Set();
+const serverProtectedServices: Set<string> = new Set();
+
+// Tier 3: Auto-learned protections (from dependency graph — services with 3+ dependents)
+const learnedProtectedProcesses: Set<string> = new Set();
+const learnedProtectedServices: Set<string> = new Set();
+
+// Persistence path (set by Primitives constructor)
+let protectedResourcesPath: string = '';
+
+/**
+ * Check if a process or service name is protected at any tier.
+ */
+export function isProtected(name: string, type: 'process' | 'service'): boolean {
+  const lower = name.toLowerCase();
+  if (type === 'process') {
+    return CORE_PROTECTED_PROCESSES.has(lower) ||
+           serverProtectedProcesses.has(lower) ||
+           learnedProtectedProcesses.has(lower);
+  }
+  return CORE_PROTECTED_SERVICES.has(lower) ||
+         serverProtectedServices.has(lower) ||
+         learnedProtectedServices.has(lower);
+}
+
+/**
+ * Update server-managed protections (tier 2).
+ * Called when agent receives config-update with protected_applications.
+ */
+export function updateServerProtections(
+  processes: string[],
+  services: string[]
+): void {
+  serverProtectedProcesses.clear();
+  serverProtectedServices.clear();
+  for (const p of processes) serverProtectedProcesses.add(p.toLowerCase());
+  for (const s of services) serverProtectedServices.add(s.toLowerCase());
+  saveProtectedResources();
+}
+
+/**
+ * Update auto-learned protections (tier 3).
+ * Rule: any service with 3+ downstream dependents is auto-protected.
+ */
+export function updateLearnedProtections(
+  dependencyMap: { serviceDependents?: Record<string, string[]> }
+): void {
+  learnedProtectedServices.clear();
+  if (dependencyMap.serviceDependents) {
+    for (const [svc, dependents] of Object.entries(dependencyMap.serviceDependents)) {
+      if (dependents.length >= 3) {
+        learnedProtectedServices.add(svc.toLowerCase());
+      }
+    }
+  }
+  saveProtectedResources();
+}
+
+function saveProtectedResources(): void {
+  if (!protectedResourcesPath) return;
+  try {
+    const data = {
+      serverProcesses: Array.from(serverProtectedProcesses),
+      serverServices: Array.from(serverProtectedServices),
+      learnedProcesses: Array.from(learnedProtectedProcesses),
+      learnedServices: Array.from(learnedProtectedServices),
+      savedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(protectedResourcesPath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    // Non-fatal — protections still work in-memory
+  }
+}
+
+function loadProtectedResources(): void {
+  if (!protectedResourcesPath) return;
+  try {
+    if (fs.existsSync(protectedResourcesPath)) {
+      const data = JSON.parse(fs.readFileSync(protectedResourcesPath, 'utf8'));
+      if (data.serverProcesses) for (const p of data.serverProcesses) serverProtectedProcesses.add(p);
+      if (data.serverServices) for (const s of data.serverServices) serverProtectedServices.add(s);
+      if (data.learnedProcesses) for (const p of data.learnedProcesses) learnedProtectedProcesses.add(p);
+      if (data.learnedServices) for (const s of data.learnedServices) learnedProtectedServices.add(s);
+    }
+  } catch (e) {
+    // Non-fatal
+  }
+}
+
+// Backward compatibility aliases for direct Set checks in this file
+const PROTECTED_PROCESSES = CORE_PROTECTED_PROCESSES;
+const PROTECTED_SERVICES = CORE_PROTECTED_SERVICES;
 
 // Directories where file operations are allowed
 const ALLOWED_FILE_DIRS = [
@@ -473,8 +567,12 @@ function checkRateLimit(operation: string): void {
 export class Primitives {
   private logger: Logger;
 
-  constructor(logger: Logger) {
+  constructor(logger: Logger, dataDir?: string) {
     this.logger = logger;
+    if (dataDir) {
+      protectedResourcesPath = path.join(dataDir, 'protected-resources.json');
+      loadProtectedResources();
+    }
   }
 
   // ========================================
@@ -487,7 +585,7 @@ export class Primitives {
       checkRateLimit('killProcess');
       validateIdentifier(processName, 'processName');
 
-      if (PROTECTED_PROCESSES.has(processName.toLowerCase())) {
+      if (isProtected(processName, 'process')) {
         return { success: false, error: `Cannot kill protected process: ${processName}`, duration_ms: Date.now() - startTime };
       }
 
@@ -577,7 +675,7 @@ export class Primitives {
       checkRateLimit('restartService');
       validateIdentifier(serviceName, 'serviceName');
 
-      if (PROTECTED_SERVICES.has(serviceName.toLowerCase())) {
+      if (isProtected(serviceName, 'service')) {
         return { success: false, error: `Cannot restart protected service: ${serviceName}`, duration_ms: Date.now() - startTime };
       }
 
@@ -627,7 +725,7 @@ export class Primitives {
       checkRateLimit('restartService');
       validateIdentifier(serviceName, 'serviceName');
 
-      if (PROTECTED_SERVICES.has(serviceName.toLowerCase())) {
+      if (isProtected(serviceName, 'service')) {
         return { success: false, error: `Cannot stop protected service: ${serviceName}`, duration_ms: Date.now() - startTime };
       }
 

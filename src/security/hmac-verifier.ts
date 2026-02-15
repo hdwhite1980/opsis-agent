@@ -26,7 +26,7 @@ function sortKeysRecursive(obj: any): any {
   }
   return obj;
 }
-const MAX_MESSAGE_AGE_MS = 5 * 60 * 1000; // 5 minutes - replay protection
+const MAX_MESSAGE_AGE_MS = 2 * 60 * 1000; // 2 minutes - replay protection (tightened from 5 min)
 
 // Track used nonces to prevent replay attacks
 const usedNonces = new Map<string, number>();
@@ -87,7 +87,7 @@ export async function verifyServerMessage(message: any): Promise<VerificationRes
     return { valid: false, error: 'Message too old (replay protection)' };
   }
 
-  if (messageTime > now + 60000) { // Allow 1 minute clock skew
+  if (messageTime > now + 30000) { // Allow 30 seconds future clock skew (tightened from 60s)
     return { valid: false, error: 'Message timestamp in future' };
   }
 

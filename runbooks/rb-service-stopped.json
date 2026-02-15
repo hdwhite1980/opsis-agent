@@ -37,6 +37,36 @@
       "params": {}
     }
   ],
+  "fallback_chains": [
+    {
+      "trigger": "step_failure",
+      "condition": {
+        "failed_step_type": "service"
+      },
+      "max_attempts": 2,
+      "fallback_steps": [
+        {
+          "type": "powershell",
+          "action": "Get-Service -Name '{eventData.serviceName}' | Select-Object Name, Status, StartType, DependentServices | ConvertTo-Json",
+          "params": {},
+          "allowFailure": true
+        },
+        {
+          "type": "powershell",
+          "action": "Start-Sleep -Seconds 5",
+          "params": {}
+        },
+        {
+          "type": "service",
+          "action": "start",
+          "params": {
+            "serviceName": "{eventData.serviceName}"
+          },
+          "timeout": 30000
+        }
+      ]
+    }
+  ],
   "risk_class": "A",
   "auto_execute_threshold": 85
 }

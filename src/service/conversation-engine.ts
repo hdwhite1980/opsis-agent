@@ -9,6 +9,7 @@ import { TroubleshootingRunner, IssueCategory, DiagnosticData } from './troubles
 import { Primitives } from '../execution/primitives';
 import { ActionTicketManager } from './action-ticket-manager';
 import { TicketDatabase } from './ticket-database';
+import { BaselineManager, ColorCodedReport } from './baseline-manager';
 
 // Conversation states
 type SessionState =
@@ -155,12 +156,38 @@ const QUICK_PICKS: Record<string, { category: IssueCategory; description: string
   'other': { category: 'general', description: 'Something else' }
 };
 
+// Multi-phrase intent patterns for natural language matching (Enhancement 9)
+// These match common user phrases to diagnostic categories with higher confidence
+// than single-keyword matching
+interface IntentPattern {
+  phrases: string[];
+  category: IssueCategory;
+  confidence: number;
+}
+
+const INTENT_PATTERNS: IntentPattern[] = [
+  { phrases: ['outlook', 'excel', 'word', 'teams', 'chrome', 'firefox', 'edge'], category: 'service', confidence: 0.7 },
+  { phrases: ['freezing', 'frozen', 'not responding', 'hang', 'stuck'], category: 'cpu', confidence: 0.6 },
+  { phrases: ['slow', 'sluggish', 'takes forever', 'laggy'], category: 'cpu', confidence: 0.6 },
+  { phrases: ['crash', 'crashing', 'closes itself', 'stopped working'], category: 'memory', confidence: 0.8 },
+  { phrases: ['internet', 'wifi', 'network', 'vpn', 'cant connect', "can't connect"], category: 'network', confidence: 0.8 },
+  { phrases: ['printer', 'print', 'cant print', "can't print", 'print queue'], category: 'service', confidence: 0.8 },
+  { phrases: ['disk full', 'no space', 'storage', 'out of space'], category: 'disk', confidence: 0.8 },
+  { phrases: ['blue screen', 'bsod', 'restart itself', 'keeps rebooting'], category: 'general', confidence: 0.9 },
+  { phrases: ['update', 'windows update', 'wont update', "won't update"], category: 'service', confidence: 0.7 },
+  { phrases: ['email', 'cant send', "can't send", 'cant receive', "can't receive"], category: 'network', confidence: 0.6 },
+];
+
+// Keywords that indicate the user wants a baseline comparison (Enhancement 10)
+const BASELINE_KEYWORDS = ['slower', 'changed', 'different', 'was faster', 'feels slow', 'used to be', 'compared to before'];
+
 export class ConversationEngine {
   private logger: Logger;
   private troubleshootingRunner: TroubleshootingRunner;
   private primitives: Primitives;
   private actionTicketManager: ActionTicketManager;
   private ticketDb: TicketDatabase;
+  private baselineManager: BaselineManager | null = null;
   private sessions: Map<string, ConversationSession> = new Map();
 
   constructor(
@@ -175,6 +202,11 @@ export class ConversationEngine {
     this.primitives = primitives;
     this.actionTicketManager = actionTicketManager;
     this.ticketDb = ticketDb;
+  }
+
+  /** Set baseline manager for baseline comparison feature */
+  setBaselineManager(manager: BaselineManager): void {
+    this.baselineManager = manager;
   }
 
   createSession(sessionId: string, callback: ConversationCallback): void {
@@ -395,6 +427,12 @@ export class ConversationEngine {
   private async handleProblemDescription(session: ConversationSession, text: string): Promise<void> {
     session.userDescription = text;
 
+    // Enhancement 10: Check for baseline comparison intent first
+    if (this.isBaselineComparisonIntent(text)) {
+      await this.handleBaselineComparison(session);
+      return;
+    }
+
     // Classify the problem
     const classification = this.classifyProblem(text);
     session.category = classification.category;
@@ -424,6 +462,90 @@ export class ConversationEngine {
     }
   }
 
+  /** Check if the user's message indicates they want a baseline comparison */
+  private isBaselineComparisonIntent(text: string): boolean {
+    const lower = text.toLowerCase();
+    return BASELINE_KEYWORDS.some(keyword => lower.includes(keyword));
+  }
+
+  /** Run a baseline comparison and present color-coded results (Enhancement 10) */
+  private async handleBaselineComparison(session: ConversationSession): Promise<void> {
+    if (!this.baselineManager) {
+      // No baseline manager — fall back to normal classification
+      const classification = this.classifyProblem(session.userDescription);
+      session.category = classification.category || 'general';
+      session.callback.sendMessage(
+        'I\'ll run a general health check on your system. This usually takes about 15 seconds...'
+      );
+      await this.runDiagnostics(session);
+      return;
+    }
+
+    session.state = 'RUNNING_DIAGNOSTICS';
+    session.category = 'general';
+    session.callback.sendMessage(
+      'I\'ll compare your system to its baseline to see what has changed. This takes about 20 seconds...'
+    );
+    session.callback.sendProgress(1, 3, 'Capturing current metrics...');
+
+    try {
+      const report = await this.baselineManager.getColorCodedReport();
+
+      if (!report) {
+        session.callback.sendMessage(
+          'No baseline has been captured yet for your system. I\'ll run a general health check instead.'
+        );
+        await this.runDiagnostics(session);
+        return;
+      }
+
+      session.callback.sendProgress(3, 3, 'Comparing to baseline...');
+
+      // Format the color-coded report as a readable table
+      const statusIcons: Record<string, string> = { green: 'OK', yellow: 'WARN', red: 'HIGH' };
+      let reportText = 'Here\'s how your system compares to its baseline:\n\n';
+      for (const item of report.items) {
+        const tag = statusIcons[item.status] || '?';
+        reportText += `[${tag}] ${item.label}: ${item.baseline} → ${item.current} (${item.change})\n`;
+      }
+      reportText += `\n${report.summary}`;
+
+      session.callback.sendMessage(reportText, {
+        type: 'baseline-report',
+        items: report.items,
+        summary: report.summary
+      });
+
+      // If any RED items, offer to run the relevant diagnostic automatically
+      if (report.hasRedItems && report.redCategories.length > 0) {
+        const primaryCategory = report.redCategories[0] as IssueCategory;
+        session.category = primaryCategory;
+
+        const pattern = PROBLEM_PATTERNS.find(p => p.category === primaryCategory);
+        const categoryName = pattern ? pattern.friendlyName.toLowerCase() : primaryCategory;
+
+        session.callback.sendMessage(
+          `I noticed significant changes in ${categoryName}. Would you like me to run a detailed diagnostic? Say "yes" to proceed.`
+        );
+        // Set to FOLLOW_UP with index past all questions — next user message triggers diagnostics
+        session.state = 'FOLLOW_UP';
+        session.followUpIndex = 99;
+      } else {
+        session.callback.sendMessage(
+          'Your system looks healthy compared to its baseline. If you\'re still experiencing issues, describe them and I\'ll run a detailed check.'
+        );
+        session.state = 'PROBLEM_DESCRIPTION';
+      }
+    } catch (error: any) {
+      this.logger.error('Baseline comparison failed', { error: error.message, sessionId: session.id });
+      session.callback.sendMessage(
+        'I had trouble comparing to the baseline. Let me run a standard health check instead.'
+      );
+      session.category = 'general';
+      await this.runDiagnostics(session);
+    }
+  }
+
   private async handleFollowUp(session: ConversationSession, text: string): Promise<void> {
     session.followUpAnswers.push(text);
     session.followUpIndex++;
@@ -441,8 +563,17 @@ export class ConversationEngine {
     }
   }
 
-  private classifyProblem(text: string): { category: IssueCategory; confidence: number } {
+  private classifyProblem(text: string): { category: IssueCategory; confidence: number; matchedPhrases?: string[] } {
     const lower = text.toLowerCase();
+
+    // Phase 1: Try multi-phrase intent matching (Enhancement 9)
+    // This catches natural language like "my Outlook keeps freezing" better than single keywords
+    const intentResult = this.matchIntent(lower);
+    if (intentResult && intentResult.confidence >= 0.5) {
+      return intentResult;
+    }
+
+    // Phase 2: Fall back to existing keyword matching
     const scores: Map<IssueCategory, number> = new Map();
 
     for (const pattern of PROBLEM_PATTERNS) {
@@ -474,6 +605,60 @@ export class ConversationEngine {
     // Boost confidence for multi-keyword matches
     const confidence = Math.min(0.5 + bestScore * 5, 1.0);
     return { category: bestCategory, confidence };
+  }
+
+  /**
+   * Multi-phrase intent matching (Enhancement 9).
+   * Scores each intent pattern by how many of its phrases appear in the user message.
+   * When multiple patterns match, their confidences combine to boost the best category.
+   */
+  private matchIntent(lower: string): { category: IssueCategory; confidence: number; matchedPhrases: string[] } | null {
+    const categoryScores: Map<IssueCategory, { totalConfidence: number; phrases: string[] }> = new Map();
+
+    for (const pattern of INTENT_PATTERNS) {
+      const matched: string[] = [];
+      for (const phrase of pattern.phrases) {
+        if (lower.includes(phrase)) {
+          matched.push(phrase);
+        }
+      }
+      if (matched.length > 0) {
+        // Scale confidence by match density within this pattern
+        const matchRatio = matched.length / pattern.phrases.length;
+        const patternScore = pattern.confidence * (0.5 + matchRatio * 0.5);
+
+        const existing = categoryScores.get(pattern.category);
+        if (existing) {
+          existing.totalConfidence = Math.min(existing.totalConfidence + patternScore * 0.3, 1.0);
+          existing.phrases.push(...matched);
+        } else {
+          categoryScores.set(pattern.category, { totalConfidence: patternScore, phrases: [...matched] });
+        }
+      }
+    }
+
+    if (categoryScores.size === 0) return null;
+
+    // Find best category
+    let bestCategory: IssueCategory = 'general';
+    let bestScore = 0;
+    let bestPhrases: string[] = [];
+
+    for (const [cat, data] of categoryScores) {
+      if (data.totalConfidence > bestScore) {
+        bestScore = data.totalConfidence;
+        bestCategory = cat;
+        bestPhrases = data.phrases;
+      }
+    }
+
+    // Boost confidence when multiple distinct patterns contributed
+    if (categoryScores.size > 1) {
+      // E.g., "outlook freezing" matches both application and performance patterns
+      bestScore = Math.min(bestScore + 0.15, 1.0);
+    }
+
+    return { category: bestCategory, confidence: bestScore, matchedPhrases: [...new Set(bestPhrases)] };
   }
 
   private async runDiagnostics(session: ConversationSession): Promise<void> {

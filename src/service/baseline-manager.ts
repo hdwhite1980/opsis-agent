@@ -54,6 +54,21 @@ export interface BaselineDiff {
   removed_software: string[];
 }
 
+export interface ColorCodedItem {
+  label: string;
+  baseline: string;
+  current: string;
+  change: string;    // "+15%", "-2 GB", "3 new"
+  status: 'green' | 'yellow' | 'red';
+}
+
+export interface ColorCodedReport {
+  items: ColorCodedItem[];
+  hasRedItems: boolean;
+  redCategories: string[];  // e.g. ['cpu', 'memory'] — for auto-suggesting diagnostics
+  summary: string;
+}
+
 const BASELINE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 export class BaselineManager {
@@ -154,7 +169,14 @@ export class BaselineManager {
     return this.loadBaseline();
   }
 
-  getBaselineDiff(currentMetrics: { cpu?: number; memory?: number; disks?: Array<{ drive: string; free_percent: number }> }): BaselineDiff | null {
+  getBaselineDiff(currentMetrics: {
+    cpu?: number;
+    memory?: number;
+    disks?: Array<{ drive: string; free_percent: number }>;
+    processes?: Array<{ name: string; memory_mb: number }>;
+    auto_start_services?: string[];
+    installed_software?: Array<{ name: string; version: string }>;
+  }): BaselineDiff | null {
     const baseline = this.getBaseline();
     if (!baseline) return null;
 
@@ -180,7 +202,187 @@ export class BaselineManager {
       }
     }
 
+    // Compare top processes
+    if (currentMetrics.processes) {
+      const baselineNames = new Set(baseline.top_processes.map(p => p.name.toLowerCase()));
+      for (const proc of currentMetrics.processes) {
+        if (!baselineNames.has(proc.name.toLowerCase())) {
+          diff.new_processes.push(proc.name);
+        }
+      }
+    }
+
+    // Compare auto-start services
+    if (currentMetrics.auto_start_services) {
+      const currentSet = new Set(currentMetrics.auto_start_services.map(s => s.toLowerCase()));
+      for (const svc of baseline.services.auto_start) {
+        if (!currentSet.has(svc.toLowerCase())) {
+          diff.missing_services.push(svc);
+        }
+      }
+    }
+
+    // Compare installed software
+    if (currentMetrics.installed_software) {
+      const baselineNames = new Set(baseline.installed_software.map(s => s.name.toLowerCase()));
+      const currentNames = new Set(currentMetrics.installed_software.map(s => s.name.toLowerCase()));
+      for (const sw of currentMetrics.installed_software) {
+        if (!baselineNames.has(sw.name.toLowerCase())) {
+          diff.new_software.push(sw.name);
+        }
+      }
+      for (const sw of baseline.installed_software) {
+        if (!currentNames.has(sw.name.toLowerCase())) {
+          diff.removed_software.push(sw.name);
+        }
+      }
+    }
+
     return diff;
+  }
+
+  /**
+   * Get a color-coded report comparing current system state to baseline.
+   * Green: within 10% of baseline. Yellow: 10-25% deviation. Red: >25% deviation or issues.
+   */
+  async getColorCodedReport(): Promise<ColorCodedReport | null> {
+    const baseline = this.getBaseline();
+    if (!baseline) return null;
+
+    // Capture fresh metrics
+    const [cpuAvg, memInfo, diskInfo, topProcs, serviceInfo, software] = await Promise.allSettled([
+      this.getCpuAverage(),
+      this.getMemoryInfo(),
+      this.getDiskInfo(),
+      this.getTopProcesses(),
+      this.getServiceInfo(),
+      this.getSoftwareList()
+    ]);
+
+    const items: ColorCodedItem[] = [];
+    const redCategories: string[] = [];
+
+    // CPU comparison
+    if (cpuAvg.status === 'fulfilled') {
+      const current = cpuAvg.value;
+      const base = baseline.cpu.average_usage;
+      const change = current - base;
+      const pctChange = base > 0 ? Math.abs(change / base) * 100 : Math.abs(change);
+      const status = pctChange <= 10 ? 'green' : pctChange <= 25 ? 'yellow' : 'red';
+      if (status === 'red') redCategories.push('cpu');
+      items.push({
+        label: 'CPU Usage',
+        baseline: `${base}%`,
+        current: `${current}%`,
+        change: `${change >= 0 ? '+' : ''}${change}%`,
+        status
+      });
+    }
+
+    // Memory comparison
+    if (memInfo.status === 'fulfilled') {
+      const current = memInfo.value.usagePercent;
+      const base = baseline.memory.usage_percent;
+      const change = current - base;
+      const pctChange = base > 0 ? Math.abs(change / base) * 100 : Math.abs(change);
+      const status = pctChange <= 10 ? 'green' : pctChange <= 25 ? 'yellow' : 'red';
+      if (status === 'red') redCategories.push('memory');
+      items.push({
+        label: 'Memory Usage',
+        baseline: `${base}%`,
+        current: `${current}%`,
+        change: `${change >= 0 ? '+' : ''}${change}%`,
+        status
+      });
+    }
+
+    // Disk comparison
+    if (diskInfo.status === 'fulfilled') {
+      for (const disk of diskInfo.value) {
+        const baseDisk = baseline.disks.find(d => d.drive === disk.drive);
+        if (baseDisk) {
+          const change = baseDisk.free_percent - disk.free_percent; // positive = less free space
+          const status = Math.abs(change) <= 10 ? 'green' : Math.abs(change) <= 25 ? 'yellow' : 'red';
+          if (status === 'red') redCategories.push('disk');
+          items.push({
+            label: `${disk.drive} Free Space`,
+            baseline: `${baseDisk.free_percent}%`,
+            current: `${disk.free_percent}%`,
+            change: `${change > 0 ? '-' : '+'}${Math.abs(change)}%`,
+            status
+          });
+        }
+      }
+    }
+
+    // New processes
+    if (topProcs.status === 'fulfilled') {
+      const baselineNames = new Set(baseline.top_processes.map(p => p.name.toLowerCase()));
+      const newProcs = topProcs.value.filter(p => !baselineNames.has(p.name.toLowerCase()));
+      if (newProcs.length > 0) {
+        const status = newProcs.length > 3 ? 'red' : newProcs.length > 1 ? 'yellow' : 'green';
+        if (status === 'red') redCategories.push('cpu');
+        items.push({
+          label: 'New Top Processes',
+          baseline: `${baseline.top_processes.length} tracked`,
+          current: `${newProcs.length} new`,
+          change: `${newProcs.length} new`,
+          status
+        });
+      }
+    }
+
+    // Missing auto-start services
+    if (serviceInfo.status === 'fulfilled') {
+      const currentAutoSet = new Set(serviceInfo.value.auto_start.map(s => s.toLowerCase()));
+      const missing = baseline.services.auto_start.filter(s => !currentAutoSet.has(s.toLowerCase()));
+      if (missing.length > 0) {
+        const status = missing.length >= 3 ? 'red' : 'yellow';
+        if (status === 'red') redCategories.push('service');
+        items.push({
+          label: 'Missing Services',
+          baseline: `${baseline.services.auto_start.length} auto-start`,
+          current: `${missing.length} stopped`,
+          change: `${missing.length} missing`,
+          status
+        });
+      }
+    }
+
+    // Software changes
+    if (software.status === 'fulfilled') {
+      const baselineNames = new Set(baseline.installed_software.map(s => s.name.toLowerCase()));
+      const currentNames = new Set(software.value.map(s => s.name.toLowerCase()));
+      const newSw = software.value.filter(s => !baselineNames.has(s.name.toLowerCase()));
+      const removedSw = baseline.installed_software.filter(s => !currentNames.has(s.name.toLowerCase()));
+      const totalChanges = newSw.length + removedSw.length;
+      if (totalChanges > 0) {
+        const status = totalChanges > 5 ? 'yellow' : 'green';
+        items.push({
+          label: 'Software Changes',
+          baseline: `${baseline.installed_software.length} apps`,
+          current: `${software.value.length} apps`,
+          change: `${newSw.length} new, ${removedSw.length} removed`,
+          status
+        });
+      }
+    }
+
+    const hasRedItems = items.some(i => i.status === 'red');
+    const greenCount = items.filter(i => i.status === 'green').length;
+    const yellowCount = items.filter(i => i.status === 'yellow').length;
+    const redCount = items.filter(i => i.status === 'red').length;
+
+    let summary: string;
+    if (redCount > 0) {
+      summary = `${redCount} significant change${redCount > 1 ? 's' : ''} detected since your baseline was captured.`;
+    } else if (yellowCount > 0) {
+      summary = `Some moderate changes detected, but nothing critical.`;
+    } else {
+      summary = `Your system looks similar to your baseline. No significant changes detected.`;
+    }
+
+    return { items, hasRedItems, redCategories: [...new Set(redCategories)], summary };
   }
 
   private loadBaseline(): SystemBaseline | null {

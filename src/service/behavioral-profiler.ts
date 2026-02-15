@@ -48,9 +48,28 @@ export interface ProcessSnapshot {
   memoryMB: number;
 }
 
+export interface MonthlyProfileBucket {
+  metric_key: string;
+  month: number;          // 0-11
+  sample_count: number;
+  mean_deviation: number; // Deviation from the overall mean
+  m2: number;
+  last_updated: string;
+}
+
+interface OverallMeanTracker {
+  mean: number;
+  sampleCount: number;
+  m2: number;
+}
+
 // Composite key for the in-memory profile cache
 function bucketKey(metricKey: string, hour: number, isWeekday: number): string {
   return `${metricKey}|${hour}|${isWeekday}`;
+}
+
+function monthlyKey(metricKey: string, month: number): string {
+  return `${metricKey}|month:${month}`;
 }
 
 function getCurrentBucket(): { hour: number; isWeekday: number } {
@@ -75,6 +94,10 @@ export class BehavioralProfiler {
   private processFrequency: Map<string, number> = new Map();
   private cachedTopProcesses: string[] = [];
 
+  // Monthly seasonality: 12 buckets per metric tracking deviation from overall mean
+  private monthlyProfiles: Map<string, MonthlyProfileBucket> = new Map();
+  private overallMeans: Map<string, OverallMeanTracker> = new Map();
+
   private flushInterval: NodeJS.Timeout | null = null;
 
   private readonly MIN_SAMPLES = 50;
@@ -98,6 +121,7 @@ export class BehavioralProfiler {
   private readonly profilesPath: string;
   private readonly processFreqPath: string;
   private readonly statsPath: string;
+  private readonly monthlyProfilesPath: string;
 
   constructor(dataDir: string, logger: Logger) {
     this.dataDir = dataDir;
@@ -105,6 +129,7 @@ export class BehavioralProfiler {
     this.profilesPath = path.join(dataDir, 'behavioral-profiles.json');
     this.processFreqPath = path.join(dataDir, 'process-frequency.json');
     this.statsPath = path.join(dataDir, 'profiler-stats.json');
+    this.monthlyProfilesPath = path.join(dataDir, 'monthly-profiles.json');
     this.currentMonth = new Date().toISOString().slice(0, 7); // "2026-02"
 
     // Load existing profiles from disk on startup
@@ -139,6 +164,23 @@ export class BehavioralProfiler {
           this.processFrequency.set(name, count);
         }
         this.rebuildTopProcesses();
+      }
+
+      // Load monthly profiles
+      if (fs.existsSync(this.monthlyProfilesPath)) {
+        const raw = fs.readFileSync(this.monthlyProfilesPath, 'utf8');
+        const data = JSON.parse(raw);
+        if (data.monthlyBuckets) {
+          for (const bucket of data.monthlyBuckets) {
+            const key = monthlyKey(bucket.metric_key, bucket.month);
+            this.monthlyProfiles.set(key, bucket);
+          }
+        }
+        if (data.overallMeans) {
+          for (const [metricKey, tracker] of Object.entries(data.overallMeans)) {
+            this.overallMeans.set(metricKey, tracker as OverallMeanTracker);
+          }
+        }
       }
 
       // Load suppression stats
@@ -213,6 +255,10 @@ export class BehavioralProfiler {
     bucket.last_updated = new Date().toISOString();
 
     this.dirty.add(key);
+
+    // Update overall mean and monthly deviation bucket
+    this.updateOverallMean(metricKey, value);
+    this.updateMonthlyBucket(metricKey, value);
   }
 
   /**
@@ -342,7 +388,11 @@ export class BehavioralProfiler {
       }
     }
 
-    // Anomalous for both day types (or fallback has insufficient data) — genuinely abnormal
+    // Monthly seasonality fallback — check if value matches the monthly deviation pattern
+    const monthlyResult = this.checkMonthlyFallback(metricKey, value);
+    if (monthlyResult) return monthlyResult;
+
+    // Anomalous for both day types and monthly — genuinely abnormal
     return primaryResult;
   }
 
@@ -453,6 +503,94 @@ export class BehavioralProfiler {
     return earliest;
   }
 
+  /**
+   * Update the overall (all-time, all-buckets) running mean for a metric.
+   */
+  private updateOverallMean(metricKey: string, value: number): void {
+    let tracker = this.overallMeans.get(metricKey);
+    if (!tracker) {
+      tracker = { mean: 0, sampleCount: 0, m2: 0 };
+    }
+    tracker.sampleCount++;
+    const delta = value - tracker.mean;
+    tracker.mean += delta / tracker.sampleCount;
+    const delta2 = value - tracker.mean;
+    tracker.m2 += delta * delta2;
+    this.overallMeans.set(metricKey, tracker);
+  }
+
+  /**
+   * Update the monthly deviation bucket. Tracks how much the current month's
+   * values deviate from the overall mean (e.g. patch Tuesday spikes in Feb).
+   */
+  private updateMonthlyBucket(metricKey: string, value: number): void {
+    const month = new Date().getMonth(); // 0-11
+    const key = monthlyKey(metricKey, month);
+    const overall = this.overallMeans.get(metricKey);
+    if (!overall || overall.sampleCount < 10) return; // Need baseline first
+
+    const deviation = value - overall.mean;
+
+    let bucket = this.monthlyProfiles.get(key);
+    if (!bucket) {
+      bucket = {
+        metric_key: metricKey,
+        month,
+        sample_count: 0,
+        mean_deviation: 0,
+        m2: 0,
+        last_updated: new Date().toISOString()
+      };
+    }
+
+    // Welford's on the deviation values
+    bucket.sample_count++;
+    const d1 = deviation - bucket.mean_deviation;
+    bucket.mean_deviation += d1 / bucket.sample_count;
+    const d2 = deviation - bucket.mean_deviation;
+    bucket.m2 += d1 * d2;
+    bucket.last_updated = new Date().toISOString();
+
+    this.monthlyProfiles.set(key, bucket);
+  }
+
+  /**
+   * Check if a value is within the expected monthly deviation pattern.
+   * Used as a final fallback after cross-day check fails.
+   */
+  private checkMonthlyFallback(metricKey: string, value: number): AnomalyResult | null {
+    const month = new Date().getMonth();
+    const key = monthlyKey(metricKey, month);
+    const monthBucket = this.monthlyProfiles.get(key);
+    const overall = this.overallMeans.get(metricKey);
+
+    if (!monthBucket || monthBucket.sample_count < 30 || !overall) return null;
+
+    // Expected value = overallMean + monthly deviation
+    const expected = overall.mean + monthBucket.mean_deviation;
+    const variance = monthBucket.sample_count > 1 ? monthBucket.m2 / monthBucket.sample_count : 0;
+    const stddev = Math.sqrt(variance);
+    if (stddev < 0.001) return null;
+
+    const zScore = (value - expected) / stddev;
+    if (Math.abs(zScore) <= this.Z_THRESHOLD) {
+      return {
+        anomalous: false,
+        reason: 'within_normal',
+        current_value: value,
+        profile: {
+          mean: Math.round(expected * 100) / 100,
+          stddev: Math.round(stddev * 100) / 100,
+          z_score: Math.round(zScore * 100) / 100,
+          sample_count: monthBucket.sample_count,
+          time_bucket: `month ${month} (monthly fallback)`
+        }
+      };
+    }
+
+    return null;
+  }
+
   private rebuildTopProcesses(): void {
     this.cachedTopProcesses = [...this.processFrequency.entries()]
       .sort((a, b) => b[1] - a[1])
@@ -478,6 +616,19 @@ export class BehavioralProfiler {
           freqObj[name] = count;
         }
         fs.writeFileSync(this.processFreqPath, JSON.stringify(freqObj), 'utf8');
+      }
+
+      // Flush monthly profiles
+      if (this.monthlyProfiles.size > 0) {
+        const overallObj: Record<string, OverallMeanTracker> = {};
+        for (const [key, tracker] of this.overallMeans.entries()) {
+          overallObj[key] = tracker;
+        }
+        const monthlyData = {
+          monthlyBuckets: [...this.monthlyProfiles.values()],
+          overallMeans: overallObj
+        };
+        fs.writeFileSync(this.monthlyProfilesPath, JSON.stringify(monthlyData), 'utf8');
       }
 
       // Flush suppression stats

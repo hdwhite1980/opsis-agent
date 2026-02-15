@@ -128,7 +128,10 @@ export class SystemMonitor {
     this.scheduleMonitor(() => this.monitorDiskIO(), 60000);            // Every 60s
     this.scheduleMonitor(() => this.monitorCrashDumps(), 300000);       // Every 5min
 
-    this.logger.info('All 17 monitoring categories started');
+    // ===== CATEGORY 7: TIME SYNCHRONIZATION =====
+    this.scheduleMonitor(() => this.monitorNtpSync(), 300000);          // Every 5min
+
+    this.logger.info('All 18 monitoring categories started');
   }
 
   public stop(): void {
@@ -1467,6 +1470,77 @@ export class SystemMonitor {
       }
     } catch (error) {
       this.logger.debug('Crash dump monitoring error', error);
+    }
+  }
+
+  // ============================================
+  // CATEGORY 7: TIME SYNCHRONIZATION
+  // ============================================
+
+  private ntpSyncOk: boolean = true;
+
+  public isNtpSyncOk(): boolean {
+    return this.ntpSyncOk;
+  }
+
+  private async monitorNtpSync(): Promise<void> {
+    try {
+      const { stdout } = await execAsync(
+        'powershell -NoProfile -Command "w32tm /query /status 2>$null | Out-String"',
+        { timeout: 10000 }
+      );
+
+      const output = stdout || '';
+
+      // Parse last sync time
+      const lastSyncMatch = output.match(/Last Successful Sync Time:\s*(.*)/i);
+      if (lastSyncMatch) {
+        const lastSyncStr = lastSyncMatch[1].trim();
+        const lastSync = new Date(lastSyncStr);
+        const hoursSinceSync = (Date.now() - lastSync.getTime()) / (1000 * 60 * 60);
+
+        if (hoursSinceSync > 1) {
+          this.ntpSyncOk = false;
+          this.emitSignal({
+            id: 'ntp-sync-stale',
+            category: 'security',
+            severity: 'warning',
+            metric: 'ntp_sync',
+            value: Math.round(hoursSinceSync),
+            threshold: 1,
+            message: `NTP sync stale: last sync was ${Math.round(hoursSinceSync)} hours ago`,
+            timestamp: new Date(),
+            metadata: { lastSync: lastSyncStr, hoursSinceSync: Math.round(hoursSinceSync) }
+          });
+          return;
+        }
+      }
+
+      // Parse clock offset (Phase Offset)
+      const offsetMatch = output.match(/Phase Offset:\s*([0-9.e+-]+)s/i);
+      if (offsetMatch) {
+        const offsetSeconds = Math.abs(parseFloat(offsetMatch[1]));
+        if (offsetSeconds > 30) {
+          this.ntpSyncOk = false;
+          this.emitSignal({
+            id: 'ntp-clock-drift',
+            category: 'security',
+            severity: 'critical',
+            metric: 'ntp_offset',
+            value: offsetSeconds,
+            threshold: 30,
+            message: `Clock drift detected: ${offsetSeconds.toFixed(1)}s offset from NTP server`,
+            timestamp: new Date(),
+            metadata: { offsetSeconds }
+          });
+          return;
+        }
+      }
+
+      this.ntpSyncOk = true;
+    } catch (error) {
+      this.logger.debug('NTP sync monitoring error', error);
+      // Don't fail NTP status on monitoring errors — w32tm may not be running
     }
   }
 

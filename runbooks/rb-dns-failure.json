@@ -36,6 +36,32 @@
       }
     }
   ],
+  "fallback_chains": [
+    {
+      "trigger": "step_failure",
+      "condition": {
+        "failed_step_type": "service"
+      },
+      "fallback_steps": [
+        {
+          "type": "powershell",
+          "action": "Stop-Service -Name Dnscache -Force",
+          "params": {}
+        },
+        {
+          "type": "powershell",
+          "action": "Start-Sleep -Seconds 3; Start-Service -Name Dnscache",
+          "params": {}
+        },
+        {
+          "type": "powershell",
+          "action": "Resolve-DnsName -Name google.com -ErrorAction Stop",
+          "params": {},
+          "allowFailure": true
+        }
+      ]
+    }
+  ],
   "risk_class": "A",
   "auto_execute_threshold": 85
 }

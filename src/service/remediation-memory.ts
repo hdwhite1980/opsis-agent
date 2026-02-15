@@ -46,11 +46,23 @@ export interface DeviceSensitivity {
   sensitiveSignals: string[]; // Signals to avoid on this device
 }
 
+export interface ResourceStats {
+  resourceId: string;       // e.g. "service-stopped:Spooler"
+  totalAttempts: number;
+  successCount: number;
+  failureCount: number;
+  successRate: number;
+  consecutiveFailures: number;
+  confidenceModifier: number; // 0.0-1.0 multiplier
+  lastAttempt: string;
+}
+
 export interface RemediationMemoryData {
   attempts: RemediationAttempt[];
   playbookStats: Record<string, PlaybookStats>;
   signalStats: Record<string, SignalStats>;
   deviceSensitivity: Record<string, DeviceSensitivity>;
+  resourceStats: Record<string, ResourceStats>;
   version: string;
 }
 
@@ -60,8 +72,8 @@ export class RemediationMemory {
   private memory: RemediationMemoryData;
   
   // Thresholds
-  private readonly DAMPENING_THRESHOLD = 3; // Consecutive failures before dampening
-  private readonly MIN_ATTEMPTS_FOR_DAMPENING = 3; // Need at least 3 attempts
+  private readonly DAMPENING_THRESHOLD = 5; // Consecutive failures before dampening
+  private readonly MIN_ATTEMPTS_FOR_DAMPENING = 5; // Need at least 5 attempts
   private readonly SUCCESS_RATE_THRESHOLD = 0.3; // Below 30% success = problematic
   private readonly MAX_HISTORY_DAYS = 90; // Keep history for 90 days
   
@@ -84,6 +96,7 @@ export class RemediationMemory {
         memory.deviceSensitivity = memory.deviceSensitivity || {};
         memory.attempts = memory.attempts || [];
         memory.playbookStats = memory.playbookStats || {};
+        memory.resourceStats = memory.resourceStats || {};
         this.logger.info('Remediation memory loaded', {
           attempts: memory.attempts.length,
           playbooks: Object.keys(memory.playbookStats).length
@@ -100,7 +113,8 @@ export class RemediationMemory {
       playbookStats: {},
       signalStats: {},
       deviceSensitivity: {},
-      version: '1.0'
+      resourceStats: {},
+      version: '1.1'
     };
   }
   
@@ -132,7 +146,8 @@ export class RemediationMemory {
     deviceId: string,
     result: 'success' | 'failure',
     duration: number,
-    errorMessage?: string
+    errorMessage?: string,
+    resourceName?: string
   ): void {
     const attempt: RemediationAttempt = {
       timestamp: new Date().toISOString(),
@@ -143,24 +158,30 @@ export class RemediationMemory {
       duration,
       errorMessage
     };
-    
+
     // Add to history
     this.memory.attempts.push(attempt);
-    
+
     // Update stats
     this.updatePlaybookStats(playbookId, result, duration);
     const safeSignalId = signalId || playbookId || 'unknown';
     this.updateSignalStats(safeSignalId, deviceId, result);
     this.updateDeviceSensitivity(deviceId, safeSignalId, result);
-    
+
+    // Update per-resource stats
+    if (resourceName) {
+      this.updateResourceStats(safeSignalId, resourceName, result);
+    }
+
     // Save to disk
     this.saveMemory();
-    
+
     this.logger.info('Remediation attempt recorded', {
       playbookId,
       signalId,
       deviceId,
-      result
+      result,
+      resourceName
     });
   }
   
@@ -314,24 +335,95 @@ export class RemediationMemory {
   }
   
   /**
+   * Update per-resource statistics and compute graduated confidence modifier.
+   * A playbook may work 90% overall but fail consistently for one specific resource (e.g. Spooler).
+   */
+  private updateResourceStats(
+    signalId: string,
+    resourceName: string,
+    result: 'success' | 'failure'
+  ): void {
+    const resourceId = `${signalId}:${resourceName}`;
+    let stats = this.memory.resourceStats[resourceId];
+
+    if (!stats) {
+      stats = {
+        resourceId,
+        totalAttempts: 0,
+        successCount: 0,
+        failureCount: 0,
+        successRate: 1,
+        consecutiveFailures: 0,
+        confidenceModifier: 1.0,
+        lastAttempt: new Date().toISOString()
+      };
+    }
+
+    stats.totalAttempts++;
+    if (result === 'success') {
+      stats.successCount++;
+      stats.consecutiveFailures = 0;
+    } else {
+      stats.failureCount++;
+      stats.consecutiveFailures++;
+    }
+
+    stats.successRate = stats.successCount / stats.totalAttempts;
+    stats.lastAttempt = new Date().toISOString();
+
+    // Calculate graduated confidence modifier once we have enough data
+    if (stats.totalAttempts >= 5) {
+      const rate = stats.successRate;
+      if (rate >= 1.0) stats.confidenceModifier = 1.0;
+      else if (rate >= 0.8) stats.confidenceModifier = 0.9;
+      else if (rate >= 0.6) stats.confidenceModifier = 0.7;
+      else if (rate >= 0.4) stats.confidenceModifier = 0.5;
+      else if (rate >= 0.2) stats.confidenceModifier = 0.3;
+      else stats.confidenceModifier = 0.1;
+    }
+
+    this.memory.resourceStats[resourceId] = stats;
+  }
+
+  /**
    * Check if remediation should be attempted for a signal
    */
   public shouldAttemptRemediation(
     signalId: string,
     deviceId: string,
-    playbookId: string
-  ): { allowed: boolean; reason?: string } {
+    playbookId: string,
+    resourceName?: string
+  ): { allowed: boolean; reason?: string; confidenceModifier: number } {
+    let confidenceModifier = 1.0;
+
+    // Check resource-specific stats first (most granular)
+    if (resourceName) {
+      const resourceId = `${signalId}:${resourceName}`;
+      const rStats = this.memory.resourceStats[resourceId];
+      if (rStats) {
+        if (rStats.consecutiveFailures >= this.DAMPENING_THRESHOLD) {
+          return {
+            allowed: false,
+            reason: `Resource "${resourceName}" dampened after ${rStats.consecutiveFailures} consecutive failures`,
+            confidenceModifier: rStats.confidenceModifier
+          };
+        }
+        confidenceModifier = rStats.confidenceModifier;
+      }
+    }
+
     // Check signal dampening
     const signalKey = `${deviceId}:${signalId}`;
     const signalStats = this.memory.signalStats[signalKey];
-    
+
     if (signalStats && signalStats.dampened) {
       return {
         allowed: false,
-        reason: `Signal dampened after ${signalStats.consecutiveFailures} consecutive failures`
+        reason: `Signal dampened after ${signalStats.consecutiveFailures} consecutive failures`,
+        confidenceModifier
       };
     }
-    
+
     // Check playbook success rate
     const playbookStats = this.memory.playbookStats[playbookId];
     if (
@@ -341,20 +433,22 @@ export class RemediationMemory {
     ) {
       return {
         allowed: false,
-        reason: `Playbook has low success rate: ${(playbookStats.successRate * 100).toFixed(1)}%`
+        reason: `Playbook has low success rate: ${(playbookStats.successRate * 100).toFixed(1)}%`,
+        confidenceModifier
       };
     }
-    
+
     // Check device sensitivity
     const deviceSensitivity = this.memory.deviceSensitivity[deviceId];
     if (deviceSensitivity && deviceSensitivity.sensitiveSignals.includes(signalId)) {
       return {
         allowed: false,
-        reason: `Device has history of failures for this signal type`
+        reason: `Device has history of failures for this signal type`,
+        confidenceModifier
       };
     }
-    
-    return { allowed: true };
+
+    return { allowed: true, confidenceModifier };
   }
   
   /**
@@ -412,6 +506,14 @@ export class RemediationMemory {
     return this.memory.deviceSensitivity[deviceId] || null;
   }
   
+  /**
+   * Get resource-specific stats
+   */
+  public getResourceStats(signalId: string, resourceName: string): ResourceStats | null {
+    const resourceId = `${signalId}:${resourceName}`;
+    return this.memory.resourceStats[resourceId] || null;
+  }
+
   /**
    * Reset dampening for a signal (manual override)
    */

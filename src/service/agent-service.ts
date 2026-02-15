@@ -28,7 +28,10 @@ import { SelfServiceServer } from './self-service-server';
 import { ControlPanelServer } from './control-panel-server';
 import { BaselineManager } from './baseline-manager';
 import { BehavioralProfiler } from './behavioral-profiler';
+import { SignalCorrelator, CorrelationResult } from './signal-correlator';
 import { CompatibilityChecker, CompatibilityReport, CapabilityMode } from './compatibility-checker';
+
+import { updateServerProtections, updateLearnedProtections } from '../execution/primitives/index';
 
 // Security imports
 import {
@@ -103,12 +106,24 @@ interface UpdateCheckResponse {
   downloadUrl?: string;
 }
 
+interface FallbackChain {
+  trigger: 'step_failure';
+  condition?: {
+    failed_step_index?: number;
+    failed_step_type?: string;
+    error_pattern?: string;
+  };
+  fallback_steps: PlaybookStep[];
+  max_attempts?: number; // default 1
+}
+
 interface PlaybookTask {
   id: string;
   name: string;
   priority: 'critical' | 'high' | 'medium' | 'low';
   source: 'server' | 'admin' | 'local';
   steps: PlaybookStep[];
+  fallback_chains?: FallbackChain[];
   createdAt: Date;
 }
 
@@ -265,6 +280,12 @@ class OPSISAgentService {
   private welcomeTimeout: NodeJS.Timeout | null = null;
   private telemetryTimer: NodeJS.Timeout | null = null;
   private inventoryTimer: NodeJS.Timeout | null = null;
+
+  // Adaptive telemetry interval (Enhancement 11)
+  private telemetryMode: 'normal' | 'reduced' | 'minimal' = 'normal';
+  private currentHeartbeatIntervalMs: number = 30000;
+  private lastSignalTime: number = Date.now();
+  private serverFixedHeartbeatInterval: number | null = null; // If set, disables adaptive mode
   private pendingPrompts: Map<string, { resolve: (response: string) => void; action_on_confirm?: string; timer?: NodeJS.Timeout }> = new Map();
 
   // Pending actions awaiting technician review
@@ -290,6 +311,7 @@ class OPSISAgentService {
 
   // Behavioral profiler for temporal anomaly detection
   private behavioralProfiler: BehavioralProfiler;
+  private signalCorrelator: SignalCorrelator;
 
   // Compatibility checker and capability mode
   private compatibilityChecker: CompatibilityChecker;
@@ -382,11 +404,15 @@ class OPSISAgentService {
 
     // Initialize behavioral profiler for temporal anomaly detection
     this.behavioralProfiler = new BehavioralProfiler(this.dataDir, this.logger);
+    this.signalCorrelator = new SignalCorrelator(this.logger);
     this.systemMonitor.setProfiler(this.behavioralProfiler);
 
     // Initialize IPC server for GUI communication
     this.ipcServer = new IPCServer(this.logger);
     this.setupIPCHandlers();
+
+    // Initialize baseline manager (before self-service portal which depends on it)
+    this.baselineManager = new BaselineManager(this.logger, this.dataDir);
 
     // Initialize self-service portal
     this.selfServiceServer = new SelfServiceServer(
@@ -394,7 +420,9 @@ class OPSISAgentService {
       this.troubleshootingRunner,
       this.actionTicketManager,
       this.ticketDb,
-      this.baseDir
+      this.baseDir,
+      19850,
+      this.baselineManager
     );
 
     // Initialize control panel web server
@@ -409,9 +437,6 @@ class OPSISAgentService {
         this.logger.error('Error sending initial data to control panel', error);
       }
     };
-
-    // Initialize baseline manager
-    this.baselineManager = new BaselineManager(this.logger, this.dataDir);
 
     // Initialize compatibility checker
     this.compatibilityChecker = new CompatibilityChecker(this.logger);
@@ -1386,7 +1411,11 @@ class OPSISAgentService {
       this.logger.warn('Initial dependency map refresh failed', err)
     );
     this.dependencyRefreshTimer = setInterval(() => {
-      this.stateTracker.refreshDependencyMap().catch(err =>
+      this.stateTracker.refreshDependencyMap().then(() => {
+        // Update tier 3 auto-learned protections from dependency graph
+        const depMap = this.stateTracker.getDependencyMap();
+        updateLearnedProtections(depMap);
+      }).catch(err =>
         this.logger.warn('Dependency map refresh failed', err)
       );
     }, 5 * 60 * 1000);
@@ -1398,6 +1427,9 @@ class OPSISAgentService {
         this.stateTracker.clearState(resourceId);
       }
     }, 60000);
+
+    // Periodically check if telemetry mode should change (every 60s)
+    setInterval(() => this.updateTelemetryMode(), 60000);
 
     this.maintenanceManager.startExpirationChecks();
     this.maintenanceManager.onExpiration((window) => {
@@ -1572,9 +1604,12 @@ class OPSISAgentService {
           this.pendingRebootCompletedMsg = null;
         }
 
-        // Start heartbeat immediately with default interval
+        // Start heartbeat immediately with adaptive interval
         // (will be updated if welcome arrives with custom config)
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.telemetryMode = 'normal'; // Start in normal mode on new connection
+        this.currentHeartbeatIntervalMs = 30000;
+        this.lastSignalTime = Date.now();
         this.sendHeartbeat();
         this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), 30000);
 
@@ -1685,11 +1720,67 @@ class OPSISAgentService {
         active_issues: ticketStats.openTickets,
         process_count: processCount,
         capability_mode: this.capabilityMode,
+        ntp_sync_ok: this.systemMonitor.isNtpSyncOk(),
+        telemetry_mode: this.telemetryMode,
+        heartbeat_interval_ms: this.serverFixedHeartbeatInterval || this.currentHeartbeatIntervalMs,
+        ewma_scores: this.patternDetector.getEWMAScores(),
+        discovered_correlations: this.patternDetector.getDiscoveredCorrelations(),
         behavioral_profile: this.behavioralProfiler.getDashboardSummary()
       }));
     } catch (error) {
       this.logger.error('Failed to send telemetry heartbeat', error);
     }
+  }
+
+  /**
+   * Adaptive telemetry interval (Enhancement 11).
+   * Adjusts heartbeat interval based on system activity:
+   * - normal:  30s (open tickets, recent signals, or profiler learning)
+   * - reduced: 60s (no tickets, 5-10 min since last signal)
+   * - minimal: 180s (no tickets, 10+ min since last signal, profiler active)
+   */
+  private updateTelemetryMode(): void {
+    // Server can override with a fixed interval — disables adaptive mode
+    if (this.serverFixedHeartbeatInterval) return;
+
+    const now = Date.now();
+    const timeSinceSignal = now - this.lastSignalTime;
+    const ticketStats = this.ticketDb.getStatistics();
+    const hasOpenTickets = ticketStats.openTickets > 0;
+    const profilerStatus = this.behavioralProfiler.getDashboardSummary().status;
+
+    let newMode: 'normal' | 'reduced' | 'minimal';
+
+    if (hasOpenTickets || timeSinceSignal < 5 * 60 * 1000 || profilerStatus === 'learning') {
+      newMode = 'normal';
+    } else if (timeSinceSignal < 10 * 60 * 1000) {
+      newMode = 'reduced';
+    } else {
+      newMode = 'minimal';
+    }
+
+    if (newMode !== this.telemetryMode) {
+      const oldMode = this.telemetryMode;
+      this.telemetryMode = newMode;
+
+      const intervals: Record<typeof newMode, number> = { normal: 30000, reduced: 60000, minimal: 180000 };
+      const newInterval = intervals[newMode];
+      this.currentHeartbeatIntervalMs = newInterval;
+
+      // Restart heartbeat timer with new interval
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), newInterval);
+
+      this.logger.info('Telemetry mode changed', { from: oldMode, to: newMode, interval_ms: newInterval });
+    }
+  }
+
+  /** Record that a signal was detected and send an immediate heartbeat */
+  private recordSignalForTelemetry(): void {
+    this.lastSignalTime = Date.now();
+    this.updateTelemetryMode();
+    // Send an immediate heartbeat when a signal is detected
+    this.sendHeartbeat();
   }
 
   private async sendSoftwareInventory(): Promise<void> {
@@ -1828,6 +1919,12 @@ class OPSISAgentService {
           // Handle protected applications list from server
           if (data.protected_applications) {
             this.saveProtectedApplications(data.protected_applications);
+            // Update tier 2 protections in primitives
+            const serverProcesses = data.protected_applications
+              .filter((a: any) => a.process_name).map((a: any) => a.process_name);
+            const serverServices = data.protected_applications
+              .filter((a: any) => a.service_name).map((a: any) => a.service_name);
+            updateServerProtections(serverProcesses, serverServices);
           }
           break;
 
@@ -3449,13 +3546,23 @@ class OPSISAgentService {
         this.systemMonitor.updateThresholds(this.serverConfig!.thresholds);
       }
 
-      // Update heartbeat interval if server specifies a different one
-      const heartbeatMs = this.serverConfig!.monitoring?.heartbeat_interval || 30000;
-      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), heartbeatMs);
+      // Update heartbeat interval if server specifies a fixed one
+      const serverHeartbeatMs = this.serverConfig!.monitoring?.heartbeat_interval;
+      if (serverHeartbeatMs && serverHeartbeatMs > 0) {
+        // Server mandates a fixed interval — disable adaptive telemetry
+        this.serverFixedHeartbeatInterval = serverHeartbeatMs;
+        this.currentHeartbeatIntervalMs = serverHeartbeatMs;
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), serverHeartbeatMs);
+        this.logger.info('Adaptive telemetry disabled — server mandates fixed interval', { interval_ms: serverHeartbeatMs });
+      } else {
+        // No server override — enable adaptive telemetry
+        this.serverFixedHeartbeatInterval = null;
+        this.updateTelemetryMode();
+      }
 
       this.logger.info('Server config applied', {
-        heartbeat_interval: heartbeatMs,
+        heartbeat_interval: serverHeartbeatMs || 'adaptive',
         thresholds: this.serverConfig!.thresholds,
         features: this.serverConfig!.features
       });
@@ -3565,15 +3672,27 @@ class OPSISAgentService {
         signature.confidence_local
       );
 
+      // Apply per-resource confidence modifier
+      const resourceName = this.extractResourceName(null, runbook);
+      const resourceModifier = resourceName
+        ? (this.remediationMemory.shouldAttemptRemediation(
+            signature.signature_id, os.hostname(), runbook.runbookId, resourceName
+          ).confidenceModifier)
+        : 1.0;
+      const effectiveConfidence = signature.confidence_local * resourceModifier;
+
       this.logger.info('Runbook classification', {
         runbook_id: runbook.runbookId,
         risk_class: riskClass,
         can_auto_execute: canAutoExecute,
-        confidence: signature.confidence_local
+        confidence: signature.confidence_local,
+        resource_name: resourceName,
+        confidence_modifier: resourceModifier,
+        effective_confidence: effectiveConfidence
       });
 
-      if (canAutoExecute && riskClass === 'A' && signature.confidence_local >= 85) {
-        // Class A with high confidence - Auto execute locally
+      if (canAutoExecute && riskClass === 'A' && effectiveConfidence >= 85) {
+        // Class A with high effective confidence - Auto execute locally
         this.executeLocalRemediation(signature, runbook);
       } else {
         // Class B/C or low confidence - Escalate to server
@@ -3596,6 +3715,9 @@ class OPSISAgentService {
       metric: signal.metric,
       value: signal.value
     });
+
+    // Adaptive telemetry: record signal time and send immediate heartbeat
+    this.recordSignalForTelemetry();
 
     // Gate 1: Maintenance window check
     const maintenanceCheck = this.maintenanceManager.isUnderMaintenance(
@@ -3678,19 +3800,43 @@ class OPSISAgentService {
       this.patternDetector.updateHealthScore(signal.id, componentKey, signal.severity);
     }
 
+    // Multi-signal correlation check
+    this.signalCorrelator.recordSignal(signal);
+    const correlation = this.signalCorrelator.checkCorrelations(signal);
+    if (correlation) {
+      this.handleCorrelation(correlation, signal);
+    }
+
     // NEW: Generate signature from system signal
     const signature = this.signatureGenerator.generateFromSystemSignal(signal, this.deviceInfo);
-    
+
+    // Apply correlation-based confidence boost
+    if (correlation?.action.confidenceBoost) {
+      signature.confidence_local = correlation.action.confidenceBoost;
+    } else if (correlation?.action.confidenceDelta) {
+      signature.confidence_local = Math.min(100, signature.confidence_local + correlation.action.confidenceDelta);
+    }
+
     this.logger.info('System signature generated', {
       signature_id: signature.signature_id,
       confidence: signature.confidence_local,
-      severity: signature.severity
+      severity: signature.severity,
+      correlation: correlation?.ruleId || null
     });
 
     // Create playbook for system signal if possible
     const playbook = this.createPlaybookForSystemSignal(signal);
-    
-    if (playbook && signature.confidence_local >= 85) {
+
+    // Apply per-resource confidence modifier
+    const sysResourceName = this.extractResourceName(signal, playbook);
+    const sysResourceModifier = sysResourceName && playbook
+      ? (this.remediationMemory.shouldAttemptRemediation(
+          signature.signature_id, os.hostname(), playbook.id, sysResourceName
+        ).confidenceModifier)
+      : 1.0;
+    const sysEffectiveConfidence = signature.confidence_local * sysResourceModifier;
+
+    if (playbook && sysEffectiveConfidence >= 85) {
       // Capability mode gate: monitor-only and limited modes cannot auto-execute
       if (this.capabilityMode === 'monitor-only' || this.capabilityMode === 'limited') {
         this.logger.info(`Capability mode '${this.capabilityMode}' — escalating instead of auto-executing`, {
@@ -3783,6 +3929,7 @@ class OPSISAgentService {
       priority: 'high',
       source: 'local',
       steps: runbook.steps,
+      fallback_chains: runbook.fallback_chains,
       createdAt: new Date()
     };
 
@@ -3850,6 +3997,7 @@ class OPSISAgentService {
         priority: cachedServerRunbook.priority || 'medium',
         source: 'server',
         steps: cachedServerRunbook.steps,
+        fallback_chains: cachedServerRunbook.fallback_chains,
         createdAt: new Date()
       };
       (cachedPlaybook as any).signalId = cachedServerRunbook.signal_id;
@@ -4003,6 +4151,23 @@ class OPSISAgentService {
       signature_ids: escalations.map(e => e.signature_id),
       with_diagnostics: escalations.filter(e => e.pre_escalation_diagnostics).length
     });
+  }
+
+  /**
+   * Handle a multi-signal correlation result.
+   * Logs the correlation and enriches escalation notes if applicable.
+   */
+  private handleCorrelation(correlation: CorrelationResult, triggerSignal: SystemSignal): void {
+    this.logger.info('Handling signal correlation', {
+      rule_id: correlation.ruleId,
+      action_type: correlation.action.type,
+      matched_signals: correlation.matchedSignals
+    });
+
+    // For escalation enrichment, store the note for later use in escalateToServer
+    if (correlation.action.type === 'enrich_escalation' && correlation.action.escalationNote) {
+      (triggerSignal as any)._correlationNote = correlation.action.escalationNote;
+    }
   }
 
   // NEW METHOD: Escalate System Issue to Server
@@ -4350,7 +4515,8 @@ class OPSISAgentService {
       const startTime = Date.now();
       const signalId = (playbook as any).signalId || playbook.id;
       const deviceId = os.hostname();
-      
+      const playbookResourceName = this.extractResourceName(null, playbook);
+
       try {
         await this.executePlaybook(playbook);
         const duration = Date.now() - startTime;
@@ -4367,7 +4533,9 @@ class OPSISAgentService {
           signalId,
           deviceId,
           'success',
-          duration
+          duration,
+          undefined,
+          playbookResourceName
         );
 
         // Save successful server runbooks for future local use
@@ -4387,7 +4555,8 @@ class OPSISAgentService {
           deviceId,
           'failure',
           duration,
-          error?.toString()
+          error?.toString(),
+          playbookResourceName
         );
       }
     }
@@ -4427,6 +4596,20 @@ class OPSISAgentService {
           this.log(`  Verification step result (non-fatal): ${step.action}`, error);
           continue;
         }
+
+        // Try fallback chain before giving up
+        const fallback = this.findFallbackChain(playbook.fallback_chains, i, step, error);
+        if (fallback) {
+          this.log(`  Step failed, attempting fallback chain (max ${fallback.max_attempts || 1} attempts)`);
+          const fallbackOk = await this.executeFallbackChain(fallback);
+          if (fallbackOk) {
+            this.log(`  Fallback chain succeeded, continuing to next step`);
+            continue; // Fallback recovered — continue to next primary step
+          }
+          this.log(`  Fallback chain also failed for step: ${step.action}`);
+          throw new Error(`Step "${step.action}" failed and fallback chain exhausted: ${error}`);
+        }
+
         this.log(`  Step failed: ${step.action}`, error);
         throw error;
       }
@@ -4438,6 +4621,61 @@ class OPSISAgentService {
 
   private isVerificationStep(step: PlaybookStep, allSteps: PlaybookStep[], index: number): boolean {
     return isVerificationStep(step, allSteps, index);
+  }
+
+  private findFallbackChain(
+    chains: FallbackChain[] | undefined,
+    stepIndex: number,
+    step: PlaybookStep,
+    error: any
+  ): FallbackChain | null {
+    if (!chains || chains.length === 0) return null;
+
+    const errorStr = String(error).toLowerCase();
+
+    for (const chain of chains) {
+      if (chain.trigger !== 'step_failure') continue;
+
+      const cond = chain.condition;
+      if (!cond) return chain; // No condition = matches any failure
+
+      if (cond.failed_step_index !== undefined && cond.failed_step_index !== stepIndex) continue;
+      if (cond.failed_step_type && cond.failed_step_type !== step.type) continue;
+      if (cond.error_pattern && !errorStr.includes(cond.error_pattern.toLowerCase())) continue;
+
+      return chain;
+    }
+
+    return null;
+  }
+
+  private async executeFallbackChain(chain: FallbackChain): Promise<boolean> {
+    const maxAttempts = chain.max_attempts || 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.log(`  Fallback attempt ${attempt}/${maxAttempts}`);
+      let allStepsOk = true;
+
+      for (let j = 0; j < chain.fallback_steps.length; j++) {
+        const fbStep = chain.fallback_steps[j];
+        this.log(`    Fallback step ${j + 1}/${chain.fallback_steps.length}: ${fbStep.type} - ${fbStep.action}`);
+        try {
+          await this.executeStep(fbStep);
+        } catch (fbError) {
+          if (fbStep.allowFailure) {
+            this.log(`    Fallback step failed (non-fatal): ${fbStep.action}`, fbError);
+            continue;
+          }
+          this.log(`    Fallback step failed: ${fbStep.action}`, fbError);
+          allStepsOk = false;
+          break;
+        }
+      }
+
+      if (allStepsOk) return true;
+    }
+
+    return false;
   }
 
   private async executeStep(step: PlaybookStep): Promise<void> {
@@ -5203,6 +5441,25 @@ class OPSISAgentService {
   }
 
   /**
+   * Extract a resource name from a signal or runbook for per-resource confidence tracking.
+   * Returns e.g. "Spooler" for a service-stopped signal, "chrome.exe" for a process signal.
+   */
+  private extractResourceName(signal?: SystemSignal | null, runbook?: any): string | undefined {
+    if (signal?.metadata?.serviceName) return signal.metadata.serviceName;
+    if (signal?.metadata?.processName) return signal.metadata.processName;
+    if (signal?.metadata?.drive) return signal.metadata.drive;
+    // Check runbook step params for a serviceName
+    if (runbook?.steps) {
+      for (const step of runbook.steps) {
+        if (step.params?.serviceName && !step.params.serviceName.includes('{')) {
+          return step.params.serviceName;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Load protected applications from local config file.
    * These are synced from the server via config-update messages.
    */
@@ -5265,6 +5522,7 @@ class OPSISAgentService {
           priority: playbook.priority,
           source: playbook.source,
           steps: playbook.steps,
+          fallback_chains: playbook.fallback_chains,
           signalId: (playbook as any).signalId,
           signatureId: (playbook as any).signatureId
         },
@@ -5340,6 +5598,7 @@ class OPSISAgentService {
         priority: state.playbook.priority || 'medium',
         source: state.playbook.source || 'server',
         steps: state.playbook.steps,
+        fallback_chains: state.playbook.fallback_chains,
         createdAt: new Date()
       };
       if (state.playbook.signalId) (playbook as any).signalId = state.playbook.signalId;
@@ -5356,7 +5615,8 @@ class OPSISAgentService {
         this.reportPlaybookResult(playbook.id, 'success');
         this.sendPlaybookResult(playbook, 'success', 0);
         const signalId = (playbook as any).signalId || playbook.id;
-        this.remediationMemory.recordAttempt(playbook.id, signalId, os.hostname(), 'success', 0);
+        const rebootResourceName = this.extractResourceName(null, playbook);
+        this.remediationMemory.recordAttempt(playbook.id, signalId, os.hostname(), 'success', 0, undefined, rebootResourceName);
         this.clearRebootPlaybookState();
         return;
       }
@@ -5365,6 +5625,7 @@ class OPSISAgentService {
       const startTime = Date.now();
       const signalId = (playbook as any).signalId || playbook.id;
       const deviceId = os.hostname();
+      const rebootResourceName = this.extractResourceName(null, playbook);
 
       try {
         await this.executePlaybook(playbook, state.resumeFromStep);
@@ -5377,7 +5638,7 @@ class OPSISAgentService {
         this.reportPlaybookResult(playbook.id, 'success');
         this.sendPlaybookResult(playbook, 'success', duration);
 
-        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'success', duration);
+        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'success', duration, undefined, rebootResourceName);
 
         if (playbook.source === 'server') {
           await this.saveServerRunbook(playbook);
@@ -5389,7 +5650,7 @@ class OPSISAgentService {
         this.reportPlaybookResult(playbook.id, 'failed', error);
         this.sendPlaybookResult(playbook, 'failed', duration, error);
 
-        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'failure', duration, error?.toString());
+        this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'failure', duration, error?.toString(), rebootResourceName);
       }
 
       // Always clean up state file after attempting resume
@@ -5549,7 +5810,7 @@ class OPSISAgentService {
         }
       }
 
-      const runbookEntry = {
+      const runbookEntry: Record<string, any> = {
         id: `server-${playbook.id}`,
         original_id: playbook.id,
         name: playbook.name,
@@ -5564,6 +5825,9 @@ class OPSISAgentService {
         signature_id: matchedSignatureId,
         triggers: (playbook as any).triggers || []
       };
+      if (playbook.fallback_chains) {
+        runbookEntry.fallback_chains = playbook.fallback_chains;
+      }
 
       if (existingIndex >= 0) {
         // Update existing entry

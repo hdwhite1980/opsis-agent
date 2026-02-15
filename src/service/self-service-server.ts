@@ -15,6 +15,7 @@ import { TroubleshootingRunner } from './troubleshooting-runner';
 import { Primitives } from '../execution/primitives';
 import { ActionTicketManager } from './action-ticket-manager';
 import { TicketDatabase } from './ticket-database';
+import { BaselineManager } from './baseline-manager';
 
 interface PortalSession {
   id: string;
@@ -75,7 +76,8 @@ export class SelfServiceServer {
     actionTicketManager: ActionTicketManager,
     ticketDb: TicketDatabase,
     baseDir: string,
-    port: number = 19850
+    port: number = 19850,
+    baselineManager?: BaselineManager
   ) {
     this.logger = logger;
     this.port = port;
@@ -91,6 +93,11 @@ export class SelfServiceServer {
       actionTicketManager,
       ticketDb
     );
+
+    // Wire baseline manager for baseline comparison feature (Enhancement 10)
+    if (baselineManager) {
+      this.engine.setBaselineManager(baselineManager);
+    }
   }
 
   async start(): Promise<void> {

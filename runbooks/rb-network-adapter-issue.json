@@ -39,6 +39,32 @@
       "params": {}
     }
   ],
+  "fallback_chains": [
+    {
+      "trigger": "step_failure",
+      "condition": {
+        "failed_step_type": "powershell"
+      },
+      "fallback_steps": [
+        {
+          "type": "powershell",
+          "action": "netsh int ip reset",
+          "params": {}
+        },
+        {
+          "type": "powershell",
+          "action": "netsh winsock reset",
+          "params": {}
+        },
+        {
+          "type": "powershell",
+          "action": "ipconfig /renew",
+          "params": {},
+          "allowFailure": true
+        }
+      ]
+    }
+  ],
   "risk_class": "A",
   "auto_execute_threshold": 85
 }

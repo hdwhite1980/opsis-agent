@@ -63,6 +63,34 @@ export interface ComponentHealthScore {
   lastUpdated: string;
 }
 
+export interface EWMAScore {
+  currentValue: number;
+  previousValue: number;
+  timestamp: string;
+  trend: 'accelerating_down' | 'degrading' | 'stable' | 'improving';
+  firstDerivative: number;
+  secondDerivative: number;
+}
+
+export interface CooccurrenceTracker {
+  pairKey: string; // "signalA|signalB" (sorted)
+  count: number;
+  timeDeltaSamples: number[]; // last 50 time deltas in ms
+  averageTimeDeltaMs: number;
+  consistencyScore: number; // 0-1, inverse of coefficient of variation
+  lastSeen: string;
+}
+
+export interface DiscoveredCorrelation {
+  pairKey: string;
+  signalA: string;
+  signalB: string;
+  count: number;
+  consistency: number;
+  averageTimeDeltaMs: number;
+  discoveredAt: string;
+}
+
 export interface PatternDetectorData {
   occurrences: PatternOccurrence[];
   detectedPatterns: Record<string, DetectedPattern>;
@@ -70,6 +98,9 @@ export interface PatternDetectorData {
   healthScores: Record<string, ComponentHealthScore>;
   correlations: Record<string, CrossSignalCorrelation>;
   degradationHistory: Record<string, Array<{ timestamp: string; score: number }>>;
+  ewmaScores: Record<string, EWMAScore>;
+  cooccurrences: Record<string, CooccurrenceTracker>;
+  discoveredCorrelations: Record<string, DiscoveredCorrelation>;
   version: string;
 }
 
@@ -246,11 +277,14 @@ export class PatternDetector {
       if (fs.existsSync(this.filePath)) {
         const data = fs.readFileSync(this.filePath, 'utf8');
         const parsed = JSON.parse(data);
-        // Migrate v1.0 data to v2.0 by adding missing fields
+        // Migrate older data by adding missing fields
         if (!parsed.healthScores) parsed.healthScores = {};
         if (!parsed.correlations) parsed.correlations = {};
         if (!parsed.degradationHistory) parsed.degradationHistory = {};
-        if (!parsed.version) parsed.version = '2.0';
+        if (!parsed.ewmaScores) parsed.ewmaScores = {};
+        if (!parsed.cooccurrences) parsed.cooccurrences = {};
+        if (!parsed.discoveredCorrelations) parsed.discoveredCorrelations = {};
+        parsed.version = '3.0';
         return parsed;
       }
     } catch (error) {
@@ -264,7 +298,10 @@ export class PatternDetector {
       healthScores: {},
       correlations: {},
       degradationHistory: {},
-      version: '2.0'
+      ewmaScores: {},
+      cooccurrences: {},
+      discoveredCorrelations: {},
+      version: '3.0'
     };
   }
   
@@ -291,9 +328,10 @@ export class PatternDetector {
       severity,
       metadata
     });
-    
+
     this.analyzePatterns(signalId, deviceId);
     this.checkCorrelations(deviceId);
+    this.trackCooccurrences(signalId, deviceId);
     this.saveData();
   }
   
@@ -555,14 +593,28 @@ export class PatternDetector {
       signal: signalId
     });
 
-    // If score drops below 50, estimate failure date
+    // Update EWMA score
+    this.updateEWMA(componentKey, existing.score);
+
+    // If score drops below 50, estimate failure date (use more pessimistic of linear and EWMA)
     if (existing.score < 50) {
-      const failureDate = this.estimateFailureDate(componentKey);
+      const linearDate = this.estimateFailureDate(componentKey);
+      const ewmaDate = this.estimateFailureDateEWMA(componentKey);
+
+      // Use the more pessimistic (earlier) estimate
+      let failureDate = linearDate;
+      if (ewmaDate && (!linearDate || new Date(ewmaDate) < new Date(linearDate))) {
+        failureDate = ewmaDate;
+      }
+
       if (failureDate) {
         this.logger.warn('Component failure date estimated', {
           component: componentKey,
           score: existing.score,
-          estimatedFailure: failureDate
+          estimatedFailure: failureDate,
+          linearEstimate: linearDate,
+          ewmaEstimate: ewmaDate,
+          ewmaTrend: this.data.ewmaScores[componentKey]?.trend
         });
       }
     }
@@ -629,6 +681,201 @@ export class PatternDetector {
     const failureDate = new Date();
     failureDate.setDate(failureDate.getDate() + Math.ceil(daysToFailure));
     return failureDate.toISOString();
+  }
+
+  // ============================================
+  // EWMA FAILURE PREDICTION
+  // ============================================
+
+  private readonly EWMA_ALPHA = 0.3;
+
+  private updateEWMA(componentKey: string, score: number): void {
+    if (!this.data.ewmaScores) this.data.ewmaScores = {};
+
+    const existing = this.data.ewmaScores[componentKey];
+    const now = new Date().toISOString();
+
+    if (!existing) {
+      this.data.ewmaScores[componentKey] = {
+        currentValue: score,
+        previousValue: score,
+        timestamp: now,
+        trend: 'stable',
+        firstDerivative: 0,
+        secondDerivative: 0
+      };
+      return;
+    }
+
+    const newEWMA = this.EWMA_ALPHA * score + (1 - this.EWMA_ALPHA) * existing.currentValue;
+    const newFirstDerivative = newEWMA - existing.currentValue;
+    const newSecondDerivative = newFirstDerivative - existing.firstDerivative;
+
+    let trend: EWMAScore['trend'] = 'stable';
+    if (newSecondDerivative < -2) trend = 'accelerating_down';
+    else if (newFirstDerivative < -1) trend = 'degrading';
+    else if (newFirstDerivative > 1) trend = 'improving';
+
+    this.data.ewmaScores[componentKey] = {
+      currentValue: newEWMA,
+      previousValue: existing.currentValue,
+      timestamp: now,
+      trend,
+      firstDerivative: newFirstDerivative,
+      secondDerivative: newSecondDerivative
+    };
+  }
+
+  private estimateFailureDateEWMA(componentKey: string): string | undefined {
+    const ewma = this.data.ewmaScores?.[componentKey];
+    if (!ewma) return undefined;
+
+    // Compare to 7-day-ago value from degradation history
+    const history = this.data.degradationHistory?.[componentKey];
+    if (!history || history.length < 10) return undefined;
+
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const oldEntry = history.find(h => new Date(h.timestamp) >= sevenDaysAgo);
+    if (!oldEntry) return undefined;
+
+    const daysSince = (Date.now() - new Date(oldEntry.timestamp).getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSince < 1) return undefined;
+
+    let ratePerDay = (ewma.currentValue - oldEntry.score) / daysSince;
+    if (ratePerDay >= 0) return undefined; // Not degrading
+
+    // If accelerating down, adjust rate with second derivative
+    if (ewma.trend === 'accelerating_down' && ewma.secondDerivative < 0) {
+      ratePerDay += ewma.secondDerivative * 0.5; // Make it more pessimistic
+    }
+
+    const failureThreshold = 20;
+    const daysToFailure = (failureThreshold - ewma.currentValue) / ratePerDay;
+
+    if (daysToFailure <= 0 || daysToFailure > 365) return undefined;
+
+    const failureDate = new Date();
+    failureDate.setDate(failureDate.getDate() + Math.ceil(daysToFailure));
+    return failureDate.toISOString();
+  }
+
+  // ============================================
+  // DATA-DRIVEN CORRELATION DISCOVERY
+  // ============================================
+
+  private readonly COOCCURRENCE_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+  private readonly MAX_TIME_DELTA_SAMPLES = 50;
+  private readonly DISCOVERY_MIN_COUNT = 5;
+  private readonly DISCOVERY_MIN_CONSISTENCY = 0.7;
+
+  private trackCooccurrences(signalId: string, deviceId: string): void {
+    if (!this.data.cooccurrences) this.data.cooccurrences = {};
+    if (!this.data.discoveredCorrelations) this.data.discoveredCorrelations = {};
+
+    const now = Date.now();
+    const cutoff = now - this.COOCCURRENCE_WINDOW_MS;
+
+    // Find all other signals from the same device within the 30-min window
+    const recentOthers = this.data.occurrences.filter(o =>
+      o.deviceId === deviceId &&
+      o.signalId !== signalId &&
+      new Date(o.timestamp).getTime() >= cutoff &&
+      new Date(o.timestamp).getTime() < now // Exclude self
+    );
+
+    // Deduplicate — only count each unique signal once per window
+    const seenSignals = new Set<string>();
+    for (const other of recentOthers) {
+      if (seenSignals.has(other.signalId)) continue;
+      seenSignals.add(other.signalId);
+
+      // Create sorted pair key
+      const pair = [signalId, other.signalId].sort();
+      const pairKey = pair.join('|');
+
+      const timeDelta = now - new Date(other.timestamp).getTime();
+
+      let tracker = this.data.cooccurrences[pairKey];
+      if (!tracker) {
+        tracker = {
+          pairKey,
+          count: 0,
+          timeDeltaSamples: [],
+          averageTimeDeltaMs: 0,
+          consistencyScore: 0,
+          lastSeen: new Date().toISOString()
+        };
+      }
+
+      tracker.count++;
+      tracker.timeDeltaSamples.push(timeDelta);
+      if (tracker.timeDeltaSamples.length > this.MAX_TIME_DELTA_SAMPLES) {
+        tracker.timeDeltaSamples = tracker.timeDeltaSamples.slice(-this.MAX_TIME_DELTA_SAMPLES);
+      }
+
+      // Calculate average time delta
+      tracker.averageTimeDeltaMs = tracker.timeDeltaSamples.reduce((a, b) => a + b, 0) / tracker.timeDeltaSamples.length;
+
+      // Calculate consistency score (inverse of coefficient of variation)
+      if (tracker.timeDeltaSamples.length >= 3) {
+        const mean = tracker.averageTimeDeltaMs;
+        const variance = tracker.timeDeltaSamples.reduce((sum, v) => sum + (v - mean) ** 2, 0) / tracker.timeDeltaSamples.length;
+        const stddev = Math.sqrt(variance);
+        const cv = mean > 0 ? stddev / mean : 1;
+        tracker.consistencyScore = Math.max(0, Math.min(1, 1 - cv));
+      }
+
+      tracker.lastSeen = new Date().toISOString();
+      this.data.cooccurrences[pairKey] = tracker;
+    }
+
+    this.checkForDiscoveries();
+  }
+
+  private checkForDiscoveries(): void {
+    for (const [pairKey, tracker] of Object.entries(this.data.cooccurrences)) {
+      if (this.data.discoveredCorrelations[pairKey]) continue; // Already discovered
+
+      if (tracker.count >= this.DISCOVERY_MIN_COUNT && tracker.consistencyScore >= this.DISCOVERY_MIN_CONSISTENCY) {
+        const [signalA, signalB] = pairKey.split('|');
+        this.data.discoveredCorrelations[pairKey] = {
+          pairKey,
+          signalA,
+          signalB,
+          count: tracker.count,
+          consistency: tracker.consistencyScore,
+          averageTimeDeltaMs: tracker.averageTimeDeltaMs,
+          discoveredAt: new Date().toISOString()
+        };
+
+        this.logger.info('New signal correlation discovered', {
+          pair: pairKey,
+          count: tracker.count,
+          consistency: Math.round(tracker.consistencyScore * 100) + '%'
+        });
+      }
+    }
+  }
+
+  public getDiscoveredCorrelations(): DiscoveredCorrelation[] {
+    return Object.values(this.data.discoveredCorrelations || {});
+  }
+
+  public getCooccurrenceSummary(): Array<{ pair: string; count: number; consistency: number }> {
+    return Object.values(this.data.cooccurrences || {})
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+      .map(t => ({
+        pair: t.pairKey,
+        count: t.count,
+        consistency: Math.round(t.consistencyScore * 100) / 100
+      }));
+  }
+
+  public getEWMAScores(): Record<string, EWMAScore> {
+    return this.data.ewmaScores || {};
   }
 
   // ============================================
