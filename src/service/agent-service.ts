@@ -1827,7 +1827,14 @@ class OPSISAgentService {
           break;
 
         case 'ack':
-          // Message acknowledged
+        case 'telemetry_ack':
+        case 'register_ack':
+        case 'software_inventory_ack':
+        case 'diagnostic_error_ack':
+        case 'proactive-action_ack':
+        case 'hardware-health-report_ack':
+        case 'status':
+          // Message acknowledged / server status update
           break;
           
         case 'decision':
