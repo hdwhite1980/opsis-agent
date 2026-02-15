@@ -2,7 +2,7 @@
 ; Service: compiled standalone exe (pkg). GUI: localhost web UI served by agent service.
 
 #define AppName "OPSIS Agent"
-#define AppVersion "1.1.0"
+#define AppVersion "1.2.0"
 #define AppPublisher "OPSIS"
 #define AppURL "https://opsis.io"
 #define ServiceName "OPSIS Agent Service"
@@ -43,6 +43,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; Compiled service executable (standalone - no Node.js needed)
 Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignoreversion
+
+; Native module: keytar for Windows Credential Manager (DPAPI-encrypted credential storage)
+Source: "node_modules\keytar\build\Release\keytar.node"; DestDir: "{app}\dist"; Flags: ignoreversion
 
 ; WinSW service wrapper
 Source: "node_modules\node-windows\bin\winsw\winsw.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
@@ -131,8 +134,8 @@ Filename: "cmd.exe"; Parameters: "/c start http://localhost:19851"; Description:
 ; Stop and uninstall service
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
-; Remove stored credentials from Credential Manager
-Filename: "powershell.exe"; Parameters: "-Command ""cmdkey /delete:OPSISAgent_ApiKey -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
+; Remove stored credentials from Credential Manager (cmdkey-stored + keytar-stored)
+Filename: "powershell.exe"; Parameters: "-Command ""cmdkey /delete:OPSISAgent_ApiKey 2>$null; cmdkey /delete:OPSIS-Agent/apiKey 2>$null; cmdkey /delete:OPSIS-Agent/hmacSecret 2>$null; cmdkey /delete:OPSIS-Agent/ipcSecret 2>$null; cmdkey /delete:OPSIS-Agent/runbookIntegrityManifest 2>$null"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
 ; Remove OPSIS registry keys
 Filename: "powershell.exe"; Parameters: "-Command ""Remove-Item -Path 'HKLM:\SOFTWARE\OPSIS' -Recurse -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanRegistry"
 ; Remove Defender exclusions
