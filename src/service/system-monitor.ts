@@ -566,7 +566,7 @@ export class SystemMonitor {
         this.emitSignal({
           id: `service-stopped-${service.Name}`,
           category: 'services',
-          severity: priority === 'critical' ? 'warning' : 'warning',
+          severity: priority === 'critical' ? 'critical' : 'warning',
           metric: 'service_status',
           value: 'stopped',
           message: `Service ${service.DisplayName || service.Name} stopped (StartType: ${service.StartType})`,
