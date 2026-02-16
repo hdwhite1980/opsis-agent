@@ -1833,6 +1833,7 @@ class OPSISAgentService {
         case 'diagnostic_error_ack':
         case 'proactive-action_ack':
         case 'hardware-health-report_ack':
+        case 'playbook_result_ack':
         case 'status':
           // Message acknowledged / server status update
           break;

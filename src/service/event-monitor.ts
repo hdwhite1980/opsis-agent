@@ -1076,7 +1076,14 @@ ConvertTo-Json -Depth 3
   private async handleUnmatchedEvent(event: EventLogEntry): Promise<void> {
     // Critical and Error events without runbooks should be escalated
     if (event.level === 'Critical' || event.level === 'Error') {
-      
+
+      // Skip events already handled by the system monitor to avoid duplicate escalations:
+      // - Event ID 7036 (service state changes) — system monitor detects and remediates stopped services
+      // - Agent's own log entries — avoid self-escalation loops
+      if (event.id === 7036 || event.source === 'OpsisAgentService') {
+        return;
+      }
+
       this.logger.info('No runbook found for critical/error event - requesting escalation', {
         eventId: event.id,
         level: event.level,
