@@ -3482,24 +3482,43 @@ class OPSISAgentService {
     return { ignored_signatures: [] };
   }
 
-  private sendPlaybookResult(playbook: PlaybookTask, status: string, durationMs: number, error?: any): void {
+  private sendPlaybookResult(
+    playbook: PlaybookTask,
+    status: string,
+    durationMs: number,
+    error?: any,
+    stepResults?: Array<{ step_index: number; type: string; action: string; status: string; error?: string }>
+  ): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const signalId = (playbook as any).signalId || playbook.id;
+      const signatureId = (playbook as any).signatureId || null;
+      const resourceName = this.extractResourceName(null, playbook);
+
       this.ws.send(JSON.stringify({
         type: 'playbook_result',
         timestamp: new Date().toISOString(),
         device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
         playbook_id: playbook.id,
+        playbook_name: playbook.name,
+        signature_id: signatureId,
+        signal_id: signalId,
         ticket_id: (playbook as any).ticketId || null,
         status,
         execution_time_ms: durationMs,
-        steps_executed: playbook.steps?.length || 0,
+        steps_total: playbook.steps?.length || 0,
+        steps_executed: stepResults?.length || playbook.steps?.length || 0,
+        step_results: stepResults || null,
         error: error ? error.toString() : null,
-        source: playbook.source
+        source: playbook.source,
+        resource_name: resourceName
       }));
 
       this.logger.info('Playbook result sent to server', {
         playbook_id: playbook.id,
-        status
+        signature_id: signatureId,
+        status,
+        steps: stepResults?.length || 0
       });
     }
   }
@@ -4478,14 +4497,16 @@ class OPSISAgentService {
         playbookId: playbook.id,
         reason: memoryCheck.reason
       });
-      
+
       this.reportPlaybookResult(playbook.id, 'skipped', memoryCheck.reason);
+      this.sendPlaybookResult(playbook, 'skipped', 0, memoryCheck.reason);
       return;
     }
 
     if (this.playbookQueue.length >= 50) {
       this.logger.warn('Playbook queue full, rejecting playbook', { playbookId: playbook.id });
       this.reportPlaybookResult(playbook.id, 'skipped', 'Queue full (limit: 50)');
+      this.sendPlaybookResult(playbook, 'skipped', 0, 'Queue full (limit: 50)');
       return;
     }
 
@@ -4530,7 +4551,7 @@ class OPSISAgentService {
 
         this.log(`Playbook completed: ${playbook.name}`);
         this.reportPlaybookResult(playbook.id, 'success');
-        this.sendPlaybookResult(playbook, 'success', duration);
+        this.sendPlaybookResult(playbook, 'success', duration, undefined, this.lastStepResults);
 
         // Refresh software inventory after successful playbook (may have installed/removed software)
         setTimeout(() => this.sendSoftwareInventory(), 5000);
@@ -4554,7 +4575,7 @@ class OPSISAgentService {
 
         this.log(`Playbook failed: ${playbook.name}`, error);
         this.reportPlaybookResult(playbook.id, 'failed', error);
-        this.sendPlaybookResult(playbook, 'failed', duration, error);
+        this.sendPlaybookResult(playbook, 'failed', duration, error, this.lastStepResults);
 
         this.remediationMemory.recordAttempt(
           playbook.id,
@@ -4571,19 +4592,25 @@ class OPSISAgentService {
     this.isExecutingPlaybook = false;
   }
 
+  private lastStepResults: Array<{ step_index: number; type: string; action: string; status: string; error?: string }> = [];
+
   private async executePlaybook(playbook: PlaybookTask, resumeFromStep: number = 0): Promise<void> {
+    this.lastStepResults = [];
+
     for (let i = resumeFromStep; i < playbook.steps.length; i++) {
       const step = playbook.steps[i];
       this.log(`  Executing step ${i + 1}/${playbook.steps.length}: ${step.type} - ${step.action}`);
 
       if (step.requiresApproval && !this.config.autoRemediation) {
         this.log('  Step requires approval, skipping (auto-remediation disabled)');
+        this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'skipped' });
         continue;
       }
 
       // If this is a reboot step and there are steps after it, save state before rebooting
       if (step.type === 'reboot' && i < playbook.steps.length - 1) {
         await this.executeStep(step);
+        this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'success' });
         // If reboot was confirmed (shutdown is pending), save remaining steps for resume
         this.saveRebootPlaybookState(playbook, i + 1);
         this.logger.info('Playbook state saved for post-reboot resume', {
@@ -4598,9 +4625,11 @@ class OPSISAgentService {
 
       try {
         await this.executeStep(step);
+        this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'success' });
       } catch (error) {
         if (isVerification) {
           this.log(`  Verification step result (non-fatal): ${step.action}`, error);
+          this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'skipped', error: String(error) });
           continue;
         }
 
@@ -4611,12 +4640,15 @@ class OPSISAgentService {
           const fallbackOk = await this.executeFallbackChain(fallback);
           if (fallbackOk) {
             this.log(`  Fallback chain succeeded, continuing to next step`);
+            this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'fallback_success' });
             continue; // Fallback recovered — continue to next primary step
           }
+          this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'failed', error: String(error) });
           this.log(`  Fallback chain also failed for step: ${step.action}`);
           throw new Error(`Step "${step.action}" failed and fallback chain exhausted: ${error}`);
         }
 
+        this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'failed', error: String(error) });
         this.log(`  Step failed: ${step.action}`, error);
         throw error;
       }
@@ -5643,7 +5675,7 @@ class OPSISAgentService {
           duration_ms: duration
         });
         this.reportPlaybookResult(playbook.id, 'success');
-        this.sendPlaybookResult(playbook, 'success', duration);
+        this.sendPlaybookResult(playbook, 'success', duration, undefined, this.lastStepResults);
 
         this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'success', duration, undefined, rebootResourceName);
 
@@ -5655,7 +5687,7 @@ class OPSISAgentService {
 
         this.logger.error('Post-reboot playbook failed', { playbook_id: playbook.id, error });
         this.reportPlaybookResult(playbook.id, 'failed', error);
-        this.sendPlaybookResult(playbook, 'failed', duration, error);
+        this.sendPlaybookResult(playbook, 'failed', duration, error, this.lastStepResults);
 
         this.remediationMemory.recordAttempt(playbook.id, signalId, deviceId, 'failure', duration, error?.toString(), rebootResourceName);
       }
