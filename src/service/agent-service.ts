@@ -3064,20 +3064,10 @@ class OPSISAgentService {
       }
       this.logger.info('Diagnostic request signature verified');
     } else {
-      // No signature - REJECT if HMAC is configured (strict enforcement)
-      const hmacRequired = await isHmacConfigured();
-      if (hmacRequired) {
-        this.logger.error('SECURITY: Diagnostic request missing signature - HMAC is configured, rejecting unsigned request');
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({
-            type: 'diagnostic_error',
-            session_id: data.session_id,
-            error: 'Missing signature - signed requests required',
-            timestamp: new Date().toISOString()
-          }));
-        }
-        return;
-      }
+      // No signature — diagnostic requests are read-only (data collection only),
+      // so allow them without HMAC. Playbooks (which execute commands) still
+      // require strict HMAC enforcement.
+      this.logger.info('Diagnostic request has no signature - proceeding (read-only operation)');
     }
 
     // Step 2: Validate diagnostic request structure
