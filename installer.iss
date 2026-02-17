@@ -68,6 +68,10 @@ Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
 Source: "config\agent.config.json"; DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "config\exclusions.json"; DestDir: "{app}\config"; Flags: ignoreversion
 
+; Installer scripts
+Source: "scripts\store-apikey.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "scripts\remove-credentials.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+
 ; License
 Source: "LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -116,7 +120,9 @@ Filename: "powershell.exe"; Parameters: "-Command ""icacls '{app}\certs' /inheri
 Filename: "powershell.exe"; Parameters: "-Command ""if (-not [System.Diagnostics.EventLog]::SourceExists('OPSIS Agent')) {{ New-EventLog -LogName Application -Source 'OPSIS Agent' -ErrorAction SilentlyContinue }}"""; StatusMsg: "Registering event log source..."; Flags: runhidden waituntilterminated shellexec
 
 ; 8. Store API key in Windows Credential Manager (DPAPI encrypted) if provided
-Filename: "powershell.exe"; Parameters: "-Command ""$key = Get-Content '{app}\data\agent.config.json' -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json | Select-Object -ExpandProperty apiKey -ErrorAction SilentlyContinue; if ($key -and $key -ne '') {{ cmdkey /generic:OPSISAgent_ApiKey /user:opsis /pass:$key | Out-Null; Write-Host 'API key stored in Credential Manager' }}"""; StatusMsg: "Securing API credentials..."; Flags: runhidden waituntilterminated shellexec
+; Keytar uses 'OPSIS-Agent:apiKey' as credential target — cmdkey can't handle colons,
+; so we use a PowerShell script with Win32 CredWrite API to match keytar's format
+Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\store-apikey.ps1"" -ConfigPath ""{app}\data\agent.config.json"""; StatusMsg: "Securing API credentials..."; Flags: runhidden waituntilterminated shellexec
 
 ; 9. Generate IPC authentication secret for GUI-to-service communication
 Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::ToBase64String((1..32 | ForEach-Object {{ [byte](Get-Random -Minimum 0 -Maximum 256) }})); $regPath = 'HKLM:\SOFTWARE\OPSIS\Agent'; if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}; Set-ItemProperty -Path $regPath -Name 'IPCSecret' -Value $secret"""; StatusMsg: "Generating IPC authentication secret..."; Flags: runhidden waituntilterminated shellexec
@@ -135,7 +141,7 @@ Filename: "cmd.exe"; Parameters: "/c start http://localhost:19851"; Description:
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
 ; Remove stored credentials from Credential Manager (cmdkey-stored + keytar-stored)
-Filename: "powershell.exe"; Parameters: "-Command ""cmdkey /delete:OPSISAgent_ApiKey 2>$null; cmdkey /delete:OPSIS-Agent/apiKey 2>$null; cmdkey /delete:OPSIS-Agent/hmacSecret 2>$null; cmdkey /delete:OPSIS-Agent/ipcSecret 2>$null; cmdkey /delete:OPSIS-Agent/runbookIntegrityManifest 2>$null"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
+Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\remove-credentials.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
 ; Remove OPSIS registry keys
 Filename: "powershell.exe"; Parameters: "-Command ""Remove-Item -Path 'HKLM:\SOFTWARE\OPSIS' -Recurse -Force -ErrorAction SilentlyContinue"""; Flags: runhidden waituntilterminated; RunOnceId: "CleanRegistry"
 ; Remove Defender exclusions
