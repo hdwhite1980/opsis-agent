@@ -1870,7 +1870,8 @@ class OPSISAgentService {
           }
 
           // Normalize server field names: playbook_id -> id, title -> name
-          if (!playbook.id && playbook.playbook_id) playbook.id = playbook.playbook_id;
+          // Always prefer playbook_id from server (the canonical identifier)
+          if (playbook.playbook_id) playbook.id = playbook.playbook_id;
           if (!playbook.name && playbook.title) playbook.name = playbook.title;
           if (!playbook || !playbook.id) {
             this.logger.warn('Received playbook message with no valid playbook data', { raw: JSON.stringify(data).slice(0, 500) });
