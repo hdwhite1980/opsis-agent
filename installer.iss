@@ -244,6 +244,55 @@ begin
   ServerURLPage.Values[1] := '';
 end;
 
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  URL, Key, Tmp: string;
+begin
+  Result := True;
+  if CurPageID = ServerURLPage.ID then
+  begin
+    URL := Trim(ServerURLPage.Values[0]);
+    Key := Trim(ServerURLPage.Values[1]);
+
+    // Both blank is fine (skip configuration)
+    if (URL = '') and (Key = '') then
+      Exit;
+
+    // Detect swap: URL field has an API key, Key field has a URL
+    if ((Pos('opsis_', URL) = 1) or (Pos('OPSIS_', URL) = 1)) and
+       ((Pos('://', Key) > 0) or (Pos('.', Key) > 0)) then
+    begin
+      // Auto-swap the values
+      Tmp := URL;
+      ServerURLPage.Values[0] := Key;
+      ServerURLPage.Values[1] := Tmp;
+      MsgBox('It looks like the Server URL and API Key were entered in the wrong fields. They have been swapped automatically. Please verify and click Next again.', mbInformation, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    // Validate URL field doesn't look like an API key
+    if (Pos('opsis_', URL) = 1) or (Pos('OPSIS_', URL) = 1) then
+    begin
+      MsgBox('The Server URL field appears to contain an API key.' + #13#10 +
+        'Please enter the server URL (e.g., wss://opsis.yourdomain.com) in the first field' + #13#10 +
+        'and the API key (e.g., opsis_xxxx) in the second field.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+
+    // Validate Key field doesn't look like a URL
+    if (Pos('://', Key) > 0) or (Pos('wss:', Key) > 0) or (Pos('ws:', Key) > 0) or (Pos('http', Key) > 0) then
+    begin
+      MsgBox('The API Key field appears to contain a URL.' + #13#10 +
+        'Please enter the API key (e.g., opsis_xxxx) in the second field' + #13#10 +
+        'and the server URL in the first field.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
 procedure CreateServiceConfig();
 var
   ConfigFile: string;
