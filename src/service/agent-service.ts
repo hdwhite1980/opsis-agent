@@ -583,8 +583,11 @@ class OPSISAgentService {
     const guiStats = {
       issuesDetected: stats.totalTickets,
       issuesEscalated: stats.escalatedTickets,
-      successRate: stats.successRate,
-      activeTickets: stats.openTickets
+      activeTickets: stats.openTickets,
+      autoResolved: stats.autoResolved,
+      awaitingReview: stats.awaitingReview,
+      remediationAttempted: stats.remediationAttempted,
+      fixRate: stats.fixRate
     };
     
     this.broadcastToAllClients({
@@ -625,8 +628,11 @@ class OPSISAgentService {
         stats: {
           issuesDetected: stats.totalTickets,
           issuesEscalated: stats.escalatedTickets,
-          successRate: stats.successRate,
-          activeTickets: stats.openTickets
+          activeTickets: stats.openTickets,
+          autoResolved: stats.autoResolved,
+          awaitingReview: stats.awaitingReview,
+          remediationAttempted: stats.remediationAttempted,
+          fixRate: stats.fixRate
         },
         healthScores: this.patternDetector.getHealthScores(),
         correlations: this.patternDetector.getCorrelations(),
@@ -650,7 +656,9 @@ class OPSISAgentService {
         const stats = this.ticketDb.getStatistics();
         return { type: 'tickets', data: { tickets, stats: {
           issuesDetected: stats.totalTickets, issuesEscalated: stats.escalatedTickets,
-          successRate: stats.successRate, activeTickets: stats.openTickets
+          activeTickets: stats.openTickets, autoResolved: stats.autoResolved,
+          awaitingReview: stats.awaitingReview, remediationAttempted: stats.remediationAttempted,
+          fixRate: stats.fixRate
         } } };
       }
       case 'get-status':
@@ -659,7 +667,9 @@ class OPSISAgentService {
         const ticketStats = this.ticketDb.getStatistics();
         return { type: 'stats', data: {
           issuesDetected: ticketStats.totalTickets, issuesEscalated: ticketStats.escalatedTickets,
-          successRate: ticketStats.successRate, activeTickets: ticketStats.openTickets
+          activeTickets: ticketStats.openTickets, autoResolved: ticketStats.autoResolved,
+          awaitingReview: ticketStats.awaitingReview, remediationAttempted: ticketStats.remediationAttempted,
+          fixRate: ticketStats.fixRate
         } };
       }
       case 'get-health-data':
@@ -867,8 +877,11 @@ class OPSISAgentService {
       const guiStats = {
         issuesDetected: stats.totalTickets,
         issuesEscalated: stats.escalatedTickets,
-        successRate: stats.successRate,
-        activeTickets: stats.openTickets
+        activeTickets: stats.openTickets,
+        autoResolved: stats.autoResolved,
+        awaitingReview: stats.awaitingReview,
+        remediationAttempted: stats.remediationAttempted,
+        fixRate: stats.fixRate
       };
       
       this.ipcServer.sendToClient(socket, {
@@ -893,8 +906,11 @@ class OPSISAgentService {
       const guiStats = {
         issuesDetected: ticketStats.totalTickets,
         issuesEscalated: ticketStats.escalatedTickets,
-        successRate: ticketStats.successRate,
-        activeTickets: ticketStats.openTickets
+        activeTickets: ticketStats.openTickets,
+        autoResolved: ticketStats.autoResolved,
+        awaitingReview: ticketStats.awaitingReview,
+        remediationAttempted: ticketStats.remediationAttempted,
+        fixRate: ticketStats.fixRate
       };
       
       this.ipcServer.sendToClient(socket, {

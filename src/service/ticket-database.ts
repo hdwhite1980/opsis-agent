@@ -275,7 +275,10 @@ export class TicketDatabase {
     openTickets: number;
     resolvedTickets: number;
     escalatedTickets: number;
-    successRate: number;
+    autoResolved: number;
+    awaitingReview: number;
+    remediationAttempted: number;
+    fixRate: number;
   } {
     try {
       const total = this.tickets.length;
@@ -285,28 +288,26 @@ export class TicketDatabase {
       const success = this.tickets.filter(t => t.result === 'success').length;
       const failed = this.tickets.filter(t => t.result === 'failure').length;
 
-      // Calculate success rate based on tickets that have a result (went through remediation)
-      // If no tickets have results yet, calculate based on non-escalated vs escalated
-      const attempted = success + failed;
-      let successRate: number;
+      // Auto-resolved: tickets where a runbook ran and succeeded
+      const autoResolved = success;
 
-      if (attempted > 0) {
-        // Tickets went through auto-remediation: show actual success rate
-        successRate = Math.round((success / attempted) * 100);
-      } else if (total > 0) {
-        // No remediation attempts yet: show % of non-escalated tickets
-        const nonEscalated = total - escalated;
-        successRate = Math.round((nonEscalated / total) * 100);
-      } else {
-        successRate = 0;
-      }
+      // Awaiting review: escalated tickets still in open status
+      const awaitingReview = this.tickets.filter(t => t.escalated === 1 && t.status === 'open').length;
+
+      // Fix rate: success out of all remediation attempts (success + failure)
+      // Only counts tickets where a runbook was actually tried
+      const attempted = success + failed;
+      const fixRate = attempted > 0 ? Math.round((success / attempted) * 100) : 0;
 
       return {
         totalTickets: total,
         openTickets: open,
         resolvedTickets: resolved,
         escalatedTickets: escalated,
-        successRate
+        autoResolved,
+        awaitingReview,
+        remediationAttempted: attempted,
+        fixRate
       };
     } catch (error) {
       this.logger.error('Error getting statistics', error);
@@ -315,7 +316,10 @@ export class TicketDatabase {
         openTickets: 0,
         resolvedTickets: 0,
         escalatedTickets: 0,
-        successRate: 0
+        autoResolved: 0,
+        awaitingReview: 0,
+        remediationAttempted: 0,
+        fixRate: 0
       };
     }
   }

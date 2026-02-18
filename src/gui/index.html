@@ -1173,20 +1173,21 @@
 
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-label">Total Tickets</div>
+                            <div class="stat-label">Issues Detected</div>
                             <div class="stat-value" id="issuesDetected">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Open Tickets</div>
-                            <div class="stat-value" id="activeTickets">0</div>
+                            <div class="stat-label">Auto-Resolved</div>
+                            <div class="stat-value" id="autoResolved" style="color:#16A34A;">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Escalated</div>
-                            <div class="stat-value" id="issuesEscalated">0</div>
+                            <div class="stat-label">Awaiting Review</div>
+                            <div class="stat-value" id="awaitingReview" style="color:#D97706;">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Success Rate</div>
-                            <div class="stat-value" id="successRate">0%</div>
+                            <div class="stat-label">Fix Rate</div>
+                            <div class="stat-value" id="fixRate">—</div>
+                            <div class="stat-hint" id="fixRateHint" style="font-size:10px;color:#9CA3AF;margin-top:4px;"></div>
                         </div>
                     </div>
 
@@ -1680,10 +1681,7 @@
 
         function handleInitialData(data) {
             if (data.stats) {
-                document.getElementById('issuesDetected').textContent = data.stats.issuesDetected || 0;
-                document.getElementById('activeTickets').textContent = data.stats.activeTickets || 0;
-                document.getElementById('issuesEscalated').textContent = data.stats.issuesEscalated || 0;
-                document.getElementById('successRate').textContent = (data.stats.successRate || 0) + '%';
+                updateStatCards(data.stats);
             }
             if (data.tickets) {
                 try {
@@ -1744,14 +1742,28 @@
             if (box) box.remove();
         }
 
+        function updateStatCards(stats) {
+            document.getElementById('issuesDetected').textContent = stats.issuesDetected || 0;
+            document.getElementById('autoResolved').textContent = stats.autoResolved || 0;
+            document.getElementById('awaitingReview').textContent = stats.awaitingReview || 0;
+
+            const fixRateEl = document.getElementById('fixRate');
+            const fixRateHint = document.getElementById('fixRateHint');
+            const attempted = stats.remediationAttempted || 0;
+            if (attempted > 0) {
+                fixRateEl.textContent = (stats.fixRate || 0) + '%';
+                fixRateHint.textContent = stats.autoResolved + ' of ' + attempted + ' remediated';
+            } else {
+                fixRateEl.textContent = '\u2014';
+                fixRateHint.textContent = 'No remediation attempts yet';
+            }
+        }
+
         async function refreshData() {
             let allOk = true;
             try {
                 const stats = await invoke('get_stats');
-                document.getElementById('issuesDetected').textContent = stats.issuesDetected || 0;
-                document.getElementById('activeTickets').textContent = stats.activeTickets || 0;
-                document.getElementById('issuesEscalated').textContent = stats.issuesEscalated || 0;
-                document.getElementById('successRate').textContent = (stats.successRate || 0) + '%';
+                updateStatCards(stats);
             } catch (e) { allOk = false; showDebugError('Stats', e); }
 
             try {
