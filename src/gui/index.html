@@ -1799,8 +1799,11 @@
             }, 500);
         });
 
-        // Temporary: show errors on screen for debugging
+        // Debug error display — only shows latest error per label, clears when connection restored
+        const debugErrors = {};
         function showDebugError(label, err) {
+            const msg = err instanceof Error ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
+            debugErrors[label] = msg;
             let box = document.getElementById('debugErrors');
             if (!box) {
                 box = document.createElement('div');
@@ -1808,17 +1811,23 @@
                 box.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#1a1a2e;color:#ff6b6b;padding:8px 12px;font-size:11px;z-index:99999;max-height:150px;overflow-y:auto;font-family:monospace;border-top:2px solid #ff6b6b;';
                 document.body.appendChild(box);
             }
-            box.innerHTML += label + ': ' + (typeof err === 'string' ? err : JSON.stringify(err)) + '<br>';
+            box.innerHTML = Object.entries(debugErrors).map(([k, v]) => k + ': ' + v).join('<br>');
+        }
+        function clearDebugErrors() {
+            Object.keys(debugErrors).forEach(k => delete debugErrors[k]);
+            const box = document.getElementById('debugErrors');
+            if (box) box.remove();
         }
 
         async function refreshData() {
+            let allOk = true;
             try {
                 const stats = await invoke('get_stats');
                 document.getElementById('issuesDetected').textContent = stats.issuesDetected || 0;
                 document.getElementById('activeTickets').textContent = stats.activeTickets || 0;
                 document.getElementById('issuesEscalated').textContent = stats.issuesEscalated || 0;
                 document.getElementById('successRate').textContent = (stats.successRate || 0) + '%';
-            } catch (e) { showDebugError('Stats', e); }
+            } catch (e) { allOk = false; showDebugError('Stats', e); }
 
             try {
                 const result = await invoke('get_tickets');
@@ -1826,7 +1835,7 @@
                 const groups = groupTickets(tickets);
                 renderTicketGroups('dashboardTickets', groups.slice(0, 10));
                 renderTicketGroups('allTickets', groups);
-            } catch (e) { showDebugError('Tickets', e); }
+            } catch (e) { allOk = false; showDebugError('Tickets', e); }
 
             try {
                 const data = await invoke('get_health_data');
@@ -1835,7 +1844,9 @@
                 renderPatterns(data.patterns || []);
                 renderDashboardHealth(data.healthScores || {});
                 renderDashboardActions(data.proactiveActions || []);
-            } catch (e) { showDebugError('Health', e); }
+            } catch (e) { allOk = false; showDebugError('Health', e); }
+
+            if (allOk) clearDebugErrors();
         }
 
         // ============================================
