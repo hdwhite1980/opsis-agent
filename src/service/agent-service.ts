@@ -1335,6 +1335,8 @@ class OPSISAgentService {
       this.logger.warn(`Agent operating in ${this.capabilityMode.toUpperCase()} mode`, {
         disabled_categories: this.compatibilityReport.disabled_categories
       });
+    } else if (this.compatibilityReport.checks.some(c => c.name === 'Windows Defender Application Control' && c.status === 'red')) {
+      this.logger.info('[COMPAT] WDAC is enforced but functional test passed — OPSIS appears whitelisted, running in FULL mode');
     }
   }
 

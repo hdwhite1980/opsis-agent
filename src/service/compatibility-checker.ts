@@ -362,6 +362,11 @@ export class CompatibilityChecker {
   private determineCapabilityMode(checks: CompatibilityCheck[]): CapabilityMode {
     const redChecks = checks.filter(c => c.status === 'red');
     const redNames = redChecks.map(c => c.name);
+    const greenNames = checks.filter(c => c.status === 'green').map(c => c.name);
+
+    // If the functional PowerShell test passed, OPSIS can actually execute scripts
+    // even if WDAC is enforced (means OPSIS is whitelisted in the WDAC policy).
+    const psWorksInPractice = greenNames.includes('Endpoint Protection Interference');
 
     // Monitor-only: PowerShell completely blocked or WDAC enforced + CLM
     const psBlocked = redNames.includes('PowerShell Execution Policy') ||
@@ -373,9 +378,13 @@ export class CompatibilityChecker {
       return 'monitor-only';
     }
 
-    // Limited: CLM or WDAC or service GPO restrictions
+    // If WDAC is enforced but the functional test proves PowerShell works,
+    // OPSIS is whitelisted — don't downgrade to limited mode for WDAC alone.
+    const wdacEffective = redNames.includes('Windows Defender Application Control') && !psWorksInPractice;
+
+    // Limited: CLM or effective WDAC block or service GPO restrictions
     if (redNames.includes('Constrained Language Mode') ||
-        redNames.includes('Windows Defender Application Control') ||
+        wdacEffective ||
         redNames.includes('Service Management GPO')) {
       return 'limited';
     }
@@ -386,6 +395,8 @@ export class CompatibilityChecker {
   private getDisabledCategories(checks: CompatibilityCheck[]): string[] {
     const disabled: string[] = [];
     const redNames = checks.filter(c => c.status === 'red').map(c => c.name);
+    const greenNames = checks.filter(c => c.status === 'green').map(c => c.name);
+    const psWorksInPractice = greenNames.includes('Endpoint Protection Interference');
 
     if (redNames.includes('Constrained Language Mode')) {
       disabled.push('registry-modification', 'advanced-process-management', 'wmi-operations');
@@ -393,7 +404,9 @@ export class CompatibilityChecker {
     if (redNames.includes('Service Management GPO')) {
       disabled.push('service-restart', 'service-stop');
     }
-    if (redNames.includes('Windows Defender Application Control')) {
+    // Only disable script/binary execution for WDAC if the functional test also failed
+    // (if PowerShell works in practice, OPSIS is whitelisted in the WDAC policy)
+    if (redNames.includes('Windows Defender Application Control') && !psWorksInPractice) {
       disabled.push('script-execution', 'binary-execution');
     }
     if (redNames.includes('Endpoint Protection Interference')) {
