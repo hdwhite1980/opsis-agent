@@ -286,24 +286,32 @@
         }
 
         .ticket-item {
-            background: #F8FAFC;
-            padding: 14px 16px;
-            border-radius: 10px;
-            border-left: 3px solid #2DD4FF;
-            margin-bottom: 10px;
+            background: #FFFFFF;
+            padding: 0;
+            border-radius: 12px;
+            border: 1px solid #E5E7EB;
+            margin-bottom: 12px;
             transition: all 0.15s ease;
-            cursor: pointer;
+            overflow: hidden;
         }
 
         .ticket-item:hover {
-            background: #F1F5F9;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+
+        .ticket-top-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 16px;
+            border-bottom: 1px solid #F1F5F9;
+            cursor: pointer;
         }
 
         .ticket-header {
             display: flex;
-            justify-content: space-between;
-            margin-bottom: 6px;
+            align-items: center;
+            gap: 8px;
         }
 
         .ticket-type {
@@ -317,11 +325,76 @@
             color: #9CA3AF;
         }
 
-        .ticket-description {
+        .ticket-body {
+            padding: 12px 16px;
+        }
+
+        .ticket-issue-row {
+            margin-bottom: 10px;
+        }
+        .ticket-issue-row .section-icon {
+            color: #EF4444;
+        }
+        .ticket-issue-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #111827;
+            margin-bottom: 3px;
+        }
+        .ticket-issue-desc {
             font-size: 12px;
-            color: #6B7280;
-            margin-bottom: 8px;
+            color: #4B5563;
             line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .ticket-info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        @media (max-width: 700px) {
+            .ticket-info-grid { grid-template-columns: 1fr; }
+        }
+
+        .ticket-info-box {
+            background: #F8FAFC;
+            border-radius: 8px;
+            padding: 10px 12px;
+            border: 1px solid #F1F5F9;
+        }
+        .ticket-info-box.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .ticket-info-label {
+            font-size: 10px;
+            font-weight: 700;
+            color: #9CA3AF;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .ticket-info-label .section-icon {
+            width: 12px;
+            height: 12px;
+        }
+
+        .ticket-info-value {
+            font-size: 12px;
+            color: #374151;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .ticket-info-value.muted {
+            color: #9CA3AF;
+            font-style: italic;
         }
 
         .ticket-status {
@@ -338,41 +411,21 @@
         .status-protected { background: rgba(59, 130, 246, 0.1); color: #2563EB; }
         .status-failed { background: rgba(239, 68, 68, 0.1); color: #DC2626; }
 
-        /* Ticket Detail */
+        /* Ticket Detail - extra metadata, toggled */
         .ticket-detail {
             display: none;
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px solid #E5E7EB;
+            padding: 0 16px 12px;
         }
         .ticket-detail.expanded { display: block; }
-
-        .detail-section { margin-bottom: 12px; }
-
-        .detail-label {
-            font-size: 10px;
-            font-weight: 700;
-            color: #9CA3AF;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            margin-bottom: 4px;
-        }
-
-        .detail-content {
-            font-size: 12px;
-            color: #374151;
-            line-height: 1.5;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
 
         .detail-meta {
             font-size: 10px;
             color: #9CA3AF;
-            margin-top: 8px;
             display: flex;
             flex-wrap: wrap;
             gap: 12px;
+            padding-top: 8px;
+            border-top: 1px solid #F1F5F9;
         }
         .detail-meta span { display: inline-flex; align-items: center; gap: 4px; }
 
@@ -390,6 +443,23 @@
         .resolution-protected { background: rgba(59, 130, 246, 0.1); color: #2563EB; }
         .resolution-escalated { background: rgba(239, 68, 68, 0.1); color: #DC2626; }
         .resolution-pending { background: rgba(245, 158, 11, 0.1); color: #D97706; }
+
+        .ticket-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 16px;
+            background: #F8FAFC;
+            border-top: 1px solid #F1F5F9;
+            font-size: 10px;
+            color: #9CA3AF;
+            cursor: pointer;
+        }
+        .ticket-footer:hover { background: #F1F5F9; }
+        .ticket-footer .toggle-hint {
+            color: #6B7280;
+            font-weight: 500;
+        }
 
         .btn-danger {
             background: rgba(239, 68, 68, 0.08);
@@ -1926,73 +1996,122 @@
             if (el) el.classList.toggle('expanded');
         }
 
-        function buildTicketDetail(ticket, gid) {
+        function buildTicketBody(ticket, gid) {
             const resCat = getResolutionCategory(ticket);
             const resLabel = getResolutionLabel(resCat);
 
-            let diagContent = '';
-            if (ticket.diagnostic_summary) {
-                diagContent = escapeHtml(ticket.diagnostic_summary);
-            } else {
-                let parts = [];
-                if (ticket.event_id && ticket.event_source) {
-                    parts.push('Event ID ' + ticket.event_id + ' from ' + ticket.event_source);
-                }
-                parts.push(ticket.description || 'No details available');
-                diagContent = escapeHtml(parts.join('\n'));
+            // --- Issue description (full, not truncated) ---
+            let issueTitle = '';
+            let issueDesc = ticket.description || 'No details available';
+            // Clean prefixes but keep full text
+            issueDesc = issueDesc
+                .replace(/^\[ESCALATED\]\s*/i, '')
+                .replace(/^No matching runbook available:\s*/i, '')
+                .replace(/^Manual review required:\s*/i, '')
+                .replace(/^Remediation (?:succeeded|failed):\s*/i, '');
+
+            if (ticket.event_id && ticket.event_source) {
+                issueTitle = 'Event ID ' + ticket.event_id + ' \u2014 ' + ticket.event_source;
+            } else if (ticket.runbook_name) {
+                issueTitle = escapeHtml(ticket.runbook_name);
             }
 
-            let actionContent = '';
+            // --- Diagnostic ---
+            let diagHtml = '';
+            if (ticket.diagnostic_summary) {
+                diagHtml = `
+                    <div class="ticket-info-box full-width">
+                        <div class="ticket-info-label">
+                            <svg class="section-icon" viewBox="0 0 24 24" fill="none" stroke="#6366F1" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                            Diagnostic Results
+                        </div>
+                        <div class="ticket-info-value">${escapeHtml(ticket.diagnostic_summary)}</div>
+                    </div>`;
+            }
+
+            // --- Action / Remediation ---
+            let actionText = '';
+            let actionMuted = false;
             if (ticket.recommended_action) {
-                actionContent = escapeHtml(ticket.recommended_action);
+                actionText = ticket.recommended_action;
             } else if (ticket.playbook_id || ticket.runbook_id) {
                 const pbId = ticket.playbook_id || ticket.runbook_id;
-                const steps = ticket.steps_total ? ' (' + ticket.steps_total + ' steps)' : '';
-                actionContent = 'Ran playbook ' + escapeHtml(pbId) + steps;
+                const pbName = ticket.runbook_name ? ticket.runbook_name : pbId;
+                const progress = ticket.steps_total
+                    ? (ticket.steps_completed != null ? ticket.steps_completed + '/' + ticket.steps_total + ' steps' : ticket.steps_total + ' steps')
+                    : '';
+                actionText = 'Ran playbook: ' + pbName + (progress ? ' (' + progress + ')' : '');
             } else if (ticket.escalated) {
-                actionContent = 'Escalated for manual review';
+                actionText = 'Escalated to server for analysis';
             } else {
-                actionContent = 'No automated action taken';
+                actionText = 'No automated action taken';
+                actionMuted = true;
             }
 
-            let resContent = '';
+            // --- Resolution ---
+            let resText = '';
+            let resMuted = false;
             if (ticket.resolution_method) {
-                resContent = escapeHtml(ticket.resolution_method);
+                resText = ticket.resolution_method;
+            } else if (ticket.error_message) {
+                resText = ticket.error_message;
+            } else if (ticket.server_message) {
+                resText = ticket.server_message;
+            } else if (resCat === 'fixed') {
+                resText = 'Issue resolved successfully';
             } else if (resCat === 'escalated') {
-                resContent = 'Awaiting technician review';
+                resText = 'Awaiting technician review';
+                resMuted = true;
+            } else if (resCat === 'protected') {
+                resText = 'Protected service — no action taken';
             } else if (resCat === 'pending') {
-                resContent = 'Awaiting approval';
+                resText = 'In progress';
+                resMuted = true;
             } else {
-                resContent = 'In progress';
+                resText = 'In progress';
+                resMuted = true;
             }
 
-            let resolvedInfo = '';
+            let resolvedTime = '';
             if (ticket.resolved_at) {
-                resolvedInfo = 'Resolved: ' + formatTimestamp(ticket.resolved_at);
+                resolvedTime = formatTimestamp(ticket.resolved_at);
                 if (ticket.resolution_time_seconds) {
-                    resolvedInfo += ' (' + ticket.resolution_time_seconds + 's)';
+                    resolvedTime += ' (' + ticket.resolution_time_seconds + 's)';
                 }
             }
 
+            // --- Build HTML ---
             return `
+                <div class="ticket-body">
+                    <div class="ticket-issue-row">
+                        ${issueTitle ? '<div class="ticket-issue-title">' + escapeHtml(issueTitle) + '</div>' : ''}
+                        <div class="ticket-issue-desc">${escapeHtml(issueDesc)}</div>
+                    </div>
+                    ${diagHtml}
+                    <div class="ticket-info-grid">
+                        <div class="ticket-info-box">
+                            <div class="ticket-info-label">
+                                <svg class="section-icon" viewBox="0 0 24 24" fill="none" stroke="#0891B2" stroke-width="2"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
+                                Remediation
+                            </div>
+                            <div class="ticket-info-value${actionMuted ? ' muted' : ''}">${escapeHtml(actionText)}</div>
+                        </div>
+                        <div class="ticket-info-box">
+                            <div class="ticket-info-label">
+                                <svg class="section-icon" viewBox="0 0 24 24" fill="none" stroke="${resCat === 'fixed' ? '#16A34A' : resCat === 'escalated' ? '#DC2626' : '#D97706'}" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                                Outcome <span class="resolution-badge resolution-${resCat}">${resLabel}</span>
+                            </div>
+                            <div class="ticket-info-value${resMuted ? ' muted' : ''}">${escapeHtml(resText)}${resolvedTime ? '<br><span style="font-size:10px;color:#9CA3AF;">' + resolvedTime + '</span>' : ''}</div>
+                        </div>
+                    </div>
+                </div>
                 <div class="ticket-detail" id="detail-${gid}">
-                    <div class="detail-section">
-                        <div class="detail-label">Diagnostic</div>
-                        <div class="detail-content">${diagContent}</div>
-                    </div>
-                    <div class="detail-section">
-                        <div class="detail-label">Action Taken</div>
-                        <div class="detail-content">${actionContent}</div>
-                    </div>
-                    <div class="detail-section">
-                        <div class="detail-label">Resolution <span class="resolution-badge resolution-${resCat}">${resLabel}</span></div>
-                        <div class="detail-content">${resContent}</div>
-                    </div>
                     <div class="detail-meta">
                         <span>ID: ${ticket.ticket_id}</span>
                         <span>Created: ${formatTimestamp(ticket.timestamp || ticket.created_at)}</span>
-                        ${resolvedInfo ? '<span>' + resolvedInfo + '</span>' : ''}
+                        ${ticket.computer_name ? '<span>Host: ' + ticket.computer_name + '</span>' : ''}
                         ${ticket.signature_id ? '<span>Sig: ' + ticket.signature_id + '</span>' : ''}
+                        ${ticket.action_type ? '<span>Action: ' + ticket.action_type.replace(/_/g, ' ') + '</span>' : ''}
                     </div>
                 </div>`;
         }
@@ -2022,10 +2141,11 @@
                               resCat === 'escalated' ? 'escalated' :
                               'pending';
                 const statusText = getResolutionLabel(resCat);
+                const borderColor = resCat === 'fixed' ? '#22C55E' :
+                                   resCat === 'escalated' ? '#EF4444' :
+                                   resCat === 'protected' ? '#3B82F6' : '#F59E0B';
                 const time = formatTimeAgo(ticket.timestamp || ticket.created_at);
                 const ticketType = formatTicketType(ticket.type || ticket.issue_type || 'unknown');
-                const desc = formatDescription(ticket.description || 'No description');
-                const source = ticket.source ? `<span style="font-size:10px;color:#9CA3AF;margin-left:8px;">${ticket.source}</span>` : '';
                 const countBadge = group.count > 1 ? `<span class="ticket-count">&times;${group.count}</span>` : '';
                 const gid = containerId + '-' + gi;
 
@@ -2038,32 +2158,33 @@
                     }).join('');
                     occurrencesHtml = `
                         <div class="ticket-occurrences" id="occ-${gid}">
-                            <div class="occurrences-label">Occurrences (${group.count})</div>
+                            <div class="occurrences-label">All Occurrences (${group.count})</div>
                             ${occRows}
                         </div>`;
                 }
 
-                const expandBtn = group.count > 1 ? `<button class="expand-btn" id="btn-${gid}" onclick="event.stopPropagation(); toggleOccurrences('${gid}')">+</button>` : '<span style="display:inline-block;width:30px;"></span>';
+                const expandBtn = group.count > 1 ? `<button class="expand-btn" id="btn-${gid}" onclick="event.stopPropagation(); toggleOccurrences('${gid}')">+</button>` : '';
 
-                const detailHtml = buildTicketDetail(ticket, gid);
+                const bodyHtml = buildTicketBody(ticket, gid);
 
                 return `
                     <div class="ticket-group">
-                        <div class="ticket-item" onclick="toggleTicketDetail('detail-${gid}')">
-                            <div class="ticket-header">
-                                <span class="ticket-type" style="display:flex;align-items:center;">
-                                    ${expandBtn}${ticketType}${countBadge}${source}
-                                </span>
+                        <div class="ticket-item" style="border-left: 3px solid ${borderColor};">
+                            <div class="ticket-top-bar" onclick="toggleTicketDetail('detail-${gid}')">
+                                <div class="ticket-header">
+                                    ${expandBtn}
+                                    <span class="ticket-status status-${status}">${statusText}</span>
+                                    <span class="ticket-type">${ticketType}</span>
+                                    ${countBadge}
+                                </div>
                                 <span class="ticket-time">${time}</span>
                             </div>
-                            <div class="ticket-description">${desc}</div>
-                            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                                <span class="ticket-status status-${status}">${statusText}</span>
-                                ${ticket.computer_name ? '<span style="font-size:10px;color:#9CA3AF;">' + ticket.computer_name + '</span>' : ''}
-                                ${ticket.runbook_id || ticket.playbook_id ? '<span style="font-size:10px;color:#0891B2;">' + (ticket.runbook_id || ticket.playbook_id) + '</span>' : ''}
-                            </div>
+                            ${bodyHtml}
                             ${occurrencesHtml}
-                            ${detailHtml}
+                            <div class="ticket-footer" onclick="toggleTicketDetail('detail-${gid}')">
+                                <span>${ticket.source || ''}</span>
+                                <span class="toggle-hint">Click for details</span>
+                            </div>
                         </div>
                     </div>`;
             }).join('');
@@ -2087,17 +2208,6 @@
             return typeMap[type] || type.replace(/-/g, ' ').replace(/(^|\s)\w/g, c => c.toUpperCase());
         }
 
-        function formatDescription(desc) {
-            let clean = desc
-                .replace(/^\[ESCALATED\]\s*/i, '')
-                .replace(/^No matching runbook available:\s*/i, '')
-                .replace(/^Manual review required:\s*/i, '')
-                .replace(/^Remediation (?:succeeded|failed):\s*/i, '');
-            if (clean.length > 150) {
-                clean = clean.substring(0, 147) + '...';
-            }
-            return clean;
-        }
 
         function formatTimeAgo(dateString) {
             const date = new Date(dateString);
