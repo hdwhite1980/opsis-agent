@@ -42,7 +42,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Visual C++ Redistributable (required by keytar.node native module)
-Source: "tools\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+; Extracted early via nocompression so PrepareToInstall can run it before [Files] phase
+Source: "tools\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall nocompression
 
 ; Compiled service executable (standalone - no Node.js needed)
 Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignoreversion
@@ -131,12 +132,9 @@ Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\s
 Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::ToBase64String((1..32 | ForEach-Object {{ [byte](Get-Random -Minimum 0 -Maximum 256) }})); $regPath = 'HKLM:\SOFTWARE\OPSIS\Agent'; if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}; Set-ItemProperty -Path $regPath -Name 'IPCSecret' -Value $secret"""; StatusMsg: "Generating IPC authentication secret..."; Flags: runhidden waituntilterminated shellexec
 
 ; === SERVICE INSTALLATION ===
+; Service install/start is handled in CurStepChanged(ssPostInstall) for better error capture.
 
-; 10. Install and start Windows Service using WinSW
-Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "install"; WorkingDir: "{app}\service"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
-Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir: "{app}\service"; StatusMsg: "Starting OPSIS Agent Service..."; Flags: runhidden waituntilterminated
-
-; 11. Verify service is running; retry start if stopped
+; 10. Verify service is running; retry start if stopped
 Filename: "powershell.exe"; Parameters: "-Command ""$svc = Get-Service -Name 'OpsisAgentService' -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -ne 'Running') {{ Start-Service -Name 'OpsisAgentService' -ErrorAction SilentlyContinue }}"""; StatusMsg: "Verifying service status..."; Flags: runhidden waituntilterminated shellexec
 
 ; Offer to open control panel in browser
@@ -185,11 +183,14 @@ begin
   AppPath := ExpandConstant('{app}');
   ServiceExe := AppPath + '\service\OpsisAgentService.exe';
 
-  // Install Visual C++ Redistributable if missing (required by keytar.node native module)
+  // Install Visual C++ Redistributable if missing (required by keytar.node native module).
+  // The vc_redist.x64.exe is available here because it uses Flags: nocompression in [Files],
+  // which causes Inno Setup to extract it before PrepareToInstall runs.
   if not IsVCRedistInstalled() then
   begin
-    Exec(ExpandConstant('{tmp}\vc_redist.x64.exe'), '/install /quiet /norestart', '',
-      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if FileExists(ExpandConstant('{tmp}\vc_redist.x64.exe')) then
+      Exec(ExpandConstant('{tmp}\vc_redist.x64.exe'), '/install /quiet /norestart', '',
+        SW_HIDE, ewWaitUntilTerminated, ResultCode);
     if not IsVCRedistInstalled() then
     begin
       Result := 'Visual C++ Redistributable could not be installed. Please install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe and re-run this installer.';
@@ -204,14 +205,19 @@ begin
   // Brief pause to let Defender apply the exclusion
   Sleep(1000);
 
-  // If OpsisAgentService.exe exists from a previous install, stop and uninstall it first
+  // Clean up any orphaned service registration (e.g. from a previous failed install where
+  // the exe no longer exists but the service name is still registered in SCM).
+  // sc delete is harmless if the service doesn't exist.
+  Exec('sc.exe', 'stop OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1000);
+  Exec('sc.exe', 'delete OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(500);
+
+  // If OpsisAgentService.exe exists from a previous install, stop and uninstall via WinSW too
   if FileExists(ServiceExe) then
   begin
-    // Stop the service (ignore errors if already stopped)
     Exec(ServiceExe, 'stop', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    // Small delay to let the process release
     Sleep(2000);
-    // Uninstall the service
     Exec(ServiceExe, 'uninstall', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(1000);
   end;
@@ -277,6 +283,10 @@ var
   ConfigFile: string;
   ConfigContent: string;
   ExitCode: Integer;
+  InstallOK: Boolean;
+  AppPath: string;
+  WinSWExe: string;
+  LogFile: string;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -310,17 +320,51 @@ begin
 
       SaveStringToFile(ConfigFile, ConfigContent, False);
     end;
+
+    // === SERVICE INSTALLATION (moved from [Run] for error capture) ===
+    AppPath := ExpandConstant('{app}');
+    WinSWExe := AppPath + '\service\OpsisAgentService.exe';
+    LogFile := AppPath + '\logs\winsw-install.log';
+
+    // Install service and log output for diagnostics
+    InstallOK := False;
+    Exec('powershell.exe',
+      '-Command "& ''' + WinSWExe + ''' install 2>&1 | Out-File -FilePath ''' + LogFile + ''' -Encoding UTF8"',
+      AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+
+    // Verify the service was registered
+    if Exec('sc.exe', 'query OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    begin
+      if ExitCode = 0 then
+        InstallOK := True;
+    end;
+
+    if not InstallOK then
+    begin
+      // Try direct execution as fallback (without PowerShell wrapper)
+      Exec(WinSWExe, 'install', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      // Check again
+      if Exec('sc.exe', 'query OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+      begin
+        if ExitCode = 0 then
+          InstallOK := True;
+      end;
+    end;
+
+    if InstallOK then
+    begin
+      // Start the service
+      Exec(WinSWExe, 'start', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+    end;
   end;
 
   if CurStep = ssDone then
   begin
-    // Verify service was installed successfully after all [Run] entries completed.
-    // sc query returns exit code 0 if the service exists.
+    // Final verification: check if the service exists
     if Exec('sc.exe', 'query OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
     begin
       if ExitCode <> 0 then
       begin
-        // Service not found — most likely Defender quarantined the executables
         if not FileExists(ExpandConstant('{app}\service\OpsisAgentService.exe')) or
            not FileExists(ExpandConstant('{app}\dist\opsis-agent-service.exe')) then
           MsgBox('The OPSIS Agent Service could not be installed because Windows Defender appears to have quarantined the service files.' + #13#10 + #13#10 +
@@ -329,7 +373,13 @@ begin
             '2. Restore any quarantined OPSIS files' + #13#10 +
             '3. Re-run this installer to complete setup', mbError, MB_OK)
         else
-          MsgBox('The OPSIS Agent Service could not be registered. Please try running the installer as Administrator.', mbError, MB_OK);
+          MsgBox('The OPSIS Agent Service could not be registered.' + #13#10 + #13#10 +
+            'Diagnostic log saved to:' + #13#10 +
+            ExpandConstant('{app}\logs\winsw-install.log') + #13#10 + #13#10 +
+            'Common fixes:' + #13#10 +
+            '1. Check the log file above for the specific error' + #13#10 +
+            '2. Run "sc delete OpsisAgentService" from an admin command prompt, then re-run this installer' + #13#10 +
+            '3. Ensure no Group Policy is blocking service creation', mbError, MB_OK);
       end;
     end;
   end;
