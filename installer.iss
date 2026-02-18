@@ -41,15 +41,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
+; Visual C++ Redistributable (required by keytar.node native module)
+Source: "tools\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+
 ; Compiled service executable (standalone - no Node.js needed)
 Source: "dist\opsis-agent-service.exe"; DestDir: "{app}\dist"; Flags: ignoreversion
 
 ; Native module: keytar for Windows Credential Manager (DPAPI-encrypted credential storage)
 Source: "node_modules\keytar\build\Release\keytar.node"; DestDir: "{app}\dist"; Flags: ignoreversion
 
-; WinSW service wrapper
-Source: "node_modules\node-windows\bin\winsw\winsw.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
-Source: "node_modules\node-windows\bin\winsw\winsw.exe.config"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe.config"; Flags: ignoreversion
+; WinSW v2.12.0 self-contained service wrapper (bundles .NET runtime - no .NET install required)
+Source: "tools\winsw\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "OpsisAgentService.exe"; Flags: ignoreversion
 
 ; Control panel web UI (served by agent service on localhost:19851)
 Source: "src\gui\index.html"; DestDir: "{app}\dist\gui"; Flags: ignoreversion
@@ -95,8 +97,9 @@ Name: "{autodesktop}\OPSIS Control Panel"; Filename: "http://localhost:19851"; I
 ; 1. Set PowerShell execution policy (required for agent monitoring commands)
 Filename: "powershell.exe"; Parameters: "-Command ""Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force"""; StatusMsg: "Configuring PowerShell execution policy..."; Flags: runhidden waituntilterminated shellexec
 
-; 2. Add Defender exclusions for install directory, service exe, and WinSW wrapper
-Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}'; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe'; Add-MpPreference -ExclusionProcess '{app}\service\OpsisAgentService.exe'"""; StatusMsg: "Adding Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
+; 2. Defender exclusions are now applied in PrepareToInstall() before files are copied.
+;    Re-apply here in case PrepareToInstall path differed (e.g. user changed install dir).
+Filename: "powershell.exe"; Parameters: "-Command ""Add-MpPreference -ExclusionPath '{app}' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess '{app}\dist\opsis-agent-service.exe' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess '{app}\service\OpsisAgentService.exe' -ErrorAction SilentlyContinue"""; StatusMsg: "Verifying Defender exclusions..."; Flags: runhidden waituntilterminated shellexec
 
 ; 3. Set directory permissions
 ; First reset inheritance on the entire app directory to ensure clean state on reinstall,
@@ -133,6 +136,9 @@ Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "install"; WorkingDir: "{app}\service"; StatusMsg: "Installing OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "start"; WorkingDir: "{app}\service"; StatusMsg: "Starting OPSIS Agent Service..."; Flags: runhidden waituntilterminated
 
+; 11. Verify service is running; retry start if stopped
+Filename: "powershell.exe"; Parameters: "-Command ""$svc = Get-Service -Name 'OpsisAgentService' -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -ne 'Running') {{ Start-Service -Name 'OpsisAgentService' -ErrorAction SilentlyContinue }}"""; StatusMsg: "Verifying service status..."; Flags: runhidden waituntilterminated shellexec
+
 ; Offer to open control panel in browser
 Filename: "cmd.exe"; Parameters: "/c start http://localhost:19851"; Description: "Open OPSIS Control Panel"; Flags: nowait postinstall skipifsilent shellexec
 
@@ -156,6 +162,13 @@ Filename: "powershell.exe"; Parameters: "-Command ""Remove-EventLog -Source 'OPS
 var
   ServerURLPage: TInputQueryWizardPage;
 
+function IsVCRedistInstalled(): Boolean;
+var
+  Version: String;
+begin
+  Result := RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64', 'Version', Version);
+end;
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;
@@ -165,22 +178,46 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
   ServiceExe: string;
+  AppPath: string;
 begin
   Result := '';
   NeedsRestart := False;
-  ServiceExe := ExpandConstant('{app}\service\OpsisAgentService.exe');
+  AppPath := ExpandConstant('{app}');
+  ServiceExe := AppPath + '\service\OpsisAgentService.exe';
+
+  // Install Visual C++ Redistributable if missing (required by keytar.node native module)
+  if not IsVCRedistInstalled() then
+  begin
+    Exec(ExpandConstant('{tmp}\vc_redist.x64.exe'), '/install /quiet /norestart', '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    if not IsVCRedistInstalled() then
+    begin
+      Result := 'Visual C++ Redistributable could not be installed. Please install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe and re-run this installer.';
+      Exit;
+    end;
+  end;
+
+  // Add Defender exclusions BEFORE files are copied to prevent quarantine on fresh machines.
+  // The [Files] section runs after PrepareToInstall, so exclusions must be set here.
+  Exec('powershell.exe', '-Command "Add-MpPreference -ExclusionPath ''' + AppPath + ''' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess ''' + AppPath + '\dist\opsis-agent-service.exe'' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess ''' + AppPath + '\service\OpsisAgentService.exe'' -ErrorAction SilentlyContinue"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Brief pause to let Defender apply the exclusion
+  Sleep(1000);
 
   // If OpsisAgentService.exe exists from a previous install, stop and uninstall it first
   if FileExists(ServiceExe) then
   begin
     // Stop the service (ignore errors if already stopped)
-    Exec(ServiceExe, 'stop', ExpandConstant('{app}\service'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ServiceExe, 'stop', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     // Small delay to let the process release
     Sleep(2000);
     // Uninstall the service
-    Exec(ServiceExe, 'uninstall', ExpandConstant('{app}\service'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ServiceExe, 'uninstall', AppPath + '\service', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(1000);
   end;
+
+  // Remove leftover .exe.config from previous installs that used .NET Framework WinSW
+  DeleteFile(AppPath + '\service\OpsisAgentService.exe.config');
 
   // Also kill any lingering opsis-agent-service.exe process
   Exec('taskkill.exe', '/F /IM opsis-agent-service.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -239,6 +276,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConfigFile: string;
   ConfigContent: string;
+  ExitCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -271,6 +309,28 @@ begin
       ConfigContent := ConfigContent + '}';
 
       SaveStringToFile(ConfigFile, ConfigContent, False);
+    end;
+  end;
+
+  if CurStep = ssDone then
+  begin
+    // Verify service was installed successfully after all [Run] entries completed.
+    // sc query returns exit code 0 if the service exists.
+    if Exec('sc.exe', 'query OpsisAgentService', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    begin
+      if ExitCode <> 0 then
+      begin
+        // Service not found — most likely Defender quarantined the executables
+        if not FileExists(ExpandConstant('{app}\service\OpsisAgentService.exe')) or
+           not FileExists(ExpandConstant('{app}\dist\opsis-agent-service.exe')) then
+          MsgBox('The OPSIS Agent Service could not be installed because Windows Defender appears to have quarantined the service files.' + #13#10 + #13#10 +
+            'To fix this:' + #13#10 +
+            '1. Open Windows Security > Virus & threat protection > Protection history' + #13#10 +
+            '2. Restore any quarantined OPSIS files' + #13#10 +
+            '3. Re-run this installer to complete setup', mbError, MB_OK)
+        else
+          MsgBox('The OPSIS Agent Service could not be registered. Please try running the installer as Administrator.', mbError, MB_OK);
+      end;
     end;
   end;
 end;

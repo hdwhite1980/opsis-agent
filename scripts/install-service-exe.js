@@ -13,17 +13,15 @@ if (!fs.existsSync(serviceDir)) {
   fs.mkdirSync(serviceDir, { recursive: true });
 }
 
-// Copy WinSW executable
-const winswSource = path.join(installDir, 'node_modules', 'node-windows', 'bin', 'winsw', 'winsw.exe');
+// Copy WinSW self-contained executable (no .NET runtime required)
+const winswSource = path.join(installDir, 'tools', 'winsw', 'WinSW-x64.exe');
 const winswDest = path.join(serviceDir, `${serviceName}.exe`);
-const winswConfigDest = path.join(serviceDir, `${serviceName}.exe.config`);
 
 console.log('Installing OPSIS Agent Service...');
 
-// Copy winsw.exe as service wrapper
+// Copy WinSW self-contained exe as service wrapper
 fs.copyFileSync(winswSource, winswDest);
-fs.copyFileSync(winswSource + '.config', winswConfigDest);
-console.log('  + Service wrapper copied');
+console.log('  + Service wrapper copied (self-contained, no .NET required)');
 
 // Create service configuration XML
 const serviceXml = `<?xml version="1.0" encoding="UTF-8"?>

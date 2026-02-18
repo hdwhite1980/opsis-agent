@@ -16,6 +16,45 @@ if (-not (Test-Path $innoPath)) {
 }
 Write-Host "  + Inno Setup found" -ForegroundColor Green
 
+# Check if WinSW self-contained binary exists
+$winswPath = "tools\winsw\WinSW-x64.exe"
+if (-not (Test-Path $winswPath)) {
+    Write-Host "Downloading WinSW v2.12.0 self-contained x64..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Force -Path "tools\winsw" | Out-Null
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        Invoke-WebRequest -Uri 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe' -OutFile $winswPath -UseBasicParsing
+        $size = [math]::Round((Get-Item $winswPath).Length / 1MB, 2)
+        Write-Host "  + WinSW downloaded ($size MB)" -ForegroundColor Green
+    } catch {
+        Write-Host "ERROR: Failed to download WinSW!" -ForegroundColor Red
+        Write-Host "  Download manually from: https://github.com/winsw/winsw/releases/tag/v2.12.0" -ForegroundColor Yellow
+        Write-Host "  Place WinSW-x64.exe in tools\winsw\" -ForegroundColor Yellow
+        exit 1
+    }
+} else {
+    Write-Host "  + WinSW self-contained binary found" -ForegroundColor Green
+}
+
+# Check if VC++ Redistributable is present for bundling
+$vcRedistPath = "tools\vc_redist.x64.exe"
+if (-not (Test-Path $vcRedistPath)) {
+    Write-Host "Downloading Visual C++ Redistributable x64..." -ForegroundColor Yellow
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vcRedistPath -UseBasicParsing
+        $size = [math]::Round((Get-Item $vcRedistPath).Length / 1MB, 2)
+        Write-Host "  + VC++ Redistributable downloaded ($size MB)" -ForegroundColor Green
+    } catch {
+        Write-Host "ERROR: Failed to download VC++ Redistributable!" -ForegroundColor Red
+        Write-Host "  Download manually from: https://aka.ms/vs/17/release/vc_redist.x64.exe" -ForegroundColor Yellow
+        Write-Host "  Place vc_redist.x64.exe in tools\" -ForegroundColor Yellow
+        exit 1
+    }
+} else {
+    Write-Host "  + VC++ Redistributable found" -ForegroundColor Green
+}
+
 # Check if icon exists
 if (-not (Test-Path "assets\icon.ico")) {
     Write-Host "WARNING: assets\icon.ico not found" -ForegroundColor Yellow
