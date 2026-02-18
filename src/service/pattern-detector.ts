@@ -429,7 +429,7 @@ export class PatternDetector {
   }
   
   public getPendingActions(): ProactiveAction[] {
-    return Object.values(this.data.proactiveActions)
+    return Object.values(this.data.proactiveActions || {})
       .filter(a => a.status === 'pending')
       .sort((a, b) => {
         const order = { immediate: 0, high: 1, medium: 2, low: 3 };
