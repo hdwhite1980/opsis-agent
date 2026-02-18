@@ -299,6 +299,8 @@ class OPSISAgentService {
   }> = new Map();
   private awaitingReviewSignals: Set<string> = new Set(); // Signals that shouldn't be re-escalated (awaiting technician)
   private readonly pendingActionsPath: string;
+  private readonly pendingPlaybookResultsPath: string;
+  private pendingPlaybookResults: any[] = [];
 
   // Self-service portal
   private selfServiceServer: SelfServiceServer | null = null;
@@ -346,6 +348,7 @@ class OPSISAgentService {
     this.serverRunbooksPath = path.join(this.dataDir, 'server-runbooks.json');
     this.pendingRebootPlaybookPath = path.join(this.dataDir, 'pending-reboot-playbook.json');
     this.pendingActionsPath = path.join(this.dataDir, 'pending-actions.json');
+    this.pendingPlaybookResultsPath = path.join(this.dataDir, 'pending-playbook-results.json');
 
     // Ensure directories exist
     [this.dataDir, this.logsDir, this.runbooksDir].forEach(dir => {
@@ -1385,6 +1388,9 @@ class OPSISAgentService {
     // Load pending actions from disk
     this.loadPendingActions();
 
+    // Load pending playbook results from disk (retry queue for WS disconnects)
+    this.loadPendingPlaybookResults();
+
     // Load protected applications from local config
     this.loadProtectedApplications();
 
@@ -1621,6 +1627,9 @@ class OPSISAgentService {
           });
           this.pendingRebootCompletedMsg = null;
         }
+
+        // Flush any queued playbook results from previous disconnected session
+        this.flushPlaybookResultQueue();
 
         // Start heartbeat immediately with adaptive interval
         // (will be updated if welcome arrives with custom config)
@@ -2769,6 +2778,55 @@ class OPSISAgentService {
     }
   }
 
+  private loadPendingPlaybookResults(): void {
+    try {
+      if (fs.existsSync(this.pendingPlaybookResultsPath)) {
+        const data = JSON.parse(fs.readFileSync(this.pendingPlaybookResultsPath, 'utf-8'));
+        if (Array.isArray(data)) {
+          this.pendingPlaybookResults = data;
+          this.logger.info('Loaded pending playbook results from disk', {
+            queue_size: this.pendingPlaybookResults.length
+          });
+        }
+      }
+    } catch (error: any) {
+      this.logger.error('Failed to load pending playbook results', { error: error.message });
+    }
+  }
+
+  private savePendingPlaybookResults(): void {
+    try {
+      fs.writeFileSync(this.pendingPlaybookResultsPath, JSON.stringify(this.pendingPlaybookResults, null, 2));
+    } catch (error: any) {
+      this.logger.error('Failed to save pending playbook results', { error: error.message });
+    }
+  }
+
+  private flushPlaybookResultQueue(): void {
+    if (this.pendingPlaybookResults.length === 0) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    const queued = [...this.pendingPlaybookResults];
+    this.pendingPlaybookResults = [];
+
+    let sent = 0;
+    for (const message of queued) {
+      try {
+        this.ws.send(JSON.stringify(message));
+        sent++;
+      } catch (error: any) {
+        // Re-queue any that fail to send
+        this.pendingPlaybookResults.push(message);
+      }
+    }
+
+    this.savePendingPlaybookResults();
+    this.logger.info('Flushed pending playbook result queue', {
+      sent,
+      remaining: this.pendingPlaybookResults.length
+    });
+  }
+
   // Execute a pending action (called by server or technician approval)
   private executePendingAction(signatureId: string): void {
     const pendingAction = this.pendingActions.get(signatureId);
@@ -3499,36 +3557,47 @@ class OPSISAgentService {
     error?: any,
     stepResults?: Array<{ step_index: number; type: string; action: string; status: string; error?: string }>
   ): void {
+    const signalId = (playbook as any).signalId || playbook.id;
+    const signatureId = (playbook as any).signatureId || null;
+    const resourceName = this.extractResourceName(null, playbook);
+
+    const message = {
+      type: 'playbook_result',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      playbook_id: playbook.id,
+      playbook_name: playbook.name,
+      signature_id: signatureId,
+      signal_id: signalId,
+      ticket_id: (playbook as any).ticketId || null,
+      status,
+      execution_time_ms: durationMs,
+      steps_total: playbook.steps?.length || 0,
+      steps_executed: stepResults?.length || playbook.steps?.length || 0,
+      step_results: stepResults || null,
+      error: error ? error.toString() : null,
+      source: playbook.source,
+      resource_name: resourceName
+    };
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const signalId = (playbook as any).signalId || playbook.id;
-      const signatureId = (playbook as any).signatureId || null;
-      const resourceName = this.extractResourceName(null, playbook);
-
-      this.ws.send(JSON.stringify({
-        type: 'playbook_result',
-        timestamp: new Date().toISOString(),
-        device_id: this.deviceInfo.device_id,
-        tenant_id: this.deviceInfo.tenant_id,
-        playbook_id: playbook.id,
-        playbook_name: playbook.name,
-        signature_id: signatureId,
-        signal_id: signalId,
-        ticket_id: (playbook as any).ticketId || null,
-        status,
-        execution_time_ms: durationMs,
-        steps_total: playbook.steps?.length || 0,
-        steps_executed: stepResults?.length || playbook.steps?.length || 0,
-        step_results: stepResults || null,
-        error: error ? error.toString() : null,
-        source: playbook.source,
-        resource_name: resourceName
-      }));
-
+      this.ws.send(JSON.stringify(message));
       this.logger.info('Playbook result sent to server', {
         playbook_id: playbook.id,
         signature_id: signatureId,
         status,
         steps: stepResults?.length || 0
+      });
+    } else {
+      // Queue for retry when WebSocket reconnects
+      this.pendingPlaybookResults.push(message);
+      this.savePendingPlaybookResults();
+      this.logger.warn('WebSocket not connected — queued playbook result for retry', {
+        playbook_id: playbook.id,
+        signature_id: signatureId,
+        status,
+        queue_size: this.pendingPlaybookResults.length
       });
     }
   }
