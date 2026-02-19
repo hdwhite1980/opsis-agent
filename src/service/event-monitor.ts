@@ -978,6 +978,7 @@ ConvertTo-Json -Depth 3
     let bestMatch: { runbook: Runbook; confidence: number; trigger: string } | null = null;
 
     for (const [id, runbook] of this.runbooks) {
+      if (!runbook.triggers || !Array.isArray(runbook.triggers)) continue;
       for (const trigger of runbook.triggers) {
         const confidence = this.calculateMatchConfidence(event, trigger);
 
