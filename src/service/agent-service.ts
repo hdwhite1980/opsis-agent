@@ -1865,10 +1865,21 @@ class OPSISAgentService {
           // Message acknowledged / server status update
           break;
           
-        case 'decision':
+        case 'decision': {
           // NEW: Server decision for escalation
-          this.handleServerDecision(data.data);
+          // Server may send decision nested under data.data or at root level
+          const decision = data.data || data;
+          if (decision && decision.decision_type) {
+            this.handleServerDecision(decision);
+          } else {
+            this.logger.warn('Received decision message with no valid decision data', {
+              hasData: !!data.data,
+              keys: Object.keys(data),
+              raw: JSON.stringify(data).substring(0, 500)
+            });
+          }
           break;
+        }
           
         case 'playbook': {
           // Server may send playbook nested under data.playbook or as the root object itself
@@ -2547,6 +2558,11 @@ class OPSISAgentService {
 
   // NEW METHOD: Handle Server Decision
   private handleServerDecision(decision: ServerDecision): void {
+    if (!decision) {
+      this.logger.error('handleServerDecision called with null/undefined decision');
+      return;
+    }
+
     // Validate decision fields
     const validTypes = ['execute_A', 'execute_B', 'request_approval', 'advisory_only', 'block', 'ignore'];
     if (!validTypes.includes(decision.decision_type)) {
