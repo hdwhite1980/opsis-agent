@@ -3766,6 +3766,17 @@ class OPSISAgentService {
       symptoms: signature.symptoms.length
     });
 
+    // Gate 3: Ticket deduplication — skip if open ticket exists for same event
+    const duplicateTicket = this.ticketDb.findOpenTicketByEvent(event.id, event.source);
+    if (duplicateTicket) {
+      this.logger.debug('Open ticket already exists for this event, skipping detection', {
+        existingTicketId: duplicateTicket.ticket_id,
+        eventId: event.id,
+        source: event.source
+      });
+      return;
+    }
+
     // FAST PATH: Check remediation memory for cached successful solution
     const cachedPlaybookId = this.remediationMemory.findCachedSolution(
       signature.signature_id.split('-').slice(0, 2).join('-'), // normalize signal key
@@ -4447,6 +4458,17 @@ class OPSISAgentService {
       signature_id: signature.signature_id,
       reason
     });
+
+    // Deduplication: skip if open ticket already exists for same event source + ID
+    const existingTicket = this.ticketDb.findOpenTicketByEvent(event.id, event.source);
+    if (existingTicket) {
+      this.logger.debug('Open ticket already exists for this event, skipping escalation', {
+        existingTicketId: existingTicket.ticket_id,
+        eventId: event.id,
+        source: event.source
+      });
+      return;
+    }
 
     // Create escalated ticket
     const ticketId = `ticket-escalated-${Date.now()}`;

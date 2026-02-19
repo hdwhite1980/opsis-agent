@@ -150,6 +150,15 @@ export class TicketDatabase {
     }
   }
 
+  public findOpenTicketByEvent(eventId: number, eventSource: string): Ticket | null {
+    return this.tickets.find(t =>
+      (t.status === 'open' || t.status === 'in-progress') &&
+      t.event_id === eventId &&
+      t.event_source === eventSource &&
+      t.source === 'event-log'
+    ) || null;
+  }
+
   public getTicket(ticketId: string): Ticket | null {
     try {
       return this.tickets.find(t => t.ticket_id === ticketId) || null;
