@@ -1886,9 +1886,26 @@ class OPSISAgentService {
           break;
           
         case 'decision': {
-          // NEW: Server decision for escalation
+          // Server decision for escalation
           // Server may send decision nested under data.data or at root level
           const decision = data.data || data;
+
+          // Normalize: server may send "decision" instead of "decision_type"
+          if (!decision.decision_type && decision.decision) {
+            decision.decision_type = decision.decision.toLowerCase();
+          }
+          // Normalize: server may omit confidence_server — default to 80
+          if (typeof decision.confidence_server !== 'number') {
+            decision.confidence_server = decision.confidence ?? 80;
+          }
+          // Normalize: default requires_approval/justification_codes if missing
+          if (typeof decision.requires_approval !== 'boolean') {
+            decision.requires_approval = false;
+          }
+          if (!Array.isArray(decision.justification_codes)) {
+            decision.justification_codes = [];
+          }
+
           if (decision && decision.decision_type) {
             this.handleServerDecision(decision);
           } else {
