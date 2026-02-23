@@ -1605,6 +1605,7 @@ class OPSISAgentService {
         }
 
         // Send registration immediately — don't wait for welcome
+        const hmacReady = await isHmacConfigured();
         this.safeSend(JSON.stringify({
           type: 'register',
           device_id: this.deviceInfo.device_id,
@@ -1615,7 +1616,8 @@ class OPSISAgentService {
           timestamp: new Date().toISOString(),
           system_info: systemInfo,
           capability_mode: this.capabilityMode,
-          deployment_health: this.compatibilityReport
+          deployment_health: this.compatibilityReport,
+          hmac_configured: hmacReady
         }));
 
         // Send pending reboot_completed notification if resuming after reboot
@@ -1878,6 +1880,7 @@ class OPSISAgentService {
         case 'software_inventory_ack':
         case 'diagnostic_error_ack':
         case 'diagnostic_results_ack':
+        case 'signal_ack':
         case 'proactive-action_ack':
         case 'hardware-health-report_ack':
         case 'playbook_result_ack':
@@ -3823,6 +3826,11 @@ class OPSISAgentService {
           this.logger.error('Failed to store HMAC secret from welcome', err);
         }
       }
+    } else {
+      const hmacConfigured = await isHmacConfigured();
+      if (!hmacConfigured) {
+        this.logger.warn('Server welcome did not include hmac_secret — agent remains unverified. Server should include hmac_secret for this device.');
+      }
     }
   }
 
@@ -4552,6 +4560,14 @@ class OPSISAgentService {
 
   // FIXED: Legacy escalation path now uses signature system
   private handleEscalationNeeded(event: EventLogEntry, reason: string): void {
+    // Gate 1: State tracking deduplication — suppress repeated escalations for unchanged events
+    const resourceId = `event:${event.source}:${event.id}`;
+    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, undefined, { eventId: event.id, source: event.source });
+    if (!stateChange) {
+      this.logger.debug('Legacy escalation suppressed — event state unchanged', { resourceId });
+      return;
+    }
+
     this.logger.warn('Escalation needed (legacy path)', {
       eventId: event.id,
       reason
@@ -4559,13 +4575,13 @@ class OPSISAgentService {
 
     // NEW: Generate signature from event (convert legacy escalation to new system)
     const signature = this.signatureGenerator.generateFromEvent(event, this.deviceInfo);
-    
+
     this.logger.info('Legacy escalation converted to signature', {
       signature_id: signature.signature_id,
       reason
     });
 
-    // Deduplication: skip if open ticket already exists for same event source + ID
+    // Gate 2: Deduplication — skip if open ticket already exists for same event source + ID
     const existingTicket = this.ticketDb.findOpenTicketByEvent(event.id, event.source);
     if (existingTicket) {
       this.logger.debug('Open ticket already exists for this event, skipping escalation', {
