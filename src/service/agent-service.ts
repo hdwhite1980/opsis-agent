@@ -3956,6 +3956,31 @@ class OPSISAgentService {
    * UPDATED: Handle system issues with signature system
    */
   private handleSystemIssue(signal: SystemSignal): void {
+    // Gate 0: Exclusion list check — skip signals for excluded services/processes/signatures
+    const exclusions = this.loadExclusionsFile();
+    if (signal.category === 'services' && signal.metadata?.serviceName) {
+      if (exclusions.services.includes(signal.metadata.serviceName)) {
+        this.logger.debug('Signal suppressed by exclusion list (service)', {
+          service: signal.metadata.serviceName, signal_id: signal.id
+        });
+        return;
+      }
+    }
+    if (signal.category === 'processes' && signal.metadata?.processName) {
+      if (exclusions.processes.includes(signal.metadata.processName)) {
+        this.logger.debug('Signal suppressed by exclusion list (process)', {
+          process: signal.metadata.processName, signal_id: signal.id
+        });
+        return;
+      }
+    }
+    if (exclusions.signatures.includes(signal.id)) {
+      this.logger.debug('Signal suppressed by exclusion list (signature)', {
+        signal_id: signal.id
+      });
+      return;
+    }
+
     this.logger.warn('System signal detected', {
       id: signal.id,
       category: signal.category,
