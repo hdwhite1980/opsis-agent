@@ -741,12 +741,10 @@ class OPSISAgentService {
             });
           }
           pending.resolve(response);
-          if (this.ws && this.ws.readyState === 1) {
-            this.ws.send(JSON.stringify({
-              type: 'user-prompt-response', prompt_id: promptId, response,
-              device_id: this.deviceInfo.device_id, timestamp: new Date().toISOString()
-            }));
-          }
+          this.safeSend(JSON.stringify({
+            type: 'user-prompt-response', prompt_id: promptId, response,
+            device_id: this.deviceInfo.device_id, timestamp: new Date().toISOString()
+          }));
         }
         return null;
       }
@@ -844,9 +842,7 @@ class OPSISAgentService {
           createdAt: new Date().toISOString()
         };
         this.maintenanceManager.addWindow(mw);
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: 'maintenance_window_created', data: mw }));
-        }
+        this.safeSend(JSON.stringify({ type: 'maintenance_window_created', data: mw }));
         return { type: 'maintenance-window-created', data: { success: true, window: mw } };
       }
       case 'cancel-maintenance-window':
@@ -1022,15 +1018,13 @@ class OPSISAgentService {
         pending.resolve(response);
 
         // Report back to server
-        if (this.ws && this.ws.readyState === 1) {
-          this.ws.send(JSON.stringify({
-            type: 'user-prompt-response',
-            prompt_id: promptId,
-            response,
-            device_id: this.deviceInfo.device_id,
-            timestamp: new Date().toISOString()
-          }));
-        }
+        this.safeSend(JSON.stringify({
+          type: 'user-prompt-response',
+          prompt_id: promptId,
+          response,
+          device_id: this.deviceInfo.device_id,
+          timestamp: new Date().toISOString()
+        }));
       } else {
         this.logger.warn('No pending prompt found for id', { promptId });
       }
@@ -1296,11 +1290,7 @@ class OPSISAgentService {
         createdAt: new Date().toISOString()
       };
       this.maintenanceManager.addWindow(window);
-
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'maintenance_window_created', data: window }));
-      }
-
+      this.safeSend(JSON.stringify({ type: 'maintenance_window_created', data: window }));
       this.ipcServer.sendToClient(socket, { type: 'maintenance-window-created', data: { success: true, window } });
     });
 
@@ -1600,11 +1590,20 @@ class OPSISAgentService {
         this.log('Connected to OPSIS server, sending registration...');
         this.reconnectAttempts = 0; // Reset backoff on successful connection
 
+        // Capture ws reference before any async work to detect stale handler
+        const openedWs = this.ws!;
+
         // Collect system info for registration
         const systemInfo = await this.collectSystemInfo();
 
+        // After await, verify this connection is still current (not replaced by reconnect)
+        if (this.ws !== openedWs || openedWs.readyState !== WebSocket.OPEN) {
+          this.logger.warn('WebSocket replaced during registration setup, aborting stale open handler');
+          return;
+        }
+
         // Send registration immediately — don't wait for welcome
-        this.ws!.send(JSON.stringify({
+        this.safeSend(JSON.stringify({
           type: 'register',
           device_id: this.deviceInfo.device_id,
           tenant_id: this.deviceInfo.tenant_id,
@@ -1619,7 +1618,7 @@ class OPSISAgentService {
 
         // Send pending reboot_completed notification if resuming after reboot
         if (this.pendingRebootCompletedMsg) {
-          this.ws!.send(JSON.stringify(this.pendingRebootCompletedMsg));
+          this.safeSend(JSON.stringify(this.pendingRebootCompletedMsg));
           this.logger.info('Sent reboot_completed to server', {
             playbook_id: this.pendingRebootCompletedMsg.playbook_id,
             authorized_by: this.pendingRebootCompletedMsg.authorized_by,
@@ -1666,6 +1665,9 @@ class OPSISAgentService {
 
       this.ws.on('close', (code) => {
         this.log(`Disconnected from server (code: ${code}), will retry with backoff...`);
+        // Clear timers to prevent stale callbacks from sending on a dead connection
+        if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+        if (this.inventoryTimer) { clearInterval(this.inventoryTimer); this.inventoryTimer = null; }
         this.scheduleReconnect();
       });
 
@@ -1691,25 +1693,40 @@ class OPSISAgentService {
     setTimeout(() => this.connectToServer(), delay);
   }
 
-  private sendTelemetry(signal: SystemSignal): void {
+  /**
+   * Safe WebSocket send — guards against readyState races and catches send errors.
+   * Returns true if the message was sent successfully, false otherwise.
+   */
+  private safeSend(data: string): boolean {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'signal',
-        timestamp: new Date().toISOString(),
-        device_id: this.deviceInfo.device_id,
-        tenant_id: this.deviceInfo.tenant_id,
-        signal: {
-          id: signal.id,
-          category: signal.category,
-          severity: signal.severity,
-          metric: signal.metric,
-          value: signal.value,
-          threshold: signal.threshold,
-          message: signal.message,
-          metadata: signal.metadata
-        }
-      }));
+      try {
+        this.ws.send(data);
+        return true;
+      } catch (err: any) {
+        this.logger.warn('WebSocket send failed', { error: err.message });
+        return false;
+      }
     }
+    return false;
+  }
+
+  private sendTelemetry(signal: SystemSignal): void {
+    this.safeSend(JSON.stringify({
+      type: 'signal',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      signal: {
+        id: signal.id,
+        category: signal.category,
+        severity: signal.severity,
+        metric: signal.metric,
+        value: signal.value,
+        threshold: signal.threshold,
+        message: signal.message,
+        metadata: signal.metadata
+      }
+    }));
   }
 
   private async sendHeartbeat(): Promise<void> {
@@ -1733,7 +1750,7 @@ class OPSISAgentService {
       const ticketStats = this.ticketDb.getStatistics();
 
       // Send flat telemetry format
-      this.ws.send(JSON.stringify({
+      this.safeSend(JSON.stringify({
         type: 'telemetry',
         timestamp: new Date().toISOString(),
         device_id: this.deviceInfo.device_id,
@@ -1817,7 +1834,7 @@ class OPSISAgentService {
       this.logger.info('Collecting software inventory...');
       const software = await this.systemMonitor.getSoftwareInventory();
 
-      this.ws.send(JSON.stringify({
+      this.safeSend(JSON.stringify({
         type: 'software_inventory',
         timestamp: new Date().toISOString(),
         device_id: this.deviceInfo.device_id,
@@ -1918,6 +1935,16 @@ class OPSISAgentService {
           // Tag playbook with the most recent signature_id for cache linking
           if (this.recentSignatureIds.length > 0) {
             playbook.signatureId = this.recentSignatureIds[0];
+          }
+          // Preserve voice_copilot dispatch metadata for result routing
+          if (data.dispatch_id || playbook.dispatch_id) {
+            playbook.dispatch_id = data.dispatch_id || playbook.dispatch_id;
+          }
+          if (data.callback_type || playbook.callback_type) {
+            playbook.callback_type = data.callback_type || playbook.callback_type;
+          }
+          if (data.source) {
+            playbook.dispatch_source = data.source;
           }
           this.receivePlaybook(playbook, 'server');
           break;
@@ -2151,13 +2178,11 @@ class OPSISAgentService {
     const script = message.script;
     if (!script) {
       this.logger.error('No capture script in baseline_capture message');
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'baseline_result',
-          status: 'error',
-          error: 'No capture script provided'
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'baseline_result',
+        status: 'error',
+        error: 'No capture script provided'
+      }));
       return;
     }
 
@@ -2198,14 +2223,12 @@ class OPSISAgentService {
         baselineData = JSON.parse(jsonLine);
       } catch (parseErr: any) {
         this.logger.error('Failed to parse baseline output', { error: parseErr.message });
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({
-            type: 'baseline_result',
-            status: 'error',
-            error: `Parse failed: ${parseErr.message}`,
-            raw_output: output.substring(0, 2000)
-          }));
-        }
+        this.safeSend(JSON.stringify({
+          type: 'baseline_result',
+          status: 'error',
+          error: `Parse failed: ${parseErr.message}`,
+          raw_output: output.substring(0, 2000)
+        }));
         return;
       }
 
@@ -2219,17 +2242,15 @@ class OPSISAgentService {
       });
 
       // Send results back to server
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'baseline_result',
-          status: 'success',
-          baseline_name: message.baseline_name || 'auto',
-          is_template: message.is_template || false,
-          template_name: message.template_name || null,
-          notes: message.notes || null,
-          data: baselineData
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'baseline_result',
+        status: 'success',
+        baseline_name: message.baseline_name || 'auto',
+        is_template: message.is_template || false,
+        template_name: message.template_name || null,
+        notes: message.notes || null,
+        data: baselineData
+      }));
 
       // Notify control panel
       this.broadcastToAllClients({
@@ -2245,13 +2266,11 @@ class OPSISAgentService {
       this.logger.error('Baseline capture failed', { error: err.message });
       try { fs.unlinkSync(scriptPath); } catch (_) { /* ignore */ }
 
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'baseline_result',
-          status: 'error',
-          error: err.message
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'baseline_result',
+        status: 'error',
+        error: err.message
+      }));
 
       this.broadcastToAllClients({
         type: 'baseline-captured',
@@ -2323,15 +2342,13 @@ class OPSISAgentService {
       }
 
       // Notify server of timeout
-      if (this.ws && this.ws.readyState === 1) {
-        this.ws.send(JSON.stringify({
-          type: 'user-prompt-response',
-          prompt_id: promptId,
-          response: 'timeout',
-          device_id: this.deviceInfo.device_id,
-          timestamp: new Date().toISOString()
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'user-prompt-response',
+        prompt_id: promptId,
+        response: 'timeout',
+        device_id: this.deviceInfo.device_id,
+        timestamp: new Date().toISOString()
+      }));
     }, timeout);
 
     this.pendingPrompts.set(promptId, {
@@ -2377,15 +2394,13 @@ class OPSISAgentService {
         pending.resolve(userResponse);
 
         // Notify server of the response
-        if (this.ws && this.ws.readyState === 1) {
-          this.ws.send(JSON.stringify({
-            type: 'user-prompt-response',
-            prompt_id: promptId,
-            response: userResponse,
-            device_id: this.deviceInfo.device_id,
-            timestamp: new Date().toISOString()
-          }));
-        }
+        this.safeSend(JSON.stringify({
+          type: 'user-prompt-response',
+          prompt_id: promptId,
+          response: userResponse,
+          device_id: this.deviceInfo.device_id,
+          timestamp: new Date().toISOString()
+        }));
       }
     }
   }
@@ -2458,19 +2473,17 @@ class OPSISAgentService {
       this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`, { authorizedBy: loggedOnUser });
 
       // Notify server of reboot authorization
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'reboot_authorized',
-          device_id: this.deviceInfo.device_id,
-          tenant_id: this.deviceInfo.tenant_id,
-          timestamp: new Date().toISOString(),
-          authorized_by: loggedOnUser,
-          playbook_id: this.playbookQueue.length > 0 ? this.playbookQueue[0]?.id : null,
-          delay_seconds: delay,
-          reason: rawMessage
-        }));
-        this.logger.info('Reboot authorization sent to server');
-      }
+      this.safeSend(JSON.stringify({
+        type: 'reboot_authorized',
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        timestamp: new Date().toISOString(),
+        authorized_by: loggedOnUser,
+        playbook_id: this.playbookQueue.length > 0 ? this.playbookQueue[0]?.id : null,
+        delay_seconds: delay,
+        reason: rawMessage
+      }));
+      this.logger.info('Reboot authorization sent to server');
 
       const { spawnSync } = require('child_process');
       // SECURITY: Use spawnSync with array args to prevent command injection
@@ -2486,17 +2499,15 @@ class OPSISAgentService {
       this.logger.info('User declined or timed out on reboot prompt', { response, user: loggedOnUser });
 
       // Notify server that reboot was declined
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'reboot_declined',
-          device_id: this.deviceInfo.device_id,
-          tenant_id: this.deviceInfo.tenant_id,
-          timestamp: new Date().toISOString(),
-          declined_by: loggedOnUser,
-          response,
-          reason: response === 'timeout' ? 'User did not respond within 5 minutes' : 'User declined reboot'
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'reboot_declined',
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        timestamp: new Date().toISOString(),
+        declined_by: loggedOnUser,
+        response,
+        reason: response === 'timeout' ? 'User did not respond within 5 minutes' : 'User declined reboot'
+      }));
     }
   }
 
@@ -2827,10 +2838,9 @@ class OPSISAgentService {
 
     let sent = 0;
     for (const message of queued) {
-      try {
-        this.ws.send(JSON.stringify(message));
+      if (this.safeSend(JSON.stringify(message))) {
         sent++;
-      } catch (error: any) {
+      } else {
         // Re-queue any that fail to send
         this.pendingPlaybookResults.push(message);
       }
@@ -2980,20 +2990,18 @@ class OPSISAgentService {
     this.broadcastTicketUpdate();
 
     // Report back to server
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'action_result',
-        timestamp: new Date().toISOString(),
-        data: {
-          decision_type: 'ignore',
-          signature_id: signatureId,
-          target,
-          category,
-          status: 'success',
-          reason
-        }
-      }));
-    }
+    this.safeSend(JSON.stringify({
+      type: 'action_result',
+      timestamp: new Date().toISOString(),
+      data: {
+        decision_type: 'ignore',
+        signature_id: signatureId,
+        target,
+        category,
+        status: 'success',
+        reason
+      }
+    }));
   }
 
   private inferExclusionFromSignature(signatureId: string): { target: string; category: 'services' | 'processes' | 'signatures' } {
@@ -3108,25 +3116,19 @@ class OPSISAgentService {
 
       if (result.success) {
         // Send acknowledgment
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify(createRotationAck(result.rotated)));
-        }
+        this.safeSend(JSON.stringify(createRotationAck(result.rotated)));
 
         // Reload credentials to use new keys
         await this.loadSecureCredentials();
         this.logger.info('Key rotation completed successfully');
       } else {
         // Send error response
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify(createRotationError(result.error || 'Unknown error')));
-        }
+        this.safeSend(JSON.stringify(createRotationError(result.error || 'Unknown error')));
         this.logger.error('Key rotation failed', { error: result.error });
       }
     } catch (error: any) {
       this.logger.error('Key rotation exception', { error: error.message });
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(createRotationError(error.message)));
-      }
+      this.safeSend(JSON.stringify(createRotationError(error.message)));
     }
   }
 
@@ -3144,14 +3146,12 @@ class OPSISAgentService {
           session_id: data.session_id
         });
         // Send error response
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({
-            type: 'diagnostic_error',
-            session_id: data.session_id,
-            error: 'Signature verification failed',
-            timestamp: new Date().toISOString()
-          }));
-        }
+        this.safeSend(JSON.stringify({
+          type: 'diagnostic_error',
+          session_id: data.session_id,
+          error: 'Signature verification failed',
+          timestamp: new Date().toISOString()
+        }));
         return;
       }
       this.logger.info('Diagnostic request signature verified');
@@ -3168,14 +3168,12 @@ class OPSISAgentService {
       this.logger.error('Diagnostic request validation failed: ' + validation.errors.join(', '), {
         session_id: data.session_id
       });
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'diagnostic_error',
-          session_id: data.session_id,
-          error: 'Validation failed: ' + validation.errors.join(', '),
-          timestamp: new Date().toISOString()
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_error',
+        session_id: data.session_id,
+        error: 'Validation failed: ' + validation.errors.join(', '),
+        timestamp: new Date().toISOString()
+      }));
       return;
     }
 
@@ -3234,22 +3232,20 @@ class OPSISAgentService {
       }
 
       // Send all results back in one message
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'diagnostic_result',
-          timestamp: new Date().toISOString(),
-          device_id: this.deviceInfo.device_id,
-          session_id: session_id || 'diag-unknown',
-          results,
-          command_count: results.length,
-          all_success: results.every(r => r.success)
-        }));
-        this.logger.info('Diagnostic results sent', {
-          session_id: session_id || 'diag-unknown',
-          total: results.length,
-          successful: results.filter(r => r.success).length
-        });
-      }
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_result',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        session_id: session_id || 'diag-unknown',
+        results,
+        command_count: results.length,
+        all_success: results.every(r => r.success)
+      }));
+      this.logger.info('Diagnostic results sent', {
+        session_id: session_id || 'diag-unknown',
+        total: results.length,
+        successful: results.filter(r => r.success).length
+      });
       return;
     }
 
@@ -3265,18 +3261,16 @@ class OPSISAgentService {
     const diagCommand = command || this.buildDiagnosticCommand(scenario, target);
     if (!diagCommand) {
       this.logger.error('Diagnostic request missing command', { data });
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'diagnostic_result',
-          timestamp: new Date().toISOString(),
-          device_id: this.deviceInfo.device_id,
-          session_id,
-          step_id,
-          success: false,
-          error: 'No command or recognized scenario provided',
-          exit_code: -1
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_result',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        session_id,
+        step_id,
+        success: false,
+        error: 'No command or recognized scenario provided',
+        exit_code: -1
+      }));
       return;
     }
 
@@ -3284,37 +3278,32 @@ class OPSISAgentService {
       const result = await this.executePowerShellCommand(diagCommand, timeout || 30);
       const parsedResult = this.parseDiagnosticOutput(result.output, step_id);
 
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'diagnostic_result',
-          timestamp: new Date().toISOString(),
-          device_id: this.deviceInfo.device_id,
-          session_id: session_id,
-          step_id: step_id,
-          success: result.exitCode === 0,
-          output: result.output,
-          error: result.error || null,
-          exit_code: result.exitCode,
-          parsed_result: parsedResult
-        }));
-
-        this.logger.info('Diagnostic result sent', { step_id, success: result.exitCode === 0 });
-      }
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_result',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        session_id: session_id,
+        step_id: step_id,
+        success: result.exitCode === 0,
+        output: result.output,
+        error: result.error || null,
+        exit_code: result.exitCode,
+        parsed_result: parsedResult
+      }));
+      this.logger.info('Diagnostic result sent', { step_id, success: result.exitCode === 0 });
     } catch (error: any) {
       this.logger.error('Diagnostic failed', { step_id, error: error.message });
 
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'diagnostic_result',
-          timestamp: new Date().toISOString(),
-          device_id: this.deviceInfo.device_id,
-          session_id: session_id,
-          step_id: step_id,
-          success: false,
-          error: error.message,
-          exit_code: -1
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_result',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        session_id: session_id,
+        step_id: step_id,
+        success: false,
+        error: error.message,
+        exit_code: -1
+      }));
     }
   }
 
@@ -3454,28 +3443,24 @@ class OPSISAgentService {
 
     if (!signature) {
       this.logger.warn('add_to_ignore_list missing signature', { data });
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: 'ignore_list_result',
-          success: false,
-          error: 'Missing signature field',
-          timestamp: new Date().toISOString()
-        }));
-      }
+      this.safeSend(JSON.stringify({
+        type: 'ignore_list_result',
+        success: false,
+        error: 'Missing signature field',
+        timestamp: new Date().toISOString()
+      }));
       return;
     }
 
     this.addToLocalIgnoreList(signature, reason || 'Added by server');
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'ignore_list_result',
-        success: true,
-        signature,
-        reason: reason || 'Added by server',
-        timestamp: new Date().toISOString()
-      }));
-    }
+    this.safeSend(JSON.stringify({
+      type: 'ignore_list_result',
+      success: true,
+      signature,
+      reason: reason || 'Added by server',
+      timestamp: new Date().toISOString()
+    }));
   }
 
   private addToLocalIgnoreList(signature: string, reason: string): void {
@@ -3577,7 +3562,12 @@ class OPSISAgentService {
     const signatureId = (playbook as any).signatureId || null;
     const resourceName = this.extractResourceName(null, playbook);
 
-    const message = {
+    // Voice dispatch metadata (echoed back for server-side routing)
+    const dispatchId = (playbook as any).dispatch_id || null;
+    const callbackType = (playbook as any).callback_type || null;
+    const dispatchSource = (playbook as any).dispatch_source || null;
+
+    const message: Record<string, any> = {
       type: 'playbook_result',
       timestamp: new Date().toISOString(),
       device_id: this.deviceInfo.device_id,
@@ -3594,14 +3584,18 @@ class OPSISAgentService {
       step_results: stepResults || null,
       error: error ? error.toString() : null,
       source: playbook.source,
-      resource_name: resourceName
+      resource_name: resourceName,
+      ...(dispatchId && { dispatch_id: dispatchId }),
+      ...(callbackType && { callback_type: callbackType }),
+      ...(dispatchSource && { dispatch_source: dispatchSource })
     };
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+    if (this.safeSend(JSON.stringify(message))) {
       this.logger.info('Playbook result sent to server', {
         playbook_id: playbook.id,
         signature_id: signatureId,
+        dispatch_id: dispatchId,
+        callback_type: callbackType,
         status,
         steps: stepResults?.length || 0
       });
@@ -3631,9 +3625,7 @@ class OPSISAgentService {
       details
     };
     this.logger.error('SECURITY ALERT', alert);
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(alert));
-    }
+    this.safeSend(JSON.stringify(alert));
   }
 
   // Handle Welcome Message from Server (heartbeat already running from on('open'))
@@ -4231,18 +4223,16 @@ class OPSISAgentService {
       (escalationPayload as any).baseline_comparison = baselineDiff;
     }
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'escalation',
-        ...escalationPayload
-      }));
-      this.logger.info('Escalation sent to server', {
-        signature_id: escalationPayload.signature_id,
-        requested_outcome: escalationPayload.requested_outcome,
-        has_diagnostic_data: !!escalationPayload.pre_escalation_diagnostics,
-        diagnostic_category: escalationPayload.pre_escalation_diagnostics?.category
-      });
-    }
+    this.safeSend(JSON.stringify({
+      type: 'escalation',
+      ...escalationPayload
+    }));
+    this.logger.info('Escalation sent to server', {
+      signature_id: escalationPayload.signature_id,
+      requested_outcome: escalationPayload.requested_outcome,
+      has_diagnostic_data: !!escalationPayload.pre_escalation_diagnostics,
+      diagnostic_category: escalationPayload.pre_escalation_diagnostics?.category
+    });
   }
 
   private flushEscalationBatch(): void {
@@ -4272,7 +4262,7 @@ class OPSISAgentService {
       this.escalationProtocol.buildEscalationPayload(item.signature, item.runbook, this.recentActions, item.diagnosticData)
     );
 
-    this.ws.send(JSON.stringify({
+    this.safeSend(JSON.stringify({
       type: 'batch_escalation',
       escalations,
       batch_size: escalations.length
@@ -4548,14 +4538,12 @@ class OPSISAgentService {
         this.logger.error('Playbook validation failed: ' + validation.errors.join(', '), {
           playbookId: playbook.id
         });
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({
-            type: 'playbook_error',
-            playbook_id: playbook.id,
-            error: 'Validation failed: ' + validation.errors.join(', '),
-            timestamp: new Date().toISOString()
-          }));
-        }
+        this.safeSend(JSON.stringify({
+          type: 'playbook_error',
+          playbook_id: playbook.id,
+          error: 'Validation failed: ' + validation.errors.join(', '),
+          timestamp: new Date().toISOString()
+        }));
         return; // Reject the playbook
       }
       this.logger.info('Playbook validated successfully', { playbookId: playbook.id });
@@ -5095,18 +5083,16 @@ class OPSISAgentService {
       }
     }
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'action_result',
-        timestamp: new Date().toISOString(),
-        data: {
-          playbook_id: playbookId,
-          ticket_id: ticketId,
-          status: status,
-          error: error ? error.toString() : undefined
-        }
-      }));
-    }
+    this.safeSend(JSON.stringify({
+      type: 'action_result',
+      timestamp: new Date().toISOString(),
+      data: {
+        playbook_id: playbookId,
+        ticket_id: ticketId,
+        status: status,
+        error: error ? error.toString() : undefined
+      }
+    }));
   }
 
   // ============================================
@@ -5143,9 +5129,9 @@ class OPSISAgentService {
         pendingActions: pendingActions.length
       });
       
-      if (this.ws && this.ws.readyState === WebSocket.OPEN && pendingActions.length > 0) {
+      if (pendingActions.length > 0) {
         for (const action of pendingActions) {
-          this.ws.send(JSON.stringify({
+          this.safeSend(JSON.stringify({
             type: 'proactive-action',
             timestamp: new Date().toISOString(),
             deviceId: os.hostname(),
@@ -5165,31 +5151,29 @@ class OPSISAgentService {
             }
           }));
         }
-        
+
         this.logger.info('Proactive actions sent to server', {
           count: pendingActions.length
         });
       }
 
       // Report hardware health scores and correlations
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        const healthScores = this.patternDetector.getHealthScores();
-        const correlations = this.patternDetector.getCorrelations();
+      const healthScores = this.patternDetector.getHealthScores();
+      const correlations = this.patternDetector.getCorrelations();
 
-        if (Object.keys(healthScores).length > 0 || Object.keys(correlations).length > 0) {
-          this.ws.send(JSON.stringify({
-            type: 'hardware-health-report',
-            timestamp: new Date().toISOString(),
-            deviceId: os.hostname(),
-            healthScores,
-            correlations
-          }));
+      if (Object.keys(healthScores).length > 0 || Object.keys(correlations).length > 0) {
+        this.safeSend(JSON.stringify({
+          type: 'hardware-health-report',
+          timestamp: new Date().toISOString(),
+          deviceId: os.hostname(),
+          healthScores,
+          correlations
+        }));
 
-          this.logger.info('Hardware health report sent to server', {
-            components: Object.keys(healthScores).length,
-            correlations: Object.keys(correlations).length
-          });
-        }
+        this.logger.info('Hardware health report sent to server', {
+          components: Object.keys(healthScores).length,
+          correlations: Object.keys(correlations).length
+        });
       }
 
     } catch (error) {
@@ -6049,8 +6033,7 @@ class OPSISAgentService {
       }
     };
 
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(reinvestigationPayload));
+    if (this.safeSend(JSON.stringify(reinvestigationPayload))) {
       this.logger.info('Reinvestigation request sent to server', {
         runbook_id: runbookEntry.id,
         execution_count: runbookEntry.execution_count
@@ -6261,15 +6244,13 @@ class OPSISAgentService {
   }): void {
     this.logger.info('Self-service resolution', data);
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'self_service_resolution',
-        timestamp: new Date().toISOString(),
-        device_id: this.deviceInfo.device_id,
-        tenant_id: this.deviceInfo.tenant_id,
-        data
-      }));
-    }
+    this.safeSend(JSON.stringify({
+      type: 'self_service_resolution',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      data
+    }));
   }
 }
 
@@ -6340,6 +6321,15 @@ process.on('SIGTERM', () => {
 
 process.on('exit', () => {
   releaseLock();
+});
+
+// Safety net: prevent unhandled errors from crashing the service
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception (service kept running):', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (service kept running):', reason);
 });
 
 agent.start().catch((error) => {
