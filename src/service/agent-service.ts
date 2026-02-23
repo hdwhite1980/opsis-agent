@@ -41,6 +41,8 @@ import {
   storeCredentialsFromSetup,
   verifyPlaybook,
   verifyDiagnosticRequest,
+  verifyServerMessage,
+  signServerMessage,
   validatePlaybook,
   validateDiagnosticRequest,
   handleKeyRotation,
@@ -1875,6 +1877,7 @@ class OPSISAgentService {
         case 'register_ack':
         case 'software_inventory_ack':
         case 'diagnostic_error_ack':
+        case 'diagnostic_results_ack':
         case 'proactive-action_ack':
         case 'hardware-health-report_ack':
         case 'playbook_result_ack':
@@ -1969,6 +1972,10 @@ class OPSISAgentService {
           this.logger.info('Received diagnostic_request', { session_id: data.data?.session_id });
           // SECURITY: Verify HMAC and validate before executing
           this.handleSecureDiagnosticRequest(data.data || data);
+          break;
+
+        case 'diagnostic_runbook':
+          this.handleDiagnosticRunbook(data);
           break;
 
         case 'key_rotation':
@@ -3179,6 +3186,98 @@ class OPSISAgentService {
 
     // Step 3: Execute the diagnostic
     await this.handleDiagnosticRequest(data);
+  }
+
+  // ============================================
+  // DIAGNOSTIC RUNBOOK (Multi-round AI investigation)
+  // ============================================
+
+  private async handleDiagnosticRunbook(data: any): Promise<void> {
+    const { session_id, round, steps, trigger } = data;
+
+    // Validate structure
+    if (!session_id || !steps || !Array.isArray(steps) || steps.length === 0) {
+      this.logger.warn('diagnostic_runbook missing required fields', { session_id });
+      this.safeSend(JSON.stringify({
+        type: 'diagnostic_error',
+        session_id: session_id || 'unknown',
+        error: 'Missing session_id or steps array',
+        timestamp: new Date().toISOString()
+      }));
+      return;
+    }
+
+    // Optional HMAC verification (same policy as diagnostic_request — read-only data collection)
+    if (data._signature) {
+      const verification = await verifyServerMessage(data);
+      if (!verification.valid) {
+        this.logger.error('diagnostic_runbook signature verification failed', {
+          error: verification.error, session_id
+        });
+        this.safeSend(JSON.stringify({
+          type: 'diagnostic_error', session_id,
+          error: 'Signature verification failed',
+          timestamp: new Date().toISOString()
+        }));
+        return;
+      }
+    }
+
+    this.logger.info('Diagnostic runbook received', {
+      session_id, round, step_count: steps.length,
+      trigger_playbook: trigger?.playbook_id,
+      trigger_error: trigger?.error?.substring(0, 100)
+    });
+
+    const results: any[] = [];
+    for (const step of steps) {
+      const cmd = step.command;
+      const cmdTimeout = step.timeout || 30;
+
+      this.logger.info('Running diagnostic runbook step', {
+        session_id, round, purpose: step.purpose,
+        command: cmd?.substring(0, 100)
+      });
+
+      try {
+        const result = await this.executePowerShellCommand(cmd, cmdTimeout);
+        results.push({
+          command: cmd,
+          purpose: step.purpose || null,
+          exit_code: result.exitCode,
+          output: result.output,
+          error: result.error || null
+        });
+      } catch (error: any) {
+        results.push({
+          command: cmd,
+          purpose: step.purpose || null,
+          exit_code: -1,
+          output: null,
+          error: error.message
+        });
+      }
+    }
+
+    const response: Record<string, any> = {
+      type: 'diagnostic_results',
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      session_id,
+      round: round || 1,
+      timestamp: new Date().toISOString(),
+      results,
+      all_success: results.every(r => r.exit_code === 0)
+    };
+
+    // Sign if HMAC is configured
+    const signed = await signServerMessage(response);
+    this.safeSend(JSON.stringify(signed || response));
+
+    this.logger.info('Diagnostic runbook results sent', {
+      session_id, round, total: results.length,
+      successful: results.filter(r => r.exit_code === 0).length
+    });
   }
 
   // ============================================
