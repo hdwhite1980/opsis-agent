@@ -2828,6 +2828,98 @@ class OPSISAgentService {
   }
 
   /**
+   * Show a message box in the logged-in user's session from Session 0 using WTSSendMessage.
+   * This is the correct way for a Windows Service to display UI to the interactive user.
+   */
+  private showSessionMessageBox(
+    title: string,
+    message: string,
+    style: 'ok' | 'yesno',
+    timeoutSeconds: number
+  ): 'ok' | 'yes' | 'no' | 'timeout' | 'error' {
+    const sanitizedTitle = String(title).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+    const sanitizedMessage = String(message).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+    const mbStyle = style === 'yesno' ? 4 : 0; // MB_YESNO = 0x04, MB_OK = 0x00
+
+    const psScript = `
+$wtsSig = @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint WTSGetActiveConsoleSessionId();
+
+[DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool WTSSendMessageW(
+    IntPtr hServer,
+    uint SessionId,
+    string pTitle,
+    uint TitleLength,
+    string pMessage,
+    uint MessageLength,
+    uint Style,
+    uint Timeout,
+    out uint pResponse,
+    bool bWait
+);
+'@
+
+Add-Type -MemberDefinition $wtsSig -Name 'WtsApi' -Namespace 'Win32' -ErrorAction Stop
+
+$sessionId = [Win32.WtsApi]::WTSGetActiveConsoleSessionId()
+if ($sessionId -eq 0xFFFFFFFF) {
+    Write-Output 'NO_SESSION'
+    exit 0
+}
+
+$title = '${sanitizedTitle}'
+$message = '${sanitizedMessage}'
+[uint32]$response = 0
+
+$success = [Win32.WtsApi]::WTSSendMessageW(
+    [IntPtr]::Zero,
+    $sessionId,
+    $title,
+    [uint32]($title.Length * 2),
+    $message,
+    [uint32]($message.Length * 2),
+    [uint32]${mbStyle},
+    [uint32]${timeoutSeconds},
+    [ref]$response,
+    $true
+)
+
+if ($success) {
+    Write-Output $response
+} else {
+    Write-Output 'API_FAILED'
+}
+`;
+
+    try {
+      const result = securePowerShell(psScript, { timeout: (timeoutSeconds + 10) * 1000 });
+      const output = result.stdout.trim();
+
+      if (!result.success || output === 'API_FAILED' || output === 'NO_SESSION') {
+        this.logger.warn('WTSSendMessage failed or no active session', { output, stderr: result.stderr });
+        return 'error';
+      }
+
+      const responseCode = parseInt(output, 10);
+      switch (responseCode) {
+        case 1:     return 'ok';      // IDOK
+        case 6:     return 'yes';     // IDYES
+        case 7:     return 'no';      // IDNO
+        case 2:     return 'no';      // IDCANCEL — treat as decline
+        case 32000: return 'timeout'; // IDTIMEOUT
+        default:
+          this.logger.warn('Unexpected WTSSendMessage response code', { responseCode });
+          return 'timeout';
+      }
+    } catch (err: any) {
+      this.logger.error('showSessionMessageBox failed', { error: err.message });
+      return 'error';
+    }
+  }
+
+  /**
    * Handle a user-prompt message from the server.
    * Broadcasts to GUI and waits for user response.
    */
@@ -2880,26 +2972,26 @@ class OPSISAgentService {
         }
       });
     } else {
-      // No GUI connected — fall back to native Windows dialog
-      this.logger.info('No GUI connected, using native Windows prompt for server user-prompt');
-      const { spawnSync } = require('child_process');
-      const title = String(promptData.title || 'Action Required').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
-      const msg = String(promptData.message || '').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
-      const buttons = promptData.buttons || ['OK', 'Cancel'];
-      // Map button labels to WPF button enum
-      const hasCancel = buttons.some((b: string) => /cancel|no|later|decline/i.test(b));
-      const wpfButtons = hasCancel ? 'YesNo' : 'OK';
-      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${msg}', 'OPSIS Agent - ${title}', '${wpfButtons}', 'Information'); Write-Output $result`;
-      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: (promptData.timeout || 300) * 1000 });
-      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
-      this.logger.info('Native user-prompt result', { promptId, result: output });
+      // No GUI connected — show dialog in user's session via WTSSendMessage
+      this.logger.info('No GUI connected, using WTSSendMessage for server user-prompt');
+      const promptTitle = String(promptData.title || 'Action Required');
+      const promptMsg = String(promptData.message || '');
+      const promptButtons = promptData.buttons || ['OK', 'Cancel'];
+      const hasCancel = promptButtons.some((b: string) => /cancel|no|later|decline/i.test(b));
+      const dialogStyle = hasCancel ? 'yesno' : 'ok';
+      const timeoutSec = promptData.timeout || 300;
+
+      const dialogResult = this.showSessionMessageBox(
+        `OPSIS Agent - ${promptTitle}`, promptMsg, dialogStyle, timeoutSec
+      );
+      this.logger.info('WTSSendMessage user-prompt result', { promptId, result: dialogResult });
 
       // Resolve the pending prompt
       clearTimeout(timer);
       const pending = this.pendingPrompts.get(promptId);
       if (pending) {
         this.pendingPrompts.delete(promptId);
-        const userResponse = (output === 'Yes' || output === 'OK') ? 'ok' : 'cancel';
+        const userResponse = (dialogResult === 'yes' || dialogResult === 'ok') ? 'ok' : 'cancel';
         pending.resolve(userResponse);
 
         // Notify server of the response
@@ -2965,14 +3057,13 @@ class OPSISAgentService {
         });
       });
     } else {
-      // No GUI connected — fall back to native Windows dialog
-      this.logger.info('No GUI connected, using native Windows prompt for reboot confirmation');
-      const { spawnSync } = require('child_process');
-      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${message.replace(/'/g, "''")}', 'OPSIS Agent - Restart Required', 'YesNo', 'Warning'); if ($result -eq 'Yes') { Write-Output 'ok' } else { Write-Output 'cancel' }`;
-      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: 300000 });
-      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
-      response = output === 'ok' ? 'ok' : 'cancel';
-      this.logger.info('Native reboot prompt result', { response: output });
+      // No GUI connected — show dialog in user's session via WTSSendMessage
+      this.logger.info('No GUI connected, using WTSSendMessage for reboot confirmation');
+      const dialogResult = this.showSessionMessageBox(
+        'OPSIS Agent - Restart Required', message, 'yesno', 300
+      );
+      response = dialogResult === 'yes' ? 'ok' : 'cancel';
+      this.logger.info('WTSSendMessage reboot prompt result', { result: dialogResult });
     }
 
     // Get the logged-on username for authorization tracking
@@ -3058,19 +3149,26 @@ class OPSISAgentService {
         });
       });
     } else {
-      // No GUI connected — fall back to native Windows dialog
-      this.logger.info('No GUI connected, using native Windows prompt for playbook user-prompt');
-      const { spawnSync } = require('child_process');
-      const title = String(params.title || 'Action Required').replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
-      const msg = String(action).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
-      const buttons = params.buttons || ['OK', 'Cancel'];
-      const hasCancel = buttons.some((b: string) => /cancel|no|later|decline/i.test(b));
-      const wpfButtons = hasCancel ? 'YesNo' : 'OK';
-      const psScript = `Add-Type -AssemblyName PresentationFramework; $result = [System.Windows.MessageBox]::Show('${msg}', 'OPSIS Agent - ${title}', '${wpfButtons}', 'Information'); Write-Output $result`;
-      const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', psScript], { timeout: timeout * 1000 });
-      const output = result.stdout ? result.stdout.toString().trim() : 'timeout';
-      response = (output === 'Yes' || output === 'OK') ? 'ok' : (output === 'timeout' ? 'timeout' : 'cancel');
-      this.logger.info('Native user-prompt result', { promptId, result: output });
+      // No GUI connected — show dialog in user's session via WTSSendMessage
+      this.logger.info('No GUI connected, using WTSSendMessage for playbook user-prompt');
+      const stepTitle = String(params.title || 'Action Required');
+      const stepMsg = String(action);
+      const stepButtons = params.buttons || ['OK', 'Cancel'];
+      const hasCancel = stepButtons.some((b: string) => /cancel|no|later|decline/i.test(b));
+      const dialogStyle = hasCancel ? 'yesno' : 'ok';
+
+      const dialogResult = this.showSessionMessageBox(
+        `OPSIS Agent - ${stepTitle}`, stepMsg, dialogStyle, timeout
+      );
+
+      if (dialogResult === 'yes' || dialogResult === 'ok') {
+        response = 'ok';
+      } else if (dialogResult === 'timeout') {
+        response = 'timeout';
+      } else {
+        response = 'cancel';
+      }
+      this.logger.info('WTSSendMessage user-prompt result', { promptId, result: dialogResult });
     }
 
     this.logger.info('User-prompt step response', { promptId, response });
