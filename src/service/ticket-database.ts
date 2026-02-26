@@ -159,6 +159,13 @@ export class TicketDatabase {
     ) || null;
   }
 
+  public findOpenTicketBySignature(signatureId: string): Ticket | null {
+    return this.tickets.find(t =>
+      (t.status === 'open' || t.status === 'in-progress' || t.status === 'pending-review') &&
+      t.signature_id === signatureId
+    ) || null;
+  }
+
   public getTicket(ticketId: string): Ticket | null {
     try {
       return this.tickets.find(t => t.ticket_id === ticketId) || null;

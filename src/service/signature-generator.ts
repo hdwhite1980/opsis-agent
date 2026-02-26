@@ -94,15 +94,28 @@ export class SignatureGenerator {
     
     const targets: Target[] = this.extractTargetsFromSignal(signal);
     const context = this.buildContext(deviceInfo);
-    
-    const signatureData = {
-      symptoms,
-      targets,
-      context,
+
+    // Build stable hash input: exclude volatile values (metric reading, PIDs, uptime_bucket)
+    // so the same logical condition always produces the same signature_id
+    const stableSignatureData = {
+      symptoms: [{
+        type: this.mapSignalCategory(signal.category),
+        severity: this.mapSystemSignalSeverity(signal.severity),
+        details: {
+          metric: signal.metric,
+          threshold: signal.threshold
+        }
+      }],
+      targets: targets.map(t => ({ type: t.type, name: t.name })),
+      context: {
+        os_build: context.os_build,
+        os_version: context.os_version,
+        device_role: context.device_role
+      },
       signal_category: signal.category
     };
-    
-    const signature_id = this.generateHash(signatureData);
+
+    const signature_id = this.generateHash(stableSignatureData);
     
     return {
       signature_id,

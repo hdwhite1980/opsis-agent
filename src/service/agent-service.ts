@@ -30,8 +30,12 @@ import { BaselineManager } from './baseline-manager';
 import { BehavioralProfiler } from './behavioral-profiler';
 import { SignalCorrelator, CorrelationResult } from './signal-correlator';
 import { CompatibilityChecker, CompatibilityReport, CapabilityMode } from './compatibility-checker';
+import { EnvironmentIntelligence } from './environment-intelligence';
+import { EnvironmentChangeEvent } from './environment-intelligence-types';
+import { ComplianceScanner } from './compliance-scanner';
+import { ComplianceTemplate, ComplianceReport, ComplianceDriftEvent, ComplianceCheck } from './compliance-scanner-types';
 
-import { updateServerProtections, updateLearnedProtections } from '../execution/primitives/index';
+import { updateServerProtections, updateLearnedProtections, securePowerShell } from '../execution/primitives/index';
 
 // Security imports
 import {
@@ -329,6 +333,12 @@ class OPSISAgentService {
     display_name: string;
   }> = [];
 
+  // Environment Intelligence
+  private environmentIntelligence!: EnvironmentIntelligence;
+
+  // Compliance Scanner
+  private complianceScanner!: ComplianceScanner;
+
   // Monitoring trap agent features
   private stateTracker!: StateTracker;
   private maintenanceManager!: MaintenanceWindowManager;
@@ -418,6 +428,19 @@ class OPSISAgentService {
 
     // Initialize baseline manager (before self-service portal which depends on it)
     this.baselineManager = new BaselineManager(this.logger, this.dataDir);
+
+    // Initialize environment intelligence (living documentation / asset discovery)
+    this.environmentIntelligence = new EnvironmentIntelligence(this.logger, this.dataDir);
+    this.environmentIntelligence.setChangeCallback((changes) => this.handleEnvironmentChanges(changes));
+    this.environmentIntelligence.setDeviceInfo(this.deviceInfo.device_id, this.deviceInfo.tenant_id);
+
+    // Initialize compliance scanner
+    this.complianceScanner = new ComplianceScanner(this.logger, this.dataDir);
+    this.complianceScanner.setDeviceInfo(this.deviceInfo.device_id, this.deviceInfo.tenant_id);
+    this.complianceScanner.setReportCallback((report) => this.handleComplianceReport(report));
+    this.complianceScanner.setDriftCallback((drifts) => this.handleComplianceDrift(drifts));
+    this.complianceScanner.setEnforcementCallback((check) => this.executeComplianceEnforcement(check));
+    this.complianceScanner.setSendCallback((message) => this.safeSend(JSON.stringify(message)));
 
     // Initialize self-service portal
     this.selfServiceServer = new SelfServiceServer(
@@ -1405,6 +1428,14 @@ class OPSISAgentService {
     await this.baselineManager.captureIfNeeded();
     this.log('System baseline check complete');
 
+    // Start environment intelligence (asset discovery & living documentation)
+    await this.environmentIntelligence.start();
+    this.log('Environment intelligence started');
+
+    // Start compliance scanner
+    await this.complianceScanner.start();
+    this.log('Compliance scanner started');
+
     // Connect to server if configured
     const serverUrl = this.deviceInfo.websocket_url || this.config.serverUrl;
     if (serverUrl && this.config.autoConnect) {
@@ -1491,6 +1522,14 @@ class OPSISAgentService {
 
     if (this.systemMonitor) {
       this.systemMonitor.stop();
+    }
+
+    if (this.environmentIntelligence) {
+      this.environmentIntelligence.stop();
+    }
+
+    if (this.complianceScanner) {
+      this.complianceScanner.stop();
     }
 
     if (this.ticketDb) {
@@ -1634,6 +1673,9 @@ class OPSISAgentService {
         // Flush any queued playbook results from previous disconnected session
         this.flushPlaybookResultQueue();
 
+        // Flush any queued compliance reports
+        this.complianceScanner.flushPendingReports();
+
         // Start heartbeat immediately with adaptive interval
         // (will be updated if welcome arrives with custom config)
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
@@ -1648,6 +1690,9 @@ class OPSISAgentService {
         // Delay initial inventory by 10s to let connection stabilize
         setTimeout(() => this.sendSoftwareInventory(), 10000);
         this.inventoryTimer = setInterval(() => this.sendSoftwareInventory(), 3600000);
+
+        // Send environment snapshot on connect (delayed 15s)
+        setTimeout(() => this.sendEnvironmentSnapshot(), 15000);
 
         // Warn if server doesn't send welcome within 10s
         if (this.welcomeTimeout) clearTimeout(this.welcomeTimeout);
@@ -1849,6 +1894,413 @@ class OPSISAgentService {
       this.logger.info('Software inventory sent', { count: software.length });
     } catch (error) {
       this.logger.error('Failed to send software inventory', error);
+    }
+  }
+
+  private async sendEnvironmentSnapshot(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      const snapshot = this.environmentIntelligence.getCurrentSnapshot();
+      if (!snapshot) {
+        this.logger.debug('No environment snapshot available to send');
+        return;
+      }
+
+      this.safeSend(JSON.stringify({
+        type: 'environment_snapshot',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        snapshot
+      }));
+
+      this.logger.info('Environment snapshot sent to server', {
+        snapshot_id: snapshot.snapshot_id,
+        software_count: snapshot.installed_software.length,
+        service_count: snapshot.services.length,
+      });
+    } catch (error) {
+      this.logger.error('Failed to send environment snapshot', error);
+    }
+  }
+
+  private handleEnvironmentChanges(changes: EnvironmentChangeEvent[]): void {
+    if (changes.length === 0) return;
+
+    this.logger.info('Environment changes detected', {
+      count: changes.length,
+      sections: [...new Set(changes.map(c => c.section))],
+    });
+
+    // Send to server via WebSocket
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.safeSend(JSON.stringify({
+        type: 'environment_changes',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        changes
+      }));
+    }
+
+    // Broadcast to control panel
+    this.broadcastToAllClients({
+      type: 'environment_changes',
+      data: { changes }
+    });
+  }
+
+  // ============================
+  // COMPLIANCE SCANNER METHODS
+  // ============================
+
+  private handleComplianceTemplate(template: ComplianceTemplate): void {
+    if (!template || !template.template_id || !Array.isArray(template.checks)) {
+      this.logger.warn('Invalid compliance template received', {
+        has_id: !!template?.template_id,
+        has_checks: Array.isArray(template?.checks),
+      });
+      return;
+    }
+    this.logger.info('Compliance template received', {
+      template_id: template.template_id,
+      version: template.template_version,
+      checks: template.checks.length,
+    });
+    this.complianceScanner.updateTemplate(template);
+  }
+
+  private handleComplianceReport(report: ComplianceReport): void {
+    this.logger.info('Compliance scan complete', {
+      report_id: report.report_id,
+      compliance: report.compliance_percentage.toFixed(1) + '%',
+      passed: report.passed,
+      failed: report.failed,
+      drift_events: report.drift_events.length,
+    });
+
+    const message = {
+      type: 'compliance_report',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      report,
+    };
+
+    if (!this.safeSend(JSON.stringify(message))) {
+      this.complianceScanner.queuePendingReport(message);
+    }
+
+    this.broadcastToAllClients({
+      type: 'compliance_report',
+      data: { report },
+    });
+  }
+
+  private handleComplianceDrift(drifts: ComplianceDriftEvent[]): void {
+    if (drifts.length === 0) return;
+
+    this.logger.warn('Compliance drift detected', {
+      count: drifts.length,
+      checks: drifts.map(d => d.check_id),
+      types: drifts.map(d => d.drift_type),
+    });
+
+    const message = {
+      type: 'compliance_drift',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      drift_events: drifts,
+    };
+
+    if (!this.safeSend(JSON.stringify(message))) {
+      this.complianceScanner.queuePendingReport(message);
+    }
+
+    this.broadcastToAllClients({
+      type: 'compliance_drift',
+      data: { drift_events: drifts },
+    });
+  }
+
+  private async executeComplianceEnforcement(check: ComplianceCheck): Promise<{ success: boolean; error?: string }> {
+    const signalId = `compliance:${check.check_id}`;
+    const playbookId = `compliance-enforce-${check.check_id}`;
+    const resourceName = check.check_id;
+    const deviceId = os.hostname();
+
+    // Step 1: Check remediation memory dampening
+    const memoryCheck = this.remediationMemory.shouldAttemptRemediation(
+      signalId, deviceId, playbookId, resourceName
+    );
+    if (!memoryCheck.allowed) {
+      this.logger.info('Compliance enforcement dampened', {
+        check_id: check.check_id,
+        reason: memoryCheck.reason,
+      });
+      return { success: false, error: `dampened: ${memoryCheck.reason}` };
+    }
+
+    if (!check.remediation_command) {
+      return { success: false, error: 'No remediation command defined' };
+    }
+
+    // Step 2: Build and execute remediation playbook
+    const playbook = {
+      id: playbookId,
+      name: `Compliance: ${check.name}`,
+      priority: (check.severity === 'critical' ? 'critical' : check.severity === 'high' ? 'high' : 'medium') as 'critical' | 'high' | 'medium' | 'low',
+      source: 'local' as const,
+      steps: [{
+        type: 'powershell' as const,
+        action: check.remediation_command,
+        params: {},
+        timeout: check.remediation_timeout_ms || 60000,
+      }],
+      createdAt: new Date(),
+    };
+
+    const startTime = Date.now();
+    try {
+      await this.executePlaybook(playbook);
+
+      // Step 3: Re-verify
+      const recheck = securePowerShell(check.command, { timeout: check.timeout_ms || 30000 });
+      const passed = this.complianceScanner.compareValue(
+        recheck.stdout, check.expected_value, check.comparison
+      );
+
+      // Step 4: Record in remediation memory
+      const duration = Date.now() - startTime;
+      this.remediationMemory.recordAttempt(
+        playbookId, signalId, deviceId,
+        passed ? 'success' : 'failure', duration,
+        passed ? undefined : 'Re-verification failed after enforcement',
+        resourceName
+      );
+
+      return { success: passed, error: passed ? undefined : 'Re-verification failed after enforcement' };
+    } catch (err: any) {
+      const duration = Date.now() - startTime;
+      this.remediationMemory.recordAttempt(
+        playbookId, signalId, deviceId, 'failure', duration,
+        err.message || 'Enforcement execution failed', resourceName
+      );
+      return { success: false, error: err.message || 'Enforcement execution failed' };
+    }
+  }
+
+  // ============================
+  // VERIFICATION & ROLLBACK
+  // ============================
+
+  private async handleVerificationRequest(data: any): Promise<void> {
+    const requestId = data.request_id;
+    const delayMs = data.delay_ms || 0;
+    const checks: Array<{ check_id: string; command: string; expected_value: string; comparison: string }> = data.checks || [];
+    const maxRetries = data.max_retries || 0;
+
+    this.logger.info('Verification request received', {
+      request_id: requestId,
+      delay_ms: delayMs,
+      checks_count: checks.length,
+      max_retries: maxRetries,
+    });
+
+    if (!requestId || checks.length === 0) {
+      this.logger.warn('Invalid verification request — missing request_id or checks');
+      return;
+    }
+
+    // Wait the requested delay before starting checks
+    if (delayMs > 0) {
+      this.logger.info(`Verification waiting ${delayMs}ms before starting checks`, { request_id: requestId });
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+
+    const results: Array<{
+      check_id: string;
+      status: 'pass' | 'fail' | 'error';
+      expected_value: string;
+      actual_value: string;
+      attempts: number;
+      error_message?: string;
+    }> = [];
+
+    for (const check of checks) {
+      let lastActual = '';
+      let lastError: string | undefined;
+      let passed = false;
+      const attempts = maxRetries + 1;
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const result = securePowerShell(check.command, { timeout: 30000 });
+          lastActual = result.stdout.trim();
+
+          if (!result.success) {
+            lastError = result.stderr || 'PowerShell execution failed';
+            this.logger.warn('Verification check execution failed', {
+              request_id: requestId,
+              check_id: check.check_id,
+              attempt,
+              error: lastError,
+            });
+          } else {
+            lastError = undefined;
+            const comparison = (check.comparison || 'equals') as 'equals' | 'not_equals' | 'contains' | 'regex' | 'greater_than' | 'less_than';
+            passed = this.complianceScanner.compareValue(lastActual, check.expected_value, comparison);
+          }
+        } catch (err: any) {
+          lastActual = '';
+          lastError = err.message || 'Unexpected error';
+          this.logger.error('Verification check threw', {
+            request_id: requestId,
+            check_id: check.check_id,
+            attempt,
+            error: lastError,
+          });
+        }
+
+        if (passed) break;
+
+        // Wait 10s between retries
+        if (attempt < attempts) {
+          this.logger.info('Verification check failed, retrying in 10s', {
+            request_id: requestId,
+            check_id: check.check_id,
+            attempt,
+            max_attempts: attempts,
+          });
+          await new Promise(resolve => setTimeout(resolve, 10000));
+        }
+      }
+
+      results.push({
+        check_id: check.check_id,
+        status: lastError ? 'error' : (passed ? 'pass' : 'fail'),
+        expected_value: check.expected_value,
+        actual_value: lastActual,
+        attempts,
+        ...(lastError && { error_message: lastError }),
+      });
+    }
+
+    const allPassed = results.every(r => r.status === 'pass');
+
+    const message = {
+      type: 'verification_result',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      request_id: requestId,
+      overall_status: allPassed ? 'pass' : 'fail',
+      results,
+    };
+
+    this.logger.info('Verification complete', {
+      request_id: requestId,
+      overall_status: message.overall_status,
+      passed: results.filter(r => r.status === 'pass').length,
+      failed: results.filter(r => r.status !== 'pass').length,
+    });
+
+    if (!this.safeSend(JSON.stringify(message))) {
+      this.logger.warn('WebSocket not connected — verification result lost', { request_id: requestId });
+    }
+  }
+
+  private async handleRollbackPlaybook(data: any): Promise<void> {
+    const playbook = data.playbook || data;
+    const playbookId = playbook.id || playbook.playbook_id || `rollback-${Date.now()}`;
+    const playbookName = playbook.name || 'Rollback Playbook';
+    const steps: PlaybookStep[] = playbook.steps || [];
+
+    this.logger.info('Rollback playbook received', {
+      playbook_id: playbookId,
+      name: playbookName,
+      steps_count: steps.length,
+    });
+
+    if (steps.length === 0) {
+      this.logger.warn('Rollback playbook has no steps', { playbook_id: playbookId });
+      return;
+    }
+
+    const startTime = Date.now();
+    const stepResults: Array<{ step_index: number; type: string; action: string; status: string; error?: string }> = [];
+    let overallStatus = 'success';
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      try {
+        await this.executeStep(step);
+        stepResults.push({
+          step_index: i,
+          type: step.type,
+          action: step.action,
+          status: 'success',
+        });
+        this.logger.info('Rollback step completed', {
+          playbook_id: playbookId,
+          step_index: i,
+          type: step.type,
+          action: step.action,
+        });
+      } catch (err: any) {
+        overallStatus = 'partial_failure';
+        stepResults.push({
+          step_index: i,
+          type: step.type,
+          action: step.action,
+          status: 'failure',
+          error: err.message || 'Unknown error',
+        });
+        this.logger.warn('Rollback step failed — continuing', {
+          playbook_id: playbookId,
+          step_index: i,
+          type: step.type,
+          action: step.action,
+          error: err.message,
+        });
+        // Never throw — continue to next step
+      }
+    }
+
+    const durationMs = Date.now() - startTime;
+
+    const message = {
+      type: 'playbook_result',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      playbook_id: playbookId,
+      playbook_name: playbookName,
+      status: overallStatus,
+      is_rollback: true,
+      execution_time_ms: durationMs,
+      steps_total: steps.length,
+      steps_executed: stepResults.length,
+      step_results: stepResults,
+      source: playbook.source || 'server',
+    };
+
+    this.logger.info('Rollback playbook complete', {
+      playbook_id: playbookId,
+      status: overallStatus,
+      duration_ms: durationMs,
+      steps_succeeded: stepResults.filter(s => s.status === 'success').length,
+      steps_failed: stepResults.filter(s => s.status === 'failure').length,
+    });
+
+    if (!this.safeSend(JSON.stringify(message))) {
+      this.pendingPlaybookResults.push(message);
+      this.savePendingPlaybookResults();
+      this.logger.warn('WebSocket not connected — queued rollback result for retry', {
+        playbook_id: playbookId,
+      });
     }
   }
 
@@ -2132,6 +2584,36 @@ class OPSISAgentService {
             type: 'baseline-stored',
             data: { status: data.status, baseline_name: data.baseline_name, summary: data.summary }
           });
+          break;
+
+        case 'request_environment_scan':
+          this.logger.info('Server requested environment scan');
+          this.environmentIntelligence.runFullScan().then(() => {
+            this.sendEnvironmentSnapshot();
+          }).catch(err => this.logger.error('Server-requested environment scan failed', err));
+          break;
+
+        case 'compliance_template':
+          this.handleComplianceTemplate(data.template || data.data);
+          break;
+
+        case 'request_compliance_scan':
+          this.logger.info('Server requested compliance scan');
+          this.complianceScanner.runScan().catch(err =>
+            this.logger.error('Server-requested compliance scan failed', err)
+          );
+          break;
+
+        case 'verification_request':
+          this.handleVerificationRequest(data).catch(err =>
+            this.logger.error('Verification request failed', err)
+          );
+          break;
+
+        case 'rollback_playbook':
+          this.handleRollbackPlaybook(data).catch(err =>
+            this.logger.error('Rollback playbook failed', err)
+          );
           break;
 
         default:
@@ -4023,6 +4505,14 @@ class OPSISAgentService {
       return;
     }
 
+    // Environment Intelligence: trigger incremental scan on service/network state changes
+    if (stateChange.isNewState && (resourceType === 'service' || resourceType === 'network')) {
+      const envSection = resourceType === 'service' ? 'services' : 'network';
+      this.environmentIntelligence.runIncrementalCheck(envSection).catch(err =>
+        this.logger.warn('Incremental environment check failed', { section: envSection, error: err })
+      );
+    }
+
     // Gate 3: Dependency awareness — suppress downstream service alerts
     if (signal.category === 'services' && signal.metadata?.serviceName) {
       const depCheck = this.stateTracker.isDownstreamOfDownParent(signal.metadata.serviceName);
@@ -4096,6 +4586,16 @@ class OPSISAgentService {
       severity: signature.severity,
       correlation: correlation?.ruleId || null
     });
+
+    // Gate 5: Ticket deduplication — skip if open ticket exists for same signature
+    const existingTicket = this.ticketDb.findOpenTicketBySignature(signature.signature_id);
+    if (existingTicket) {
+      this.logger.debug('Open ticket already exists for this signature, skipping', {
+        existingTicketId: existingTicket.ticket_id,
+        signature_id: signature.signature_id
+      });
+      return;
+    }
 
     // Create playbook for system signal if possible
     const playbook = this.createPlaybookForSystemSignal(signal);
@@ -4480,6 +4980,7 @@ class OPSISAgentService {
       source: 'monitoring',
       computer_name: os.hostname(),
       escalated: 1,
+      signature_id: signature.signature_id,
       diagnostic_summary: `Detected symptoms: ${symptoms}\nAffected targets: ${targets}\nConfidence: ${signature.confidence_local}%`,
       recommended_action: 'Manual review required — no automated remediation available',
       resolution_category: 'escalated'
@@ -4747,22 +5248,30 @@ class OPSISAgentService {
 
     const signalId = (playbook as any).signalId || playbook.id;
     const deviceId = os.hostname();
+    const overrideDampening = (playbook as any).override_dampening === true;
 
-    const memoryCheck = this.remediationMemory.shouldAttemptRemediation(
-      signalId,
-      deviceId,
-      playbook.id
-    );
-    
-    if (!memoryCheck.allowed) {
-      this.logger.warn('Remediation blocked by memory system', {
+    if (overrideDampening) {
+      this.logger.info('Dampening override active — skipping remediation memory check', {
         playbookId: playbook.id,
-        reason: memoryCheck.reason
+        signalId,
       });
+    } else {
+      const memoryCheck = this.remediationMemory.shouldAttemptRemediation(
+        signalId,
+        deviceId,
+        playbook.id
+      );
 
-      this.reportPlaybookResult(playbook.id, 'skipped', memoryCheck.reason);
-      this.sendPlaybookResult(playbook, 'skipped', 0, memoryCheck.reason);
-      return;
+      if (!memoryCheck.allowed) {
+        this.logger.warn('Remediation blocked by memory system', {
+          playbookId: playbook.id,
+          reason: memoryCheck.reason
+        });
+
+        this.reportPlaybookResult(playbook.id, 'skipped', memoryCheck.reason);
+        this.sendPlaybookResult(playbook, 'skipped', 0, memoryCheck.reason);
+        return;
+      }
     }
 
     if (this.playbookQueue.length >= 50) {
@@ -4817,6 +5326,13 @@ class OPSISAgentService {
 
         // Refresh software inventory after successful playbook (may have installed/removed software)
         setTimeout(() => this.sendSoftwareInventory(), 5000);
+
+        // Trigger environment rescan after playbook (services/software may have changed)
+        setTimeout(() => {
+          this.environmentIntelligence.runFullScan().catch(err =>
+            this.logger.warn('Post-playbook environment scan failed', err)
+          );
+        }, 60000);
 
         this.remediationMemory.recordAttempt(
           playbook.id,

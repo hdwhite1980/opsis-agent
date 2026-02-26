@@ -361,7 +361,7 @@ function isSymlink(filePath: string): boolean {
 // SECURE COMMAND EXECUTION
 // ===========================================
 
-interface SecureExecOptions {
+export interface SecureExecOptions {
   timeout?: number;
   cwd?: string;
 }
@@ -386,7 +386,7 @@ function secureExec(command: string, args: string[], options: SecureExecOptions 
 }
 
 // Execute PowerShell command securely
-function securePowerShell(script: string, options: SecureExecOptions = {}): { stdout: string; stderr: string; success: boolean } {
+export function securePowerShell(script: string, options: SecureExecOptions = {}): { stdout: string; stderr: string; success: boolean } {
   // Use -NoProfile -NonInteractive for security
   // -EncodedCommand with Base64 prevents injection
   const encodedCommand = Buffer.from(script, 'utf16le').toString('base64');

@@ -144,6 +144,8 @@ Filename: "cmd.exe"; Parameters: "/c start http://localhost:19851"; Description:
 ; Stop and uninstall service
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "stop"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "StopService"
 Filename: "{app}\service\OpsisAgentService.exe"; Parameters: "uninstall"; WorkingDir: "{app}\service"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallService"
+; Fallback: ensure service is deleted from SCM even if WinSW uninstall fails
+Filename: "sc.exe"; Parameters: "delete OpsisAgentService"; Flags: runhidden waituntilterminated; RunOnceId: "ScDeleteService"
 ; Remove stored credentials from Credential Manager (cmdkey-stored + keytar-stored)
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\remove-credentials.ps1"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteCreds"
 ; Remove OPSIS registry keys
