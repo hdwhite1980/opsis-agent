@@ -52,6 +52,49 @@ export class SystemMonitor {
   private readonly CRITICAL_CEILING_MEMORY = 95;
   private readonly CRITICAL_CEILING_DISK_FREE = 3;
 
+  // Common BSOD bugcheck codes → human-readable names
+  private static readonly BUGCHECK_NAMES: Record<number, string> = {
+    0x0A: 'IRQL_NOT_LESS_OR_EQUAL',
+    0x1E: 'KMODE_EXCEPTION_NOT_HANDLED',
+    0x24: 'NTFS_FILE_SYSTEM',
+    0x2E: 'DATA_BUS_ERROR',
+    0x3B: 'SYSTEM_SERVICE_EXCEPTION',
+    0x3F: 'NO_MORE_SYSTEM_PTES',
+    0x44: 'MULTIPLE_IRP_COMPLETE_REQUESTS',
+    0x4E: 'PFN_LIST_CORRUPT',
+    0x50: 'PAGE_FAULT_IN_NONPAGED_AREA',
+    0x51: 'REGISTRY_ERROR',
+    0x7A: 'KERNEL_DATA_INPAGE_ERROR',
+    0x7B: 'INACCESSIBLE_BOOT_DEVICE',
+    0x7E: 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED',
+    0x7F: 'UNEXPECTED_KERNEL_MODE_TRAP',
+    0x9F: 'DRIVER_POWER_STATE_FAILURE',
+    0xA0: 'INTERNAL_POWER_ERROR',
+    0xBE: 'ATTEMPTED_WRITE_TO_READONLY_MEMORY',
+    0xC1: 'SPECIAL_POOL_DETECTED_MEMORY_CORRUPTION',
+    0xC2: 'BAD_POOL_CALLER',
+    0xC4: 'DRIVER_VERIFIER_DETECTED_VIOLATION',
+    0xC5: 'DRIVER_CORRUPTED_EXPOOL',
+    0xCE: 'DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS',
+    0xD1: 'DRIVER_IRQL_NOT_LESS_OR_EQUAL',
+    0xD5: 'DRIVER_PAGE_FAULT_IN_FREED_SPECIAL_POOL',
+    0xEF: 'CRITICAL_PROCESS_DIED',
+    0xF4: 'CRITICAL_OBJECT_TERMINATION',
+    0xFC: 'ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY',
+    0x100000EA: 'THREAD_STUCK_IN_DEVICE_DRIVER',
+    0x133: 'DPC_WATCHDOG_VIOLATION',
+    0x139: 'KERNEL_SECURITY_CHECK_FAILURE',
+    0x1A: 'MEMORY_MANAGEMENT',
+    0x19: 'BAD_POOL_HEADER',
+    0xC9: 'DRIVER_VERIFIER_IOMANAGER_VIOLATION',
+    0x1000007E: 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED_M',
+    0x10000050: 'PAGE_FAULT_IN_NONPAGED_AREA_M',
+  };
+
+  private getBugCheckName(code: number): string {
+    return SystemMonitor.BUGCHECK_NAMES[code] || `UNKNOWN_BUGCHECK_0x${code.toString(16).toUpperCase()}`;
+  }
+
   // Server-configurable thresholds (defaults overridden by welcome message)
   private thresholds = {
     cpu_warning: 75,
@@ -1727,37 +1770,115 @@ export class SystemMonitor {
 
   private async monitorCrashDumps(): Promise<void> {
     try {
-      // Check for recent minidumps (last 24 hours)
-      const { stdout: minidumps } = await execAsync(
-        `powershell -NoProfile -Command "Get-ChildItem 'C:\\Windows\\Minidump' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-24) } | Select-Object Name,LastWriteTime,Length | ConvertTo-Json -Compress"`,
-        { timeout: 10000 }
-      );
+      // Run all 3 diagnostic queries in parallel for speed
+      const [werResult, dumpHeaderResult, kernelPowerResult] = await Promise.all([
+        // 1. WER BugCheck events with structured properties (bugcheck code + 4 params + dump path)
+        execAsync(
+          `powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'} -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-24) } | Select-Object TimeCreated, @{N='BugCheckCode';E={$_.Properties[0].Value}}, @{N='Param1';E={$_.Properties[1].Value}}, @{N='Param2';E={$_.Properties[2].Value}}, @{N='Param3';E={$_.Properties[3].Value}}, @{N='Param4';E={$_.Properties[4].Value}}, @{N='DumpPath';E={$_.Properties[5].Value}}, @{N='Msg';E={$_.Message.Substring(0, [Math]::Min(300, $_.Message.Length))}} | ConvertTo-Json -Compress"`,
+          { timeout: 10000 }
+        ).catch(() => ({ stdout: '' })),
 
-      // Check for BugCheck events in System log (last 24 hours)
-      const { stdout: bugchecks } = await execAsync(
-        `powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'} -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-24) } | Select-Object TimeCreated,Message | ConvertTo-Json -Compress"`,
-        { timeout: 10000 }
-      );
+        // 2. Minidump header binary parsing — read first 72 bytes to extract bugcheck code + params
+        execAsync(
+          `powershell -NoProfile -Command "$dumps = Get-ChildItem 'C:\\Windows\\Minidump\\*.dmp' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3; $results = @(); foreach ($d in $dumps) { try { $bytes = New-Object byte[] 72; $fs = [System.IO.File]::OpenRead($d.FullName); $fs.Read($bytes, 0, 72) | Out-Null; $fs.Close(); $bc = [BitConverter]::ToUInt32($bytes, 0x20); $results += [PSCustomObject]@{ File=$d.Name; Size=$d.Length; Date=$d.LastWriteTime.ToString('o'); BugCheckCode=$bc; Param1=[BitConverter]::ToUInt64($bytes, 0x28); Param2=[BitConverter]::ToUInt64($bytes, 0x30); Param3=[BitConverter]::ToUInt64($bytes, 0x38); Param4=[BitConverter]::ToUInt64($bytes, 0x40) } } catch {} }; if ($results.Count -gt 0) { $results | ConvertTo-Json -Compress } else { '[]' }"`,
+          { timeout: 10000 }
+        ).catch(() => ({ stdout: '' })),
 
-      let dumpCount = 0;
+        // 3. Kernel-Power event ID 41 — unexpected shutdown context
+        execAsync(
+          `powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41} -MaxEvents 5 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-24) } | Select-Object TimeCreated, @{N='Msg';E={$_.Message.Substring(0, [Math]::Min(300, $_.Message.Length))}} | ConvertTo-Json -Compress"`,
+          { timeout: 10000 }
+        ).catch(() => ({ stdout: '' }))
+      ]);
+
+      // Parse WER bugcheck events
+      const bugchecks: Array<{
+        timestamp: string; bugcheck_code: string; bugcheck_name: string;
+        param1: string; param2: string; param3: string; param4: string;
+        dump_path?: string; source: string;
+      }> = [];
+
+      if (werResult.stdout.trim()) {
+        const werEvents = Array.isArray(JSON.parse(werResult.stdout.trim()))
+          ? JSON.parse(werResult.stdout.trim())
+          : [JSON.parse(werResult.stdout.trim())];
+
+        for (const evt of werEvents) {
+          const codeStr = String(evt.BugCheckCode || '').trim();
+          // WER Properties[0] is the bugcheck code as hex string (e.g. "0x0000009f")
+          const codeNum = codeStr.startsWith('0x') ? parseInt(codeStr, 16) : parseInt(codeStr, 10);
+          const codeHex = isNaN(codeNum) ? codeStr : `0x${codeNum.toString(16).toUpperCase()}`;
+
+          bugchecks.push({
+            timestamp: this.parsePSDate(evt.TimeCreated),
+            bugcheck_code: codeHex,
+            bugcheck_name: isNaN(codeNum) ? 'UNKNOWN' : this.getBugCheckName(codeNum),
+            param1: this.formatHexParam(evt.Param1),
+            param2: this.formatHexParam(evt.Param2),
+            param3: this.formatHexParam(evt.Param3),
+            param4: this.formatHexParam(evt.Param4),
+            dump_path: evt.DumpPath || undefined,
+            source: 'wer_event'
+          });
+        }
+      }
+
+      // Parse minidump headers
       let dumpFiles: string[] = [];
 
-      if (minidumps.trim()) {
-        const dumps = Array.isArray(JSON.parse(minidumps.trim())) ? JSON.parse(minidumps.trim()) : [JSON.parse(minidumps.trim())];
-        dumpCount = dumps.length;
-        dumpFiles = dumps.map((d: any) => d.Name);
+      if (dumpHeaderResult.stdout.trim() && dumpHeaderResult.stdout.trim() !== '[]') {
+        const dumpHeaders = Array.isArray(JSON.parse(dumpHeaderResult.stdout.trim()))
+          ? JSON.parse(dumpHeaderResult.stdout.trim())
+          : [JSON.parse(dumpHeaderResult.stdout.trim())];
+
+        for (const hdr of dumpHeaders) {
+          dumpFiles.push(hdr.File);
+          const codeNum = typeof hdr.BugCheckCode === 'number' ? hdr.BugCheckCode : parseInt(hdr.BugCheckCode, 10);
+          const codeHex = isNaN(codeNum) ? '0x0' : `0x${codeNum.toString(16).toUpperCase()}`;
+
+          // Only add if not already covered by a WER event with the same code+timestamp
+          const isDuplicate = bugchecks.some(bc => bc.bugcheck_code === codeHex);
+          if (!isDuplicate) {
+            bugchecks.push({
+              timestamp: this.parsePSDate(hdr.Date),
+              bugcheck_code: codeHex,
+              bugcheck_name: isNaN(codeNum) ? 'UNKNOWN' : this.getBugCheckName(codeNum),
+              param1: this.formatHexParam(hdr.Param1),
+              param2: this.formatHexParam(hdr.Param2),
+              param3: this.formatHexParam(hdr.Param3),
+              param4: this.formatHexParam(hdr.Param4),
+              dump_path: hdr.File,
+              source: 'minidump_header'
+            });
+          }
+        }
       }
 
-      let bugcheckCount = 0;
-      let bugcheckMessages: string[] = [];
+      // Parse Kernel-Power events
+      const kernelPowerEvents: Array<{ timestamp: string; message: string }> = [];
 
-      if (bugchecks.trim()) {
-        const checks = Array.isArray(JSON.parse(bugchecks.trim())) ? JSON.parse(bugchecks.trim()) : [JSON.parse(bugchecks.trim())];
-        bugcheckCount = checks.length;
-        bugcheckMessages = checks.map((c: any) => (c.Message || '').substring(0, 200));
+      if (kernelPowerResult.stdout.trim()) {
+        const kpEvents = Array.isArray(JSON.parse(kernelPowerResult.stdout.trim()))
+          ? JSON.parse(kernelPowerResult.stdout.trim())
+          : [JSON.parse(kernelPowerResult.stdout.trim())];
+
+        for (const kp of kpEvents) {
+          kernelPowerEvents.push({
+            timestamp: this.parsePSDate(kp.TimeCreated),
+            message: (kp.Msg || '').substring(0, 300)
+          });
+        }
       }
 
-      if (dumpCount > 0 || bugcheckCount > 0) {
+      const dumpCount = dumpFiles.length;
+      const bugcheckCount = bugchecks.length;
+
+      if (dumpCount > 0 || bugcheckCount > 0 || kernelPowerEvents.length > 0) {
+        // Sort bugchecks newest first
+        bugchecks.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+        const primary = bugchecks[0];
+
         this.emitSignal({
           id: 'bsod-detected',
           category: 'hardware',
@@ -1765,20 +1886,25 @@ export class SystemMonitor {
           metric: 'crash_dump',
           value: dumpCount + bugcheckCount,
           threshold: 0,
-          message: `BSOD detected: ${dumpCount} crash dump(s), ${bugcheckCount} BugCheck event(s) in last 24 hours`,
+          message: primary
+            ? `BSOD: ${primary.bugcheck_name} (${primary.bugcheck_code}) — ${dumpCount} dump(s), ${bugcheckCount} bugcheck(s) in last 24h`
+            : `BSOD detected: ${dumpCount} crash dump(s), ${kernelPowerEvents.length} unexpected shutdown(s) in last 24 hours`,
           timestamp: new Date(),
           metadata: {
             dumpFiles,
             dumpCount,
             bugcheckCount,
-            bugcheckMessages
+            bugcheckMessages: bugchecks.map(bc => `${bc.bugcheck_name} (${bc.bugcheck_code})`)
           },
           details: {
             dump_count: dumpCount,
             bugcheck_count: bugcheckCount,
-            total_events: dumpCount + bugcheckCount,
+            total_events: dumpCount + bugcheckCount + kernelPowerEvents.length,
             dump_files: dumpFiles,
-            bugcheck_messages: bugcheckMessages
+            bugchecks,
+            kernel_power_events: kernelPowerEvents,
+            primary_bugcheck_code: primary?.bugcheck_code,
+            primary_bugcheck_name: primary?.bugcheck_name
           },
           componentType: 'motherboard'
         });
@@ -1786,6 +1912,29 @@ export class SystemMonitor {
     } catch (error) {
       this.logger.debug('Crash dump monitoring error', error);
     }
+  }
+
+  private formatHexParam(value: any): string {
+    if (value == null) return '0x0';
+    if (typeof value === 'string') {
+      if (value.startsWith('0x') || value.startsWith('0X')) return value;
+      const num = parseInt(value, 10);
+      return isNaN(num) ? value : `0x${num.toString(16).toUpperCase()}`;
+    }
+    if (typeof value === 'number') return `0x${value.toString(16).toUpperCase()}`;
+    return String(value);
+  }
+
+  /** Parse PowerShell JSON date formats: /Date(ms)/, ISO strings, or arbitrary strings */
+  private parsePSDate(value: any): string {
+    if (!value) return new Date().toISOString();
+    const str = String(value);
+    // Handle /Date(1234567890123)/ format from ConvertTo-Json
+    const dateMatch = str.match(/\/Date\((\d+)\)\//);
+    if (dateMatch) return new Date(parseInt(dateMatch[1], 10)).toISOString();
+    // Try direct parse
+    const d = new Date(str);
+    return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
   }
 
   // ============================================
