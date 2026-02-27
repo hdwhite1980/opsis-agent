@@ -186,6 +186,12 @@ export class SystemMonitor {
           threshold: this.thresholds.cpu_critical,
           message: `CPU usage sustained critically high: ${cpuUsage.toFixed(1)}%`,
           timestamp: new Date(),
+          details: {
+            cpu_percent: parseFloat(cpuUsage.toFixed(1)),
+            threshold_percent: this.thresholds.cpu_critical,
+            cpu_count: os.cpus().length,
+            cpu_model: os.cpus()[0]?.model
+          },
           eventId: 2001,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -199,6 +205,12 @@ export class SystemMonitor {
           threshold: this.thresholds.cpu_warning,
           message: `CPU usage sustained elevated: ${cpuUsage.toFixed(1)}%`,
           timestamp: new Date(),
+          details: {
+            cpu_percent: parseFloat(cpuUsage.toFixed(1)),
+            threshold_percent: this.thresholds.cpu_warning,
+            cpu_count: os.cpus().length,
+            cpu_model: os.cpus()[0]?.model
+          },
           eventId: 2002,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -330,6 +342,13 @@ export class SystemMonitor {
             freeGB: (freeMem / 1024 / 1024 / 1024).toFixed(2),
             usedGB: (usedMem / 1024 / 1024 / 1024).toFixed(2)
           },
+          details: {
+            used_percent: parseFloat(usedPercent.toFixed(1)),
+            total_gb: parseFloat((totalMem / 1024 / 1024 / 1024).toFixed(2)),
+            free_gb: parseFloat((freeMem / 1024 / 1024 / 1024).toFixed(2)),
+            used_gb: parseFloat((usedMem / 1024 / 1024 / 1024).toFixed(2)),
+            threshold_percent: this.thresholds.memory_critical
+          },
           eventId: 2010,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -343,6 +362,13 @@ export class SystemMonitor {
           threshold: this.thresholds.memory_warning,
           message: `Memory usage sustained high: ${usedPercent.toFixed(1)}%`,
           timestamp: new Date(),
+          details: {
+            used_percent: parseFloat(usedPercent.toFixed(1)),
+            total_gb: parseFloat((totalMem / 1024 / 1024 / 1024).toFixed(2)),
+            free_gb: parseFloat((freeMem / 1024 / 1024 / 1024).toFixed(2)),
+            used_gb: parseFloat((usedMem / 1024 / 1024 / 1024).toFixed(2)),
+            threshold_percent: this.thresholds.memory_warning
+          },
           eventId: 2011,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -538,6 +564,11 @@ export class SystemMonitor {
               health: disk.HealthStatus,
               status: disk.OperationalStatus
             },
+            details: {
+              disk_name: disk.FriendlyName,
+              health_status: disk.HealthStatus,
+              operational_status: disk.OperationalStatus
+            },
             eventId: 2022,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -577,6 +608,11 @@ export class SystemMonitor {
               status: battery.BatteryStatus,
               runtime: battery.EstimatedRunTime
             },
+            details: {
+              charge_percent: battery.EstimatedChargeRemaining,
+              battery_status: battery.BatteryStatus,
+              estimated_runtime_minutes: battery.EstimatedRunTime
+            },
             eventId: 2030,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -590,6 +626,11 @@ export class SystemMonitor {
             threshold: 25,
             message: `Battery low: ${battery.EstimatedChargeRemaining}%`,
             timestamp: new Date(),
+            details: {
+              charge_percent: battery.EstimatedChargeRemaining,
+              battery_status: battery.BatteryStatus,
+              estimated_runtime_minutes: battery.EstimatedRunTime
+            },
             eventId: 2031,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -795,6 +836,11 @@ export class SystemMonitor {
           message: `System uptime: ${Math.floor(uptimeHours / 24)} days - reboot recommended`,
           timestamp: new Date(),
           metadata: { uptimeDays: Math.floor(uptimeHours / 24) },
+          details: {
+            uptime_hours: Math.round(uptimeHours),
+            uptime_days: Math.floor(uptimeHours / 24),
+            threshold_days: 30
+          },
           eventId: 2050,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -824,6 +870,11 @@ export class SystemMonitor {
           value: true,
           message: 'System restart required to complete updates',
           timestamp: new Date(),
+          details: {
+            reboot_required: true,
+            reason: 'component_based_servicing',
+            uptime_hours: Math.round(os.uptime() / 3600)
+          },
           eventId: 2051,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -1347,6 +1398,18 @@ export class SystemMonitor {
             message: `Disk ${disk.FriendlyName} health status: ${disk.HealthStatus}`,
             timestamp: new Date(),
             metadata: meta,
+            details: {
+              disk_name: disk.FriendlyName,
+              device_id: diskId,
+              media_type: disk.MediaType,
+              health_status: disk.HealthStatus,
+              operational_status: disk.OperationalStatus,
+              read_errors: disk.ReadErrorsTotal || 0,
+              write_errors: disk.WriteErrorsTotal || 0,
+              temperature_c: disk.Temperature || 0,
+              wear_percent: disk.Wear || 0,
+              power_on_hours: disk.PowerOnHours || 0
+            },
             componentType: 'disk'
           });
         }
@@ -1364,6 +1427,15 @@ export class SystemMonitor {
             message: `Disk ${disk.FriendlyName} has ${totalErrors} SMART errors (read: ${disk.ReadErrorsTotal || 0}, write: ${disk.WriteErrorsTotal || 0})`,
             timestamp: new Date(),
             metadata: meta,
+            details: {
+              disk_name: disk.FriendlyName,
+              device_id: diskId,
+              media_type: disk.MediaType,
+              total_errors: totalErrors,
+              read_errors: disk.ReadErrorsTotal || 0,
+              write_errors: disk.WriteErrorsTotal || 0,
+              health_status: disk.HealthStatus
+            },
             componentType: 'disk'
           });
         }
@@ -1382,6 +1454,14 @@ export class SystemMonitor {
               message: `SSD ${disk.FriendlyName} wear level at ${wearPct}%`,
               timestamp: new Date(),
               metadata: meta,
+              details: {
+                disk_name: disk.FriendlyName,
+                device_id: diskId,
+                media_type: 'SSD',
+                wear_percent: wearPct,
+                power_on_hours: disk.PowerOnHours || 0,
+                health_status: disk.HealthStatus
+              },
               componentType: 'disk'
             });
           }
@@ -1401,6 +1481,14 @@ export class SystemMonitor {
               message: `Disk ${disk.FriendlyName} temperature: ${tempC}°C`,
               timestamp: new Date(),
               metadata: meta,
+              details: {
+                disk_name: disk.FriendlyName,
+                device_id: diskId,
+                media_type: disk.MediaType,
+                temperature_c: tempC,
+                threshold_c: 55,
+                health_status: disk.HealthStatus
+              },
               componentType: 'disk'
             });
           }
@@ -1419,6 +1507,15 @@ export class SystemMonitor {
             message: `Disk ${disk.FriendlyName} has ${disk.PowerOnHours} power-on hours`,
             timestamp: new Date(),
             metadata: meta,
+            details: {
+              disk_name: disk.FriendlyName,
+              device_id: diskId,
+              media_type: disk.MediaType,
+              power_on_hours: disk.PowerOnHours,
+              power_on_years: parseFloat((disk.PowerOnHours / 8760).toFixed(1)),
+              health_status: disk.HealthStatus,
+              wear_percent: disk.Wear || 0
+            },
             componentType: 'disk'
           });
         }
@@ -1459,6 +1556,12 @@ export class SystemMonitor {
             message: `CPU temperature critically high: ${tempC}°C`,
             timestamp: new Date(),
             metadata: { zone: zoneName, temperatureC: tempC },
+            details: {
+              temperature_c: tempC,
+              threshold_c: 90,
+              thermal_zone: zoneName,
+              cpu_model: os.cpus()[0]?.model
+            },
             componentType: 'cpu'
           });
         } else if (this.isSustainedBreach(`cpu-temp-high-${zoneName}`, tempC > 80)) {
@@ -1472,6 +1575,12 @@ export class SystemMonitor {
             message: `CPU temperature elevated: ${tempC}°C`,
             timestamp: new Date(),
             metadata: { zone: zoneName, temperatureC: tempC },
+            details: {
+              temperature_c: tempC,
+              threshold_c: 80,
+              thermal_zone: zoneName,
+              cpu_model: os.cpus()[0]?.model
+            },
             componentType: 'cpu'
           });
         }
@@ -1506,6 +1615,13 @@ export class SystemMonitor {
             errorCount: events.length,
             latestError: events[0]?.Message?.substring(0, 200) || 'Unknown',
             eventIds: events.map((e: any) => e.Id)
+          },
+          details: {
+            error_count: events.length,
+            error_source: 'WHEA-Logger',
+            latest_error: events[0]?.Message?.substring(0, 200) || 'Unknown',
+            event_ids: events.map((e: any) => e.Id),
+            total_memory_gb: parseFloat((os.totalmem() / 1024 / 1024 / 1024).toFixed(2))
           },
           componentType: 'memory'
         });
@@ -1566,6 +1682,14 @@ export class SystemMonitor {
               writeLatencyMs: metrics.writeLatency?.toFixed(1),
               throughputBps: metrics.throughput
             },
+            details: {
+              disk_instance: instance,
+              max_latency_ms: parseFloat(maxLatency.toFixed(1)),
+              read_latency_ms: metrics.readLatency != null ? parseFloat(metrics.readLatency.toFixed(1)) : undefined,
+              write_latency_ms: metrics.writeLatency != null ? parseFloat(metrics.writeLatency.toFixed(1)) : undefined,
+              throughput_bps: metrics.throughput || 0,
+              threshold_ms: 100
+            },
             componentType: 'disk'
           });
         } else if (this.isSustainedBreach(`disk-io-warning-${instance}`, maxLatency > 20)) {
@@ -1583,6 +1707,14 @@ export class SystemMonitor {
               readLatencyMs: metrics.readLatency?.toFixed(1),
               writeLatencyMs: metrics.writeLatency?.toFixed(1),
               throughputBps: metrics.throughput
+            },
+            details: {
+              disk_instance: instance,
+              max_latency_ms: parseFloat(maxLatency.toFixed(1)),
+              read_latency_ms: metrics.readLatency != null ? parseFloat(metrics.readLatency.toFixed(1)) : undefined,
+              write_latency_ms: metrics.writeLatency != null ? parseFloat(metrics.writeLatency.toFixed(1)) : undefined,
+              throughput_bps: metrics.throughput || 0,
+              threshold_ms: 20
             },
             componentType: 'disk'
           });
@@ -1641,6 +1773,13 @@ export class SystemMonitor {
             bugcheckCount,
             bugcheckMessages
           },
+          details: {
+            dump_count: dumpCount,
+            bugcheck_count: bugcheckCount,
+            total_events: dumpCount + bugcheckCount,
+            dump_files: dumpFiles,
+            bugcheck_messages: bugcheckMessages
+          },
           componentType: 'motherboard'
         });
       }
@@ -1686,7 +1825,12 @@ export class SystemMonitor {
             threshold: 1,
             message: `NTP sync stale: last sync was ${Math.round(hoursSinceSync)} hours ago`,
             timestamp: new Date(),
-            metadata: { lastSync: lastSyncStr, hoursSinceSync: Math.round(hoursSinceSync) }
+            metadata: { lastSync: lastSyncStr, hoursSinceSync: Math.round(hoursSinceSync) },
+            details: {
+              hours_since_sync: Math.round(hoursSinceSync),
+              last_sync_time: lastSyncStr,
+              threshold_hours: 1
+            }
           });
           return;
         }
@@ -1707,7 +1851,11 @@ export class SystemMonitor {
             threshold: 30,
             message: `Clock drift detected: ${offsetSeconds.toFixed(1)}s offset from NTP server`,
             timestamp: new Date(),
-            metadata: { offsetSeconds }
+            metadata: { offsetSeconds },
+            details: {
+              offset_seconds: parseFloat(offsetSeconds.toFixed(1)),
+              threshold_seconds: 30
+            }
           });
           return;
         }
