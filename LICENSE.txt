@@ -1,9 +1,248 @@
-OPSIS Agent - License Agreement
+OPSIS AGENT - END USER LICENSE AGREEMENT
 
-Copyright (c) 2024 OPSIS
+Last Updated: February 27, 2026
 
-This software is proprietary and confidential.
-Unauthorized copying or distribution is prohibited.
+IMPORTANT: PLEASE READ THIS END USER LICENSE AGREEMENT ("AGREEMENT") CAREFULLY
+BEFORE INSTALLING OR USING THE OPSIS AGENT SOFTWARE. BY INSTALLING, COPYING, OR
+OTHERWISE USING THE SOFTWARE, YOU ("LICENSEE") AGREE TO BE BOUND BY THE TERMS OF
+THIS AGREEMENT. IF YOU DO NOT AGREE TO THESE TERMS, DO NOT INSTALL OR USE THE
+SOFTWARE.
 
-For licensing inquiries: contact@opsis.io
+This Agreement is a legal agreement between you (either an individual or a single
+entity) and OPSIS ("Licensor", "we", "us", or "our") for the OPSIS Agent software
+product, which includes the computer software, associated media, printed materials,
+and electronic documentation (collectively, the "Software").
 
+1. GRANT OF LICENSE
+
+   1.1. Subject to the terms of this Agreement and payment of applicable fees,
+   Licensor grants Licensee a limited, non-exclusive, non-transferable,
+   non-sublicensable license to install and use the Software on the number of
+   devices covered by the Licensee's active subscription or service agreement
+   with Licensor or an authorized Managed Service Provider ("MSP") partner.
+
+   1.2. The Software is licensed, not sold. Licensor reserves all rights not
+   expressly granted to Licensee.
+
+   1.3. This license is contingent upon the Licensee maintaining a valid and
+   current subscription or service agreement. Upon expiration or termination of
+   such agreement, the license to use the Software shall automatically terminate.
+
+2. PERMITTED USE
+
+   2.1. Licensee may install the Software on endpoint devices owned or managed
+   by Licensee, or on devices managed on behalf of Licensee by an authorized MSP
+   partner.
+
+   2.2. Licensee may use the Software solely for the purpose of monitoring,
+   managing, and remediating IT issues on authorized devices as part of the
+   Licensee's internal business operations.
+
+3. RESTRICTIONS
+
+   Licensee shall NOT:
+
+   3.1. Copy, modify, adapt, translate, reverse engineer, decompile, disassemble,
+   or create derivative works based on the Software, except to the extent
+   permitted by applicable law notwithstanding this restriction.
+
+   3.2. Rent, lease, loan, sell, sublicense, distribute, or otherwise transfer the
+   Software or any rights therein to any third party.
+
+   3.3. Remove, alter, or obscure any proprietary notices, labels, or marks on the
+   Software or documentation.
+
+   3.4. Use the Software to provide service bureau, time-sharing, or other
+   computer hosting services to third parties without prior written consent from
+   Licensor.
+
+   3.5. Use the Software in any manner that violates applicable local, state,
+   national, or international law or regulation.
+
+   3.6. Attempt to circumvent or disable any security, authentication, or
+   licensing mechanisms within the Software.
+
+   3.7. Use the Software to develop a competing product or service.
+
+4. AUTONOMOUS OPERATIONS
+
+   4.1. The Software is designed to autonomously monitor system health, detect
+   issues, and execute remediation actions on endpoint devices. By installing and
+   enabling autonomous remediation features, Licensee acknowledges and consents
+   to the Software performing automated actions including, but not limited to:
+
+       (a) Restarting Windows services;
+       (b) Terminating processes;
+       (c) Clearing temporary files and caches;
+       (d) Resetting network configurations;
+       (e) Modifying registry values as required for remediation;
+       (f) Initiating system restarts (with user notification).
+
+   4.2. The Software includes safety mechanisms including protected process and
+   service lists, risk classification, confidence thresholds, dampening controls,
+   and rollback capabilities. However, Licensor does not guarantee that automated
+   actions will not cause unintended effects on Licensee's systems.
+
+   4.3. Licensee may configure the Software to disable autonomous remediation,
+   in which case the Software will only monitor and report issues without taking
+   automated corrective action.
+
+5. DATA COLLECTION AND COMMUNICATION
+
+   5.1. The Software collects and transmits system telemetry data to the Licensor's
+   servers or to servers operated by an authorized MSP partner. This data includes
+   but is not limited to:
+
+       (a) System health metrics (CPU, memory, disk, network utilization);
+       (b) Windows service and process status;
+       (c) Event log entries relevant to system health;
+       (d) Software inventory;
+       (e) Hardware and operating system information;
+       (f) Logged-in user session information (username, session type);
+       (g) Remediation action results and diagnostic data.
+
+   5.2. The Software does not intentionally collect personal files, browsing
+   history, email content, passwords, or other personal data unrelated to system
+   management.
+
+   5.3. All communication between the Software and Licensor's servers is encrypted
+   and authenticated using industry-standard protocols.
+
+   5.4. Data collected by the Software is handled in accordance with Licensor's
+   Privacy Policy, available at https://opsisit.com/privacy or upon request at
+   info@opsisit.com.
+
+6. INTELLECTUAL PROPERTY
+
+   6.1. The Software, including all copies, modifications, enhancements, and
+   derivative works, and all intellectual property rights therein, are and shall
+   remain the exclusive property of Licensor.
+
+   6.2. This Agreement does not grant Licensee any rights to trademarks, service
+   marks, or trade names of Licensor.
+
+   6.3. Any feedback, suggestions, or improvements provided by Licensee regarding
+   the Software may be used by Licensor without obligation or compensation to
+   Licensee.
+
+7. UPDATES AND MODIFICATIONS
+
+   7.1. Licensor may, from time to time, provide updates, patches, or new versions
+   of the Software. Such updates may be installed automatically if the auto-update
+   feature is enabled.
+
+   7.2. Licensor reserves the right to modify, suspend, or discontinue any feature
+   or functionality of the Software at any time, with or without notice.
+
+   7.3. Continued use of the Software after any update constitutes acceptance of
+   any modified terms included with such update.
+
+8. TERM AND TERMINATION
+
+   8.1. This Agreement is effective from the date of installation and continues
+   until terminated.
+
+   8.2. Licensor may terminate this Agreement immediately if Licensee breaches any
+   term of this Agreement.
+
+   8.3. Licensee may terminate this Agreement at any time by uninstalling the
+   Software and destroying all copies in Licensee's possession.
+
+   8.4. Upon termination, Licensee must immediately cease all use of the Software
+   and uninstall it from all devices. Sections 6, 9, 10, 11, and 12 shall survive
+   termination.
+
+9. DISCLAIMER OF WARRANTIES
+
+   9.1. THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTY OF
+   ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED
+   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+   NON-INFRINGEMENT.
+
+   9.2. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE UNINTERRUPTED,
+   ERROR-FREE, SECURE, OR FREE OF VIRUSES OR OTHER HARMFUL COMPONENTS.
+
+   9.3. LICENSOR DOES NOT WARRANT THAT THE SOFTWARE WILL DETECT ALL SYSTEM ISSUES
+   OR THAT ALL AUTOMATED REMEDIATION ACTIONS WILL BE SUCCESSFUL OR FREE OF
+   UNINTENDED CONSEQUENCES.
+
+   9.4. LICENSEE ACKNOWLEDGES THAT THE SOFTWARE PERFORMS AUTOMATED SYSTEM
+   MODIFICATIONS AND ACCEPTS ALL RISKS ASSOCIATED WITH SUCH OPERATIONS.
+
+10. LIMITATION OF LIABILITY
+
+   10.1. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL
+   LICENSOR, ITS AFFILIATES, OFFICERS, DIRECTORS, EMPLOYEES, AGENTS, OR PARTNERS
+   BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE
+   DAMAGES, INCLUDING BUT NOT LIMITED TO DAMAGES FOR LOSS OF PROFITS, GOODWILL,
+   DATA, BUSINESS INTERRUPTION, OR OTHER INTANGIBLE LOSSES, ARISING OUT OF OR
+   RELATED TO THE USE OF OR INABILITY TO USE THE SOFTWARE, REGARDLESS OF THE
+   THEORY OF LIABILITY (CONTRACT, TORT, STRICT LIABILITY, OR OTHERWISE) AND EVEN
+   IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+   10.2. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR'S TOTAL
+   AGGREGATE LIABILITY ARISING OUT OF OR RELATED TO THIS AGREEMENT SHALL NOT
+   EXCEED THE AMOUNT PAID BY LICENSEE FOR THE SOFTWARE DURING THE TWELVE (12)
+   MONTHS IMMEDIATELY PRECEDING THE EVENT GIVING RISE TO THE CLAIM.
+
+   10.3. THE FOREGOING LIMITATIONS SHALL APPLY EVEN IF THE REMEDIES PROVIDED
+   HEREIN FAIL OF THEIR ESSENTIAL PURPOSE.
+
+11. INDEMNIFICATION
+
+   11.1. Licensee agrees to indemnify, defend, and hold harmless Licensor, its
+   affiliates, officers, directors, employees, and agents from and against any
+   and all claims, damages, losses, liabilities, costs, and expenses (including
+   reasonable attorneys' fees) arising out of or related to:
+
+       (a) Licensee's use of the Software in violation of this Agreement;
+       (b) Licensee's violation of any applicable law or regulation;
+       (c) Any unauthorized modification of the Software by Licensee.
+
+12. GENERAL PROVISIONS
+
+   12.1. GOVERNING LAW. This Agreement shall be governed by and construed in
+   accordance with the laws of the jurisdiction in which Licensor is incorporated,
+   without regard to its conflict of laws provisions.
+
+   12.2. ENTIRE AGREEMENT. This Agreement constitutes the entire agreement between
+   the parties with respect to the subject matter hereof and supersedes all prior
+   or contemporaneous agreements, representations, warranties, and understandings.
+
+   12.3. SEVERABILITY. If any provision of this Agreement is held to be
+   unenforceable or invalid, such provision shall be modified to the minimum
+   extent necessary to make it enforceable, and the remaining provisions shall
+   continue in full force and effect.
+
+   12.4. WAIVER. The failure of Licensor to exercise or enforce any right or
+   provision of this Agreement shall not constitute a waiver of such right or
+   provision.
+
+   12.5. ASSIGNMENT. Licensee may not assign or transfer this Agreement or any
+   rights hereunder without the prior written consent of Licensor. Licensor may
+   assign this Agreement without restriction.
+
+   12.6. NOTICES. All notices under this Agreement shall be in writing and sent
+   to:
+
+       OPSIS
+       Email: info@opsisit.com
+       Website: https://opsisit.com
+
+   12.7. EXPORT COMPLIANCE. Licensee shall comply with all applicable export and
+   import control laws and regulations in connection with the use of the Software.
+
+   12.8. THIRD-PARTY SOFTWARE. The Software may include or be distributed with
+   third-party open-source software components, each subject to its own license
+   terms. A list of such components and their licenses is available upon request.
+
+   12.9. FORCE MAJEURE. Licensor shall not be liable for any failure or delay in
+   performance due to circumstances beyond its reasonable control, including but
+   not limited to acts of God, natural disasters, war, terrorism, pandemic,
+   government actions, or failure of third-party services.
+
+BY INSTALLING OR USING THE OPSIS AGENT SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE
+READ THIS AGREEMENT, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS AND
+CONDITIONS.
+
+Copyright (c) 2026 OPSIS. All rights reserved.
