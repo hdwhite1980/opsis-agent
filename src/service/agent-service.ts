@@ -195,6 +195,17 @@ interface DeviceInfo {
   websocket_url?: string;
 }
 
+interface UserSession {
+  username: string;
+  upn: string;
+  display_name: string;
+  session_id: number;
+  session_type: 'console' | 'rdp' | 'other';
+  session_state: 'active' | 'disconnected' | 'locked';
+}
+
+type UserSessionEvent = 'login' | 'logout' | 'lock' | 'unlock' | 'rdp_connect' | 'rdp_disconnect';
+
 interface ServerConfig {
   monitoring: {
     heartbeat_interval: number;
@@ -338,6 +349,12 @@ class OPSISAgentService {
 
   // Compliance Scanner
   private complianceScanner!: ComplianceScanner;
+
+  // User session detection
+  private lastUserSessions: UserSession[] = [];
+  private userSessionTimer: NodeJS.Timeout | null = null;
+  private upnCache: Map<string, { upn: string; displayName: string }> = new Map();
+  private readonly USER_SESSION_POLL_MS = 60000;
 
   // Monitoring trap agent features
   private stateTracker!: StateTracker;
@@ -671,7 +688,25 @@ class OPSISAgentService {
         deploymentHealth: this.compatibilityReport,
         protectedApplications: this.protectedApplications,
         exclusions: this.loadExclusionsFile(),
-        ignoreList: this.loadIgnoreListFile()
+        ignoreList: this.loadIgnoreListFile(),
+        activeUser: (() => {
+          const user = this.getActiveUser();
+          return user ? {
+            username: user.username,
+            upn: user.upn,
+            display_name: user.display_name,
+            session_type: user.session_type,
+            session_state: user.session_state
+          } : null;
+        })(),
+        allSessions: this.lastUserSessions.map(s => ({
+          username: s.username,
+          upn: s.upn,
+          display_name: s.display_name,
+          session_id: s.session_id,
+          session_type: s.session_type,
+          session_state: s.session_state
+        }))
       }
     };
   }
@@ -1436,6 +1471,11 @@ class OPSISAgentService {
     await this.complianceScanner.start();
     this.log('Compliance scanner started');
 
+    // Start user session detection (60s polling)
+    this.checkUserSessionChanges();
+    this.userSessionTimer = setInterval(() => this.checkUserSessionChanges(), this.USER_SESSION_POLL_MS);
+    this.log('User session detection started');
+
     // Connect to server if configured
     const serverUrl = this.deviceInfo.websocket_url || this.config.serverUrl;
     if (serverUrl && this.config.autoConnect) {
@@ -1569,6 +1609,10 @@ class OPSISAgentService {
       clearInterval(this.dependencyRefreshTimer);
     }
 
+    if (this.userSessionTimer) {
+      clearInterval(this.userSessionTimer);
+    }
+
     if (this.maintenanceManager) {
       this.maintenanceManager.stopExpirationChecks();
     }
@@ -1656,7 +1700,17 @@ class OPSISAgentService {
           system_info: systemInfo,
           capability_mode: this.capabilityMode,
           deployment_health: this.compatibilityReport,
-          hmac_configured: hmacReady
+          hmac_configured: hmacReady,
+          active_user: (() => {
+            const user = this.getActiveUser();
+            return user ? {
+              username: user.username,
+              upn: user.upn,
+              display_name: user.display_name,
+              session_type: user.session_type,
+              session_state: user.session_state
+            } : null;
+          })()
         }));
 
         // Send pending reboot_completed notification if resuming after reboot
@@ -1693,6 +1747,14 @@ class OPSISAgentService {
 
         // Send environment snapshot on connect (delayed 15s)
         setTimeout(() => this.sendEnvironmentSnapshot(), 15000);
+
+        // Send current user session state on connect
+        if (this.lastUserSessions.length > 0) {
+          const activeUser = this.getActiveUser();
+          if (activeUser) {
+            this.sendUserSessionEvent('login', activeUser, this.lastUserSessions);
+          }
+        }
 
         // Warn if server doesn't send welcome within 10s
         if (this.welcomeTimeout) clearTimeout(this.welcomeTimeout);
@@ -1818,7 +1880,16 @@ class OPSISAgentService {
         heartbeat_interval_ms: this.serverFixedHeartbeatInterval || this.currentHeartbeatIntervalMs,
         ewma_scores: this.patternDetector.getEWMAScores(),
         discovered_correlations: this.patternDetector.getDiscoveredCorrelations(),
-        behavioral_profile: this.behavioralProfiler.getDashboardSummary()
+        behavioral_profile: this.behavioralProfiler.getDashboardSummary(),
+        active_user: (() => {
+          const user = this.getActiveUser();
+          return user ? {
+            username: user.username,
+            upn: user.upn,
+            session_type: user.session_type,
+            session_state: user.session_state
+          } : null;
+        })()
       }));
     } catch (error) {
       this.logger.error('Failed to send telemetry heartbeat', error);
@@ -3066,8 +3137,9 @@ if ($success) {
       this.logger.info('WTSSendMessage reboot prompt result', { result: dialogResult });
     }
 
-    // Get the logged-on username for authorization tracking
-    const loggedOnUser = process.env.USERNAME || process.env.USER || os.userInfo().username || 'Unknown';
+    // Get the logged-on username from session detection (not process.env which returns SYSTEM for services)
+    const activeUser = this.getActiveUser();
+    const loggedOnUser = activeUser ? activeUser.username : 'Unknown (no interactive session)';
 
     if (response === 'ok') {
       this.logger.info(`User confirmed reboot, scheduling in ${delay} seconds`, { authorizedBy: loggedOnUser });
@@ -6298,6 +6370,264 @@ if ($success) {
     };
   }
 
+  // ============================
+  // USER SESSION DETECTION
+  // ============================
+
+  /**
+   * Detect all interactive user sessions from Session 0 (SYSTEM service).
+   * Uses 'query user' to enumerate console and RDP sessions.
+   */
+  private detectUserSessions(): UserSession[] {
+    const psScript = `
+$sessions = @()
+try {
+    $quserOutput = query user 2>$null
+    if ($quserOutput) {
+        foreach ($line in $quserOutput[1..($quserOutput.Length - 1)]) {
+            if ($line.Trim().Length -eq 0) { continue }
+            $trimmedLine = $line
+            $isActive = $line.StartsWith('>')
+            if ($isActive) { $trimmedLine = ' ' + $line.Substring(1) }
+
+            $username = $trimmedLine.Substring(1, 20).Trim()
+            $sessionName = $trimmedLine.Substring(22, 18).Trim()
+            $idStr = $trimmedLine.Substring(40, 6).Trim()
+            $state = $trimmedLine.Substring(46, 8).Trim()
+
+            $sessionType = 'other'
+            if ($sessionName -match '^console') { $sessionType = 'console' }
+            elseif ($sessionName -match '^rdp') { $sessionType = 'rdp' }
+
+            $sessionState = 'active'
+            if ($state -eq 'Disc') { $sessionState = 'disconnected' }
+            elseif ($state -eq 'Active') { $sessionState = 'active' }
+            else { $sessionState = $state.ToLower() }
+
+            $sid = 0
+            [int]::TryParse($idStr, [ref]$sid) | Out-Null
+
+            $sessions += @{
+                username     = $username
+                session_id   = $sid
+                session_type = $sessionType
+                session_state = $sessionState
+            }
+        }
+    }
+} catch {}
+$sessions | ConvertTo-Json -Compress -Depth 3
+`;
+
+    try {
+      const result = securePowerShell(psScript, { timeout: 10000 });
+      if (!result.success || !result.stdout.trim()) {
+        return [];
+      }
+
+      let parsed = JSON.parse(result.stdout.trim());
+      if (!Array.isArray(parsed)) {
+        parsed = [parsed];
+      }
+
+      return parsed.map((s: any) => ({
+        username: s.username || '',
+        upn: '',
+        display_name: '',
+        session_id: s.session_id || 0,
+        session_type: s.session_type || 'other',
+        session_state: s.session_state || 'active'
+      }));
+    } catch (err: any) {
+      this.logger.error('Failed to detect user sessions', { error: err.message });
+      return [];
+    }
+  }
+
+  /**
+   * Resolve UPN (email) and display name for a Windows username.
+   * Checks cache first, then Azure AD registry cache, then AD LDAP lookup.
+   */
+  private resolveUserUPN(username: string): { upn: string; displayName: string } {
+    if (!username) return { upn: '', displayName: '' };
+
+    const cached = this.upnCache.get(username.toLowerCase());
+    if (cached) return cached;
+
+    const sanitizedUsername = String(username).replace(/'/g, "''").replace(/[`$&|;<>\r\n"]/g, '');
+
+    const psScript = `
+$username = '${sanitizedUsername}'
+$upn = ''
+$displayName = ''
+$samName = $username
+if ($username.Contains('\\')) { $samName = $username.Split('\\')[1] }
+
+# Try 1: Azure AD Identity Store cache
+try {
+    $aadEntries = Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\IdentityStore\\Cache\\*\\IdentityCache\\*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.UserName -and ($_.UserName -like "*$samName*") }
+    if ($aadEntries) {
+        $entry = @($aadEntries)[0]
+        if ($entry.UserName -match '@') { $upn = $entry.UserName }
+        if ($entry.DisplayName) { $displayName = $entry.DisplayName }
+    }
+} catch {}
+
+# Try 2: Active Directory LDAP lookup
+if (-not $upn) {
+    try {
+        $searcher = [adsisearcher]"(samaccountname=$samName)"
+        $adResult = $searcher.FindOne()
+        if ($adResult) {
+            $upn = [string]$adResult.Properties.userprincipalname
+            $displayName = [string]$adResult.Properties.displayname
+        }
+    } catch {}
+}
+
+# Fallback: username@hostname
+if (-not $upn) {
+    $upn = "$samName@$($env:COMPUTERNAME)"
+}
+
+[PSCustomObject]@{ upn = $upn; displayName = $displayName } | ConvertTo-Json -Compress
+`;
+
+    try {
+      const result = securePowerShell(psScript, { timeout: 10000 });
+      if (result.success && result.stdout.trim()) {
+        const info = JSON.parse(result.stdout.trim());
+        const resolved = {
+          upn: info.upn || `${username}@${os.hostname()}`,
+          displayName: info.displayName || ''
+        };
+        this.upnCache.set(username.toLowerCase(), resolved);
+        return resolved;
+      }
+    } catch (err: any) {
+      this.logger.warn('UPN resolution failed', { username, error: err.message });
+    }
+
+    const fallback = { upn: `${username}@${os.hostname()}`, displayName: '' };
+    this.upnCache.set(username.toLowerCase(), fallback);
+    return fallback;
+  }
+
+  /**
+   * Poll for user session changes. Diffs current vs last known state.
+   */
+  private checkUserSessionChanges(): void {
+    const currentSessions = this.detectUserSessions();
+
+    // Resolve UPN for each session
+    for (const session of currentSessions) {
+      if (session.username && !session.upn) {
+        const resolved = this.resolveUserUPN(session.username);
+        session.upn = resolved.upn;
+        session.display_name = resolved.displayName;
+      }
+    }
+
+    const previousMap = new Map<number, UserSession>();
+    for (const s of this.lastUserSessions) {
+      previousMap.set(s.session_id, s);
+    }
+
+    const currentMap = new Map<number, UserSession>();
+    for (const s of currentSessions) {
+      currentMap.set(s.session_id, s);
+    }
+
+    const events: Array<{ event: UserSessionEvent; user: UserSession }> = [];
+
+    // New sessions or state changes
+    for (const [sessionId, current] of currentMap) {
+      const prev = previousMap.get(sessionId);
+      if (!prev) {
+        const event: UserSessionEvent = current.session_type === 'rdp' ? 'rdp_connect' : 'login';
+        events.push({ event, user: current });
+      } else if (prev.session_state !== current.session_state) {
+        if (current.session_state === 'disconnected' && prev.session_state === 'active') {
+          const event: UserSessionEvent = current.session_type === 'rdp' ? 'rdp_disconnect' : 'lock';
+          events.push({ event, user: current });
+        } else if (current.session_state === 'active' && prev.session_state === 'disconnected') {
+          const event: UserSessionEvent = current.session_type === 'rdp' ? 'rdp_connect' : 'unlock';
+          events.push({ event, user: current });
+        }
+      }
+    }
+
+    // Disappeared sessions
+    for (const [sessionId, prev] of previousMap) {
+      if (!currentMap.has(sessionId)) {
+        const event: UserSessionEvent = prev.session_type === 'rdp' ? 'rdp_disconnect' : 'logout';
+        events.push({ event, user: prev });
+      }
+    }
+
+    for (const { event, user } of events) {
+      this.logger.info('User session change detected', {
+        event, username: user.username, upn: user.upn, session_type: user.session_type
+      });
+      this.sendUserSessionEvent(event, user, currentSessions);
+    }
+
+    this.lastUserSessions = currentSessions;
+  }
+
+  /**
+   * Send a user_session event to the server via WebSocket.
+   */
+  private sendUserSessionEvent(event: UserSessionEvent, user: UserSession, allSessions: UserSession[]): void {
+    const message = {
+      type: 'user_session',
+      timestamp: new Date().toISOString(),
+      device_id: this.deviceInfo.device_id,
+      tenant_id: this.deviceInfo.tenant_id,
+      event,
+      user: {
+        username: user.username,
+        upn: user.upn,
+        display_name: user.display_name,
+        session_id: user.session_id,
+        session_type: user.session_type,
+        session_state: user.session_state
+      },
+      all_sessions: allSessions.map(s => ({
+        username: s.username,
+        upn: s.upn,
+        display_name: s.display_name,
+        session_id: s.session_id,
+        session_type: s.session_type,
+        session_state: s.session_state
+      }))
+    };
+
+    this.safeSend(JSON.stringify(message));
+
+    // Broadcast to control panel
+    this.broadcastToAllClients({
+      type: 'user-session-change',
+      data: { event, user: message.user, all_sessions: message.all_sessions }
+    });
+  }
+
+  /**
+   * Get the primary active console user from cached session data.
+   */
+  private getActiveUser(): UserSession | null {
+    const consoleActive = this.lastUserSessions.find(
+      s => s.session_type === 'console' && s.session_state === 'active'
+    );
+    if (consoleActive) return consoleActive;
+
+    const anyActive = this.lastUserSessions.find(s => s.session_state === 'active');
+    if (anyActive) return anyActive;
+
+    return this.lastUserSessions.length > 0 ? this.lastUserSessions[0] : null;
+  }
+
   private getSystemStats(): Record<string, any> {
     const metrics = this.systemMonitor.getMonitoringStats();
     
@@ -6425,7 +6755,8 @@ if ($success) {
    */
   private saveRebootPlaybookState(playbook: PlaybookTask, resumeFromStep: number): void {
     try {
-      const loggedOnUser = process.env.USERNAME || process.env.USER || os.userInfo().username || 'Unknown';
+      const rebootActiveUser = this.getActiveUser();
+      const loggedOnUser = rebootActiveUser ? rebootActiveUser.username : 'Unknown (no interactive session)';
       const state = {
         playbook: {
           id: playbook.id,
