@@ -76,6 +76,32 @@ const PROTECTED_SERVICES: ReadonlySet<string> = new Set([
   'schedule', 'spooler', 'w32time', 'wuauserv'
 ]);
 
+// User-friendly display names for common Windows services (used in pre-action notifications)
+const SERVICE_FRIENDLY_NAMES: Record<string, string> = {
+  'spooler': 'Print Spooler',
+  'wuauserv': 'Windows Update',
+  'bits': 'Background Intelligent Transfer',
+  'w32time': 'Windows Time',
+  'dnscache': 'DNS Client',
+  'dhcp': 'DHCP Client',
+  'lanmanserver': 'File Sharing',
+  'lanmanworkstation': 'Network Workstation',
+  'mpssvc': 'Windows Firewall',
+  'winmgmt': 'WMI',
+  'eventlog': 'Windows Event Log',
+  'schedule': 'Task Scheduler',
+  'audiosrv': 'Windows Audio',
+  'wscsvc': 'Security Center',
+  'cryptsvc': 'Cryptographic Services',
+  'netman': 'Network Connections',
+  'nlasvc': 'Network Location Awareness',
+  'wlansvc': 'Wi-Fi AutoConfig',
+  'netsetupSvc': 'Network Setup',
+  'trustedinstaller': 'Windows Module Installer',
+  'diagtrack': 'Diagnostics Tracking',
+  'remoteregistry': 'Remote Registry',
+};
+
 function isProtectedProcess(name: string): boolean {
   return PROTECTED_PROCESSES.has(name.toLowerCase());
 }
@@ -140,6 +166,8 @@ interface PlaybookStep {
   timeout?: number;
   requiresApproval?: boolean;
   allowFailure?: boolean;
+  notification?: string;   // Server-supplied custom notification message (overrides auto-generated)
+  disruptive?: boolean;    // Server can explicitly force/suppress pre-action notification
 }
 
 /**
@@ -185,6 +213,7 @@ interface AgentConfig {
   confidenceThreshold: number;
   updateCheckInterval: number; // minutes
   apiKey?: string;
+  preActionNotifications: boolean; // Show courtesy notifications before disruptive actions
 }
 
 interface DeviceInfo {
@@ -225,6 +254,7 @@ interface ServerConfig {
     ai_enabled: boolean;
     proactive_monitoring: boolean;
     auto_update: boolean;
+    notify_user_before_action?: boolean;
   };
 }
 
@@ -554,7 +584,8 @@ class OPSISAgentService {
       autoUpdate: true,
       autoRemediation: true,
       confidenceThreshold: 75,
-      updateCheckInterval: 60
+      updateCheckInterval: 60,
+      preActionNotifications: true
     };
   }
 
@@ -2991,6 +3022,147 @@ if ($success) {
   }
 
   /**
+   * Classify whether a playbook step is disruptive and warrants a pre-action notification.
+   * Returns a disruption descriptor or null if the step is non-disruptive.
+   */
+  private classifyStepDisruption(step: PlaybookStep): { level: 'medium' | 'high' | 'critical'; defaultMessage: string } | null {
+    // Server explicitly suppressed notification
+    if (step.disruptive === false) return null;
+
+    // Server explicitly forced notification with custom message
+    if (step.disruptive === true && step.notification) {
+      return { level: 'medium', defaultMessage: step.notification };
+    }
+
+    const getFriendlyServiceName = (name: string): string =>
+      SERVICE_FRIENDLY_NAMES[name.toLowerCase()] || name;
+
+    // Service actions
+    if (step.type === 'service') {
+      const serviceName = step.params?.serviceName || 'a service';
+      const friendly = getFriendlyServiceName(serviceName);
+
+      if (step.action === 'restart') {
+        return { level: 'medium', defaultMessage: `OPSIS is restarting the ${friendly} service to resolve an issue. This may take a few seconds.` };
+      }
+      if (step.action === 'stop') {
+        return { level: 'high', defaultMessage: `OPSIS is stopping the ${friendly} service to resolve an issue.` };
+      }
+      return null; // start is non-disruptive
+    }
+
+    // PowerShell actions — detect disruptive patterns
+    if (step.type === 'powershell') {
+      const action = step.action || '';
+      const actionLower = action.toLowerCase();
+
+      // Service restart/stop via plain-English action names (from server playbooks)
+      let match = action.match(/^(?:restart|stop)\s+service\s+(.+)$/i);
+      if (match) {
+        const friendly = getFriendlyServiceName(match[1].trim());
+        const verb = actionLower.startsWith('stop') ? 'stopping' : 'restarting';
+        return { level: actionLower.startsWith('stop') ? 'high' : 'medium', defaultMessage: `OPSIS is ${verb} the ${friendly} service to resolve an issue.` };
+      }
+
+      // Process kill via plain-English action names
+      match = action.match(/^kill\s+(.+?)\s+process$/i);
+      if (match) {
+        return { level: 'high', defaultMessage: `OPSIS is closing ${match[1]} to resolve an issue. Unsaved work in that application may be affected.` };
+      }
+
+      // Kill and restart process
+      match = action.match(/^(?:kill and restart|restart)\s+(.+?)\s+process$/i);
+      if (match) {
+        return { level: 'high', defaultMessage: `OPSIS is restarting ${match[1]} to resolve an issue. The application will reopen automatically.` };
+      }
+
+      // PowerShell cmdlets embedded in action/params
+      if (/Stop-Process/i.test(actionLower)) {
+        const nameMatch = action.match(/-Name\s+'([^']+)'/i) || action.match(/-Name\s+(\S+)/i);
+        const procName = nameMatch ? nameMatch[1] : 'an application';
+        return { level: 'high', defaultMessage: `OPSIS is closing ${procName} to resolve an issue. Unsaved work may be affected.` };
+      }
+      if (/Restart-Service/i.test(actionLower)) {
+        const nameMatch = action.match(/-Name\s+'([^']+)'/i) || action.match(/-Name\s+(\S+)/i);
+        const friendly = nameMatch ? getFriendlyServiceName(nameMatch[1]) : 'a service';
+        return { level: 'medium', defaultMessage: `OPSIS is restarting the ${friendly} service. This may take a few seconds.` };
+      }
+      if (/Stop-Service/i.test(actionLower)) {
+        const nameMatch = action.match(/-Name\s+'([^']+)'/i) || action.match(/-Name\s+(\S+)/i);
+        const friendly = nameMatch ? getFriendlyServiceName(nameMatch[1]) : 'a service';
+        return { level: 'high', defaultMessage: `OPSIS is stopping the ${friendly} service to resolve an issue.` };
+      }
+
+      // Network disruptions
+      if (/Disable-NetAdapter/i.test(actionLower)) {
+        return { level: 'critical', defaultMessage: 'OPSIS is temporarily disabling a network adapter to resolve a connectivity issue. Your network connection will drop briefly.' };
+      }
+      if (/ipconfig.*\/release/i.test(actionLower)) {
+        return { level: 'medium', defaultMessage: 'OPSIS is resetting your network connection. Internet access may be briefly interrupted.' };
+      }
+
+      return null;
+    }
+
+    // Server forced disruptive flag on an otherwise non-classified step
+    if (step.disruptive === true) {
+      return { level: 'medium', defaultMessage: step.notification || 'OPSIS is performing a maintenance action. There may be a brief interruption.' };
+    }
+
+    return null;
+  }
+
+  /**
+   * Show a non-blocking courtesy notification to the user before a disruptive playbook step.
+   * Uses GUI broadcast if control panel is connected, falls back to WTSSendMessage.
+   * Fire-and-forget: shows the message, pauses briefly, then returns.
+   * Notification failure never blocks playbook execution.
+   */
+  private async notifyUserBeforeStep(step: PlaybookStep, stepIndex: number, totalSteps: number): Promise<void> {
+    if (!this.config.preActionNotifications) return;
+
+    // Reboot and user-prompt steps already have their own notification UI
+    if (step.type === 'reboot' || step.type === 'user-prompt') return;
+
+    const disruption = this.classifyStepDisruption(step);
+    if (!disruption) return;
+
+    const message = step.notification || disruption.defaultMessage;
+    const title = 'OPSIS Agent';
+
+    this.logger.info('Pre-action notification', {
+      stepIndex, stepType: step.type, action: step.action,
+      level: disruption.level, message
+    });
+
+    try {
+      if (this.hasAnyGuiClient()) {
+        // GUI path: broadcast non-interactive toast notification
+        this.broadcastToAllClients({
+          type: 'action-notification',
+          data: {
+            title,
+            message,
+            level: disruption.level,
+            stepIndex,
+            totalSteps,
+            autoDismiss: true,
+            autoDismissSeconds: 8,
+            timestamp: new Date().toISOString()
+          }
+        });
+        // Brief pause so GUI can render the toast before the action starts
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        // Fallback: WTSSendMessage with auto-dismiss after 5 seconds
+        this.showSessionMessageBox(title, message, 'ok', 5);
+      }
+    } catch (err: any) {
+      this.logger.warn('Pre-action notification failed (non-fatal)', { error: err.message });
+    }
+  }
+
+  /**
    * Handle a user-prompt message from the server.
    * Broadcasts to GUI and waits for user response.
    */
@@ -4423,6 +4595,9 @@ if ($success) {
       if (this.serverConfig!.features) {
         this.config.autoRemediation = this.serverConfig!.features.autonomous_remediation;
         this.config.autoUpdate = this.serverConfig!.features.auto_update;
+        if (this.serverConfig!.features.notify_user_before_action !== undefined) {
+          this.config.preActionNotifications = this.serverConfig!.features.notify_user_before_action;
+        }
       }
 
       // Update system monitor thresholds from server config
@@ -5571,6 +5746,11 @@ if ($success) {
 
       const isVerification = step.allowFailure || this.isVerificationStep(step, playbook.steps, i);
 
+      // Show courtesy notification for disruptive steps (non-blocking)
+      if (!isVerification) {
+        await this.notifyUserBeforeStep(step, i, playbook.steps.length);
+      }
+
       try {
         await this.executeStep(step);
         this.lastStepResults.push({ step_index: i, type: step.type, action: step.action, status: 'success' });
@@ -5646,6 +5826,7 @@ if ($success) {
       for (let j = 0; j < chain.fallback_steps.length; j++) {
         const fbStep = chain.fallback_steps[j];
         this.log(`    Fallback step ${j + 1}/${chain.fallback_steps.length}: ${fbStep.type} - ${fbStep.action}`);
+        await this.notifyUserBeforeStep(fbStep, j, chain.fallback_steps.length);
         try {
           await this.executeStep(fbStep);
         } catch (fbError) {

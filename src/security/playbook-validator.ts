@@ -73,6 +73,8 @@ export interface PlaybookStep {
   command?: string;
   script?: string;
   params?: Record<string, any>;
+  notification?: string;
+  disruptive?: boolean;
 }
 
 export interface Playbook {
