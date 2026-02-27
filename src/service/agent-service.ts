@@ -6463,18 +6463,40 @@ $displayName = ''
 $samName = $username
 if ($username.Contains('\\')) { $samName = $username.Split('\\')[1] }
 
-# Try 1: Azure AD Identity Store cache
+# Try 1: SID-based lookup — resolve the logged-in user's account to a SID,
+# then find the matching AAD Identity Store cache entry by SID in the registry path.
+# This works even when the local SAM name differs from the Azure AD UPN prefix.
 try {
-    $aadEntries = Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\IdentityStore\\Cache\\*\\IdentityCache\\*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.UserName -and ($_.UserName -like "*$samName*") }
-    if ($aadEntries) {
-        $entry = @($aadEntries)[0]
-        if ($entry.UserName -match '@') { $upn = $entry.UserName }
-        if ($entry.DisplayName) { $displayName = $entry.DisplayName }
+    # Get the full account name (e.g., AzureAD\\HughWhite) from Win32_ComputerSystem
+    $fullAccount = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($fullAccount) {
+        $userSid = (New-Object System.Security.Principal.NTAccount($fullAccount)).Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+        if ($userSid) {
+            # Find IdentityStore entries where the user's SID is the IdentityCache child key
+            $sidEntries = @(Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\IdentityStore\\Cache\\*\\IdentityCache\\$userSid" -ErrorAction SilentlyContinue |
+                Where-Object { $_.UserName -and ($_.UserName -match '@') })
+            if ($sidEntries.Count -gt 0) {
+                $upn = $sidEntries[0].UserName
+                if ($sidEntries[0].DisplayName) { $displayName = $sidEntries[0].DisplayName }
+            }
+        }
     }
 } catch {}
 
-# Try 2: Active Directory LDAP lookup
+# Try 2: Direct SAM name match against AAD cache (works when SAM name = UPN prefix)
+if (-not $upn) {
+    try {
+        $aadEntries = @(Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\IdentityStore\\Cache\\*\\IdentityCache\\*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.UserName -and ($_.UserName -match '@') -and ($_.UserName -like "*$samName*") })
+        if ($aadEntries.Count -gt 0) {
+            $upn = $aadEntries[0].UserName
+            if ($aadEntries[0].DisplayName) { $displayName = $aadEntries[0].DisplayName }
+        }
+    } catch {}
+}
+
+# Try 3: Active Directory LDAP lookup (domain-joined machines)
 if (-not $upn) {
     try {
         $searcher = [adsisearcher]"(samaccountname=$samName)"
@@ -6483,6 +6505,14 @@ if (-not $upn) {
             $upn = [string]$adResult.Properties.userprincipalname
             $displayName = [string]$adResult.Properties.displayname
         }
+    } catch {}
+}
+
+# Get display name from LogonUI if still missing
+if (-not $displayName) {
+    try {
+        $logonUI = Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\LogonUI" -ErrorAction SilentlyContinue
+        if ($logonUI.LastLoggedOnDisplayName) { $displayName = $logonUI.LastLoggedOnDisplayName }
     } catch {}
 }
 
