@@ -19,6 +19,7 @@ export interface SystemSignal {
   message: string;
   timestamp: Date;
   metadata?: Record<string, any>;
+  details?: Record<string, any>; // Server-facing structured payload for fingerprint/pattern/AI services
   // For ticket creation
   eventId?: number;
   eventSource?: string;
@@ -232,7 +233,20 @@ export class SystemMonitor {
               pid: proc.pid,
               process_path: proc.path,
               process_company: proc.company,
-              command_line: proc.command_line
+              command_line: proc.command_line,
+              parent_pid: proc.parent_pid
+            },
+            details: {
+              process_name: proc.name,
+              pid: proc.pid,
+              name: proc.name,
+              process_path: proc.path,
+              process_company: proc.company,
+              command_line: proc.command_line ? proc.command_line.substring(0, 500) : undefined,
+              cpu_percent: proc.cpu,
+              memory_mb: 0,
+              thread_count: proc.thread_count,
+              parent_pid: proc.parent_pid
             },
             eventId: 2003,
             eventSource: 'OPSIS-SystemMonitor'
@@ -258,10 +272,10 @@ export class SystemMonitor {
     }
   }
 
-  private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number, path?: string, company?: string, command_line?: string}>> {
+  private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number, path?: string, company?: string, command_line?: string, thread_count?: number, parent_pid?: number}>> {
     try {
       const { stdout } = await execAsync(
-        `powershell -NoProfile -Command "$cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors; $cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Id -ne 0} | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; CPUPercent=[math]::Round(($_.CPU / ((Get-Date) - $_.StartTime).TotalSeconds) * 100 / $cpuCores, 2); Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
+        `powershell -NoProfile -Command "$cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors; $cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Id -ne 0} | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; CPUPercent=[math]::Round(($_.CPU / ((Get-Date) - $_.StartTime).TotalSeconds) * 100 / $cpuCores, 2); Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine}; ThreadCount=$_.Threads.Count; ParentProcessId=if($c){$c.ParentProcessId} } } | ConvertTo-Json"`,
         { timeout: 15000 }
       );
       const processes = JSON.parse(stdout || '[]');
@@ -271,7 +285,9 @@ export class SystemMonitor {
         cpu: p.CPUPercent || 0,
         path: p.Path || undefined,
         company: p.Company || undefined,
-        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined
+        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined,
+        thread_count: p.ThreadCount || undefined,
+        parent_pid: p.ParentProcessId || undefined
       })) : [];
     } catch {
       return [];
@@ -361,7 +377,20 @@ export class SystemMonitor {
               pid: proc.pid,
               process_path: proc.path,
               process_company: proc.company,
-              command_line: proc.command_line
+              command_line: proc.command_line,
+              parent_pid: proc.parent_pid
+            },
+            details: {
+              process_name: proc.name,
+              pid: proc.pid,
+              name: proc.name,
+              process_path: proc.path,
+              process_company: proc.company,
+              command_line: proc.command_line ? proc.command_line.substring(0, 500) : undefined,
+              cpu_percent: 0,
+              memory_mb: proc.memoryMB,
+              thread_count: proc.thread_count,
+              parent_pid: proc.parent_pid
             },
             eventId: 2012,
             eventSource: 'OPSIS-SystemMonitor'
@@ -375,10 +404,10 @@ export class SystemMonitor {
     }
   }
 
-  private async getTopMemoryProcesses(): Promise<Array<{name: string, pid: number, memoryMB: number, path?: string, company?: string, command_line?: string}>> {
+  private async getTopMemoryProcesses(): Promise<Array<{name: string, pid: number, memoryMB: number, path?: string, company?: string, command_line?: string, thread_count?: number, parent_pid?: number}>> {
     try {
       const { stdout } = await execAsync(
-        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.WS -gt 0} | Sort-Object WS -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; WS=$_.WS; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
+        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.WS -gt 0} | Sort-Object WS -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; WS=$_.WS; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine}; ThreadCount=$_.Threads.Count; ParentProcessId=if($c){$c.ParentProcessId} } } | ConvertTo-Json"`,
         { timeout: 10000 }
       );
       const processes = JSON.parse(stdout || '[]');
@@ -388,7 +417,9 @@ export class SystemMonitor {
         memoryMB: (p.WS || 0) / 1024 / 1024,
         path: p.Path || undefined,
         company: p.Company || undefined,
-        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined
+        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined,
+        thread_count: p.ThreadCount || undefined,
+        parent_pid: p.ParentProcessId || undefined
       })) : [];
     } catch {
       return [];
@@ -435,6 +466,12 @@ export class SystemMonitor {
                 freeGB: (drive.Free / 1024 / 1024 / 1024).toFixed(2),
                 totalGB: (total / 1024 / 1024 / 1024).toFixed(2)
               },
+              details: {
+                drive: drive.Name,
+                total_gb: parseFloat((total / 1024 / 1024 / 1024).toFixed(2)),
+                free_gb: parseFloat((drive.Free / 1024 / 1024 / 1024).toFixed(2)),
+                percent_free: parseFloat(freePercent.toFixed(1))
+              },
               eventId: 2020,
               eventSource: 'OPSIS-SystemMonitor'
             });
@@ -453,6 +490,12 @@ export class SystemMonitor {
               message: `Drive ${drive.Name}: low space (${freePercent.toFixed(1)}% free)`,
               timestamp: new Date(),
               metadata: { drive: drive.Name },
+              details: {
+                drive: drive.Name,
+                total_gb: parseFloat((total / 1024 / 1024 / 1024).toFixed(2)),
+                free_gb: parseFloat((drive.Free / 1024 / 1024 / 1024).toFixed(2)),
+                percent_free: parseFloat(freePercent.toFixed(1))
+              },
               eventId: 2021,
               eventSource: 'OPSIS-SystemMonitor'
             });
@@ -564,7 +607,7 @@ export class SystemMonitor {
   private async monitorServices(): Promise<void> {
     try {
       const { stdout } = await execAsync(
-        'powershell -Command "Get-Service | Where-Object {$_.StartType -eq \'Automatic\' -and $_.Status -ne \'Running\'} | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json"',
+        'powershell -Command "Get-Service | Where-Object {$_.StartType -eq \'Automatic\' -and $_.Status -ne \'Running\'} | Select-Object Name,DisplayName,Status,StartType,@{N=\'Dependencies\';E={($_.ServicesDependedOn | Select-Object -ExpandProperty Name) -join \',\'}} | ConvertTo-Json"',
         { timeout: 15000 }
       );
 
@@ -580,6 +623,8 @@ export class SystemMonitor {
           continue;
         }
 
+        const dependencies = service.Dependencies ? service.Dependencies.split(',').filter(Boolean) : [];
+
         this.emitSignal({
           id: `service-stopped-${service.Name}`,
           category: 'services',
@@ -594,6 +639,13 @@ export class SystemMonitor {
             status: service.Status,
             startType: service.StartType,
             priority
+          },
+          details: {
+            service_name: service.Name,
+            name: service.Name,
+            display_name: service.DisplayName,
+            start_type: service.StartType,
+            dependencies
           },
           eventId: 7034,
           eventSource: 'Service Control Manager'
@@ -632,14 +684,16 @@ export class SystemMonitor {
 
   private async monitorUpdates(): Promise<void> {
     try {
-      // Check for pending updates
+      // Check for pending updates with critical count
       const { stdout } = await execAsync(
-        'powershell -Command "$updates = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search(\'IsInstalled=0 and IsHidden=0\'); $updates.Updates.Count"',
+        'powershell -Command "$updates = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search(\'IsInstalled=0 and IsHidden=0\'); $critical = @($updates.Updates | Where-Object {$_.MsrcSeverity -eq \'Critical\'}).Count; [PSCustomObject]@{Total=$updates.Updates.Count;Critical=$critical} | ConvertTo-Json"',
         { timeout: 30000 }
       );
 
-      const pendingCount = parseInt(stdout.trim() || '0');
-      
+      const updateInfo = stdout.trim() ? JSON.parse(stdout) : { Total: 0, Critical: 0 };
+      const pendingCount = updateInfo.Total || 0;
+      const criticalCount = updateInfo.Critical || 0;
+
       if (pendingCount > 20) {
         this.emitSignal({
           id: 'updates-many-pending',
@@ -651,6 +705,10 @@ export class SystemMonitor {
           message: `${pendingCount} Windows updates pending installation`,
           timestamp: new Date(),
           metadata: { count: pendingCount },
+          details: {
+            pending_count: pendingCount,
+            critical_count: criticalCount
+          },
           eventId: 2040,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -664,6 +722,10 @@ export class SystemMonitor {
           message: `${pendingCount} Windows updates available`,
           timestamp: new Date(),
           metadata: { count: pendingCount },
+          details: {
+            pending_count: pendingCount,
+            critical_count: criticalCount
+          },
           eventId: 2041,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -699,6 +761,10 @@ export class SystemMonitor {
             message: `No Windows updates in ${daysSince} days (last: ${lastUpdate.toLocaleDateString()})`,
             timestamp: new Date(),
             metadata: { lastUpdate: lastUpdate.toISOString(), daysSince },
+            details: {
+              last_update_date: lastUpdate.toISOString(),
+              days_since_update: daysSince
+            },
             eventId: 2042,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -788,6 +854,11 @@ export class SystemMonitor {
           const appMatch = event.Message.match(/application name: ([^,]+)/i);
           const appName = appMatch ? appMatch[1].trim() : event.Source;
 
+          // Parse crash-specific fields from WER message format
+          const faultingModuleMatch = event.Message?.match(/faulting module (?:name|path): ([^,\r\n]+)/i);
+          const exceptionCodeMatch = event.Message?.match(/exception code: (0x[0-9a-fA-F]+)/i);
+          const faultingAppPathMatch = event.Message?.match(/faulting application path: ([^,\r\n]+)/i);
+
           this.emitSignal({
             id: `app-crash-${event.TimeGenerated}`,
             category: 'applications',
@@ -801,6 +872,18 @@ export class SystemMonitor {
               source: event.Source,
               eventId: event.EventID,
               message: event.Message.substring(0, 200)
+            },
+            details: {
+              event_id: parseInt(event.EventID, 10),
+              source: event.Source,
+              provider: event.Source,
+              logName: 'Application',
+              process_name: appName,
+              faultingModule: faultingModuleMatch ? faultingModuleMatch[1].trim() : undefined,
+              exceptionCode: exceptionCodeMatch ? exceptionCodeMatch[1] : undefined,
+              faultingApplicationPath: faultingAppPathMatch ? faultingAppPathMatch[1].trim() : undefined,
+              event_count: 1,
+              first_seen: new Date(event.TimeGenerated).toISOString()
             },
             eventId: event.EventID,
             eventSource: 'Application'
@@ -821,7 +904,7 @@ export class SystemMonitor {
     try {
       // Check for hung/not responding processes
       const { stdout } = await execAsync(
-        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Responding -eq $false} | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; StartTime=$_.StartTime; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
+        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Responding -eq $false} | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; StartTime=$_.StartTime; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine}; ThreadCount=$_.Threads.Count; ParentProcessId=if($c){$c.ParentProcessId} } } | ConvertTo-Json"`,
         { timeout: 15000 }
       );
 
@@ -830,6 +913,8 @@ export class SystemMonitor {
         const procArray = Array.isArray(processes) ? processes : [processes];
 
         for (const proc of procArray) {
+          const cmdLine = typeof proc.CommandLine === 'string' ? proc.CommandLine.substring(0, 500) : undefined;
+          const parentPid = typeof proc.ParentProcessId === 'number' ? proc.ParentProcessId : undefined;
           this.emitSignal({
             id: `process-hung-${proc.Id}`,
             category: 'processes',
@@ -844,7 +929,17 @@ export class SystemMonitor {
               startTime: proc.StartTime,
               process_path: proc.Path || undefined,
               process_company: proc.Company || undefined,
-              command_line: proc.CommandLine ? proc.CommandLine.substring(0, 500) : undefined
+              command_line: cmdLine
+            },
+            details: {
+              process_name: proc.Name,
+              pid: proc.Id,
+              name: proc.Name,
+              process_path: proc.Path || undefined,
+              process_company: proc.Company || undefined,
+              command_line: cmdLine,
+              thread_count: typeof proc.ThreadCount === 'number' ? proc.ThreadCount : undefined,
+              parent_pid: parentPid
             },
             eventId: 2060,
             eventSource: 'OPSIS-SystemMonitor'
@@ -862,6 +957,23 @@ export class SystemMonitor {
   // ============================================
 
   private async monitorNetwork(): Promise<void> {
+    // Gather adapter info once for all network signals
+    let adapterName: string | undefined;
+    let adapterStatus: string | undefined;
+    try {
+      const { stdout: adapterOut } = await execAsync(
+        'powershell -NoProfile -Command "Get-NetAdapter | Where-Object Status -eq \'Up\' | Select-Object -First 1 Name,Status | ConvertTo-Json"',
+        { timeout: 5000 }
+      );
+      if (adapterOut.trim()) {
+        const adapter = JSON.parse(adapterOut);
+        adapterName = adapter.Name;
+        adapterStatus = adapter.Status;
+      }
+    } catch {
+      // Adapter query failed, continue without it
+    }
+
     try {
       // Test internet connectivity
       const { stdout } = await execAsync(
@@ -874,17 +986,25 @@ export class SystemMonitor {
           id: 'network-offline',
           category: 'network',
           severity: 'critical',
-          metric: 'network_connectivity',
+          metric: 'connectivity',
           value: false,
           message: 'Network connectivity lost - cannot reach internet',
           timestamp: new Date(),
+          details: {
+            ping_target: '8.8.8.8',
+            ping_result: false,
+            gateway_reachable: undefined,
+            dns_working: undefined,
+            adapter_name: adapterName,
+            adapter_status: adapterStatus
+          },
           eventId: 2070,
           eventSource: 'OPSIS-SystemMonitor'
         });
       }
 
       // Check gateway connectivity
-      await this.checkGateway();
+      await this.checkGateway(adapterName, adapterStatus);
 
     } catch (error) {
       this.emitSignal({
@@ -895,13 +1015,19 @@ export class SystemMonitor {
         value: true,
         message: 'Network connectivity test timed out',
         timestamp: new Date(),
+        details: {
+          ping_target: '8.8.8.8',
+          ping_result: false,
+          adapter_name: adapterName,
+          adapter_status: adapterStatus
+        },
         eventId: 2071,
         eventSource: 'OPSIS-SystemMonitor'
       });
     }
   }
 
-  private async checkGateway(): Promise<void> {
+  private async checkGateway(adapterName?: string, adapterStatus?: string): Promise<void> {
     try {
       const { stdout } = await execAsync(
         'powershell -Command "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Select-Object -ExpandProperty NextHop"',
@@ -925,6 +1051,13 @@ export class SystemMonitor {
             message: `Default gateway ${gateway} unreachable`,
             timestamp: new Date(),
             metadata: { gateway },
+            details: {
+              ping_target: gateway,
+              ping_result: false,
+              gateway_reachable: false,
+              adapter_name: adapterName,
+              adapter_status: adapterStatus
+            },
             eventId: 2072,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -955,8 +1088,12 @@ export class SystemMonitor {
           value: false,
           message: 'DNS resolution failing - cannot resolve domain names',
           timestamp: new Date(),
-          eventId: 1014, // Windows DNS Event ID
-          eventSource: 'DNS Client'
+          details: {
+            dns_working: false,
+            ping_target: 'google.com'
+          },
+          eventId: 1014,
+          eventSource: 'DNS Client Events'
         });
       }
 
@@ -969,8 +1106,12 @@ export class SystemMonitor {
         value: true,
         message: 'DNS resolution timed out',
         timestamp: new Date(),
+        details: {
+          dns_working: false,
+          ping_target: 'google.com'
+        },
         eventId: 1015,
-        eventSource: 'DNS Client'
+        eventSource: 'DNS Client Events'
       });
     }
   }
@@ -982,21 +1123,27 @@ export class SystemMonitor {
   private async monitorSecurity(): Promise<void> {
     try {
       const { stdout } = await execAsync(
-        'powershell -Command "Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,IoavProtectionEnabled,OnAccessProtectionEnabled | ConvertTo-Json"',
+        'powershell -Command "Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,IoavProtectionEnabled,OnAccessProtectionEnabled,AntivirusSignatureAge | ConvertTo-Json"',
         { timeout: 15000 }
       );
 
       const defender = JSON.parse(stdout);
-      
+      const definitionsAgeDays = defender.AntivirusSignatureAge || undefined;
+
       if (!defender.AntivirusEnabled) {
         this.emitSignal({
           id: 'defender-disabled',
           category: 'security',
           severity: 'critical',
-          metric: 'antivirus_enabled',
-          value: false,
+          metric: 'antivirus_status',
+          value: 'disabled',
           message: 'Windows Defender antivirus is disabled',
           timestamp: new Date(),
+          details: {
+            defender_enabled: false,
+            firewall_enabled: undefined,
+            definitions_age_days: definitionsAgeDays
+          },
           eventId: 2080,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -1012,6 +1159,11 @@ export class SystemMonitor {
           message: 'Windows Defender real-time protection is disabled',
           timestamp: new Date(),
           metadata: defender,
+          details: {
+            defender_enabled: defender.AntivirusEnabled,
+            firewall_enabled: undefined,
+            definitions_age_days: definitionsAgeDays
+          },
           eventId: 2081,
           eventSource: 'OPSIS-SystemMonitor'
         });
@@ -1052,6 +1204,10 @@ export class SystemMonitor {
             message: `Windows Firewall disabled for ${profile.Name} profile`,
             timestamp: new Date(),
             metadata: { profile: profile.Name },
+            details: {
+              firewall_enabled: false,
+              defender_enabled: undefined
+            },
             eventId: 2082,
             eventSource: 'OPSIS-SystemMonitor'
           });

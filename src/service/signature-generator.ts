@@ -88,6 +88,7 @@ export class SignatureGenerator {
         metric: signal.metric,
         value: signal.value,
         threshold: signal.threshold,
+        ...(signal.details || {}),
         metadata: signal.metadata
       }
     }];

@@ -63,6 +63,8 @@ export class EventMonitor {
   private monitoringInterval: NodeJS.Timeout | null = null;
   private lastCheckedTime: Date;
   private onIssueDetected: (event: EventLogEntry, runbook?: RunbookMatch) => void;
+  // Rate counters for threshold-based suppression (e.g., .NET Runtime 1022 suppress <20/hr)
+  private eventRateCounters: Map<string, { count: number; windowStart: number }> = new Map();
   private onEscalationNeeded: (event: EventLogEntry, reason: string) => void;
   private subscriptionProcess: ChildProcess | null = null;
   private subscriptionBuffer: string = '';
@@ -610,6 +612,280 @@ export class EventMonitor {
             }
           }
         ]
+      },
+
+      // 13. .NET Runtime Errors (suppress threshold: >20/hr)
+      {
+        id: 'rb-dotnet-runtime',
+        name: '.NET Runtime Error',
+        description: 'Handle .NET Runtime crash events - suppress unless >20/hr',
+        priority: 'medium',
+        requiresApproval: false,
+        triggers: [
+          {
+            logName: 'Application',
+            eventId: 1022,
+            source: '.NET Runtime',
+            level: 'Error'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 14. NTFS File System Corruption (P1 ticket)
+      {
+        id: 'rb-ntfs-corruption',
+        name: 'NTFS File System Error',
+        description: 'NTFS corruption detected - requires immediate attention',
+        priority: 'critical',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 55,
+            source: 'Ntfs',
+            level: 'Error'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'disk',
+            params: {}
+          }
+        ]
+      },
+
+      // 15. Bad Disk Block (Event 7 from disk)
+      {
+        id: 'rb-disk-bad-block',
+        name: 'Bad Disk Block Detected',
+        description: 'Physical disk bad block detected - ticket for investigation',
+        priority: 'critical',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 7,
+            source: 'disk',
+            level: 'Error'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'disk',
+            params: {}
+          }
+        ]
+      },
+
+      // 16. Unexpected Shutdown / Kernel-Power
+      {
+        id: 'rb-kernel-power',
+        name: 'Unexpected Shutdown',
+        description: 'Kernel-Power event 41 - unexpected shutdown or reboot detected',
+        priority: 'critical',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 41,
+            source: 'Microsoft-Windows-Kernel-Power',
+            level: 'Critical'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 17. Failed Logon Attempts (brute force detection)
+      {
+        id: 'rb-failed-logons',
+        name: 'Multiple Failed Logon Attempts',
+        description: 'Security event 4625 - failed logon attempts detected',
+        priority: 'high',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'Security',
+            eventId: 4625,
+            source: 'Microsoft-Windows-Security-Auditing'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 18. Account Lockout
+      {
+        id: 'rb-account-lockout',
+        name: 'Account Locked Out',
+        description: 'Security event 4740 - account lockout detected',
+        priority: 'high',
+        requiresApproval: false,
+        triggers: [
+          {
+            logName: 'Security',
+            eventId: 4740,
+            source: 'Microsoft-Windows-Security-Auditing'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 19. Audit Log Cleared (P1 - potential security incident)
+      {
+        id: 'rb-audit-log-cleared',
+        name: 'Security Audit Log Cleared',
+        description: 'Security event 1102 - audit log was cleared',
+        priority: 'critical',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'Security',
+            eventId: 1102,
+            source: 'Microsoft-Windows-Security-Auditing'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 20. BSOD via WER-SystemErrorReporting (P1 ticket)
+      {
+        id: 'rb-bsod-wer',
+        name: 'BSOD Detected',
+        description: 'WER System Error Reporting event 1001 - BSOD data collected',
+        priority: 'critical',
+        requiresApproval: true,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 1001,
+            source: 'Microsoft-Windows-WER-SystemErrorReporting',
+            level: 'Error'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'system',
+            params: {}
+          }
+        ]
+      },
+
+      // 21. Print Service Error (fix: restart spooler)
+      {
+        id: 'rb-print-service-error',
+        name: 'Print Job Failed',
+        description: 'PrintService event 372 - fix by restarting print spooler',
+        priority: 'medium',
+        requiresApproval: false,
+        triggers: [
+          {
+            logName: 'Microsoft-Windows-PrintService/Operational',
+            eventId: 372,
+            source: 'Microsoft-Windows-PrintService'
+          }
+        ],
+        steps: [
+          {
+            type: 'service',
+            action: 'stop',
+            params: {
+              serviceName: 'Spooler'
+            }
+          },
+          {
+            type: 'powershell',
+            action: 'Remove-Item "C:\\Windows\\System32\\spool\\PRINTERS\\*" -Force -ErrorAction SilentlyContinue',
+            params: {}
+          },
+          {
+            type: 'service',
+            action: 'start',
+            params: {
+              serviceName: 'Spooler'
+            }
+          }
+        ]
+      },
+
+      // 22. TCP/IP Address Conflict
+      {
+        id: 'rb-tcpip-conflict',
+        name: 'IP Address Conflict',
+        description: 'Tcpip event 4199 - IP address conflict detected',
+        priority: 'high',
+        requiresApproval: false,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 4199,
+            source: 'Tcpip',
+            level: 'Error'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'network',
+            params: {}
+          }
+        ]
+      },
+
+      // 23. DNS Client Timeout
+      {
+        id: 'rb-dns-client-timeout',
+        name: 'DNS Client Resolution Timeout',
+        description: 'DNS Client Events event 1014 - DNS resolution timeout',
+        priority: 'high',
+        requiresApproval: false,
+        triggers: [
+          {
+            logName: 'System',
+            eventId: 1014,
+            source: 'DNS Client Events',
+            level: 'Warning'
+          }
+        ],
+        steps: [
+          {
+            type: 'diagnostic',
+            action: 'network',
+            params: {}
+          }
+        ]
       }
     ];
 
@@ -677,7 +953,7 @@ export class EventMonitor {
     });
     
     try {
-      const logs = ['System', 'Application'];
+      const logs = ['System', 'Application', 'Security'];
       
       for (const logName of logs) {
         this.logger.debug(`Starting check of ${logName} log`);
@@ -801,9 +1077,39 @@ ConvertTo-Json -Depth 3
       message: event.message.substring(0, 100)
     });
 
-    // Skip non-critical events
-    if (event.level === 'Information') {
+    // Security events with specific IDs are always processed regardless of level
+    const securityCriticalEvents = [4625, 4740, 1102];
+    if (event.logName === 'Security' && securityCriticalEvents.includes(event.id)) {
+      // Always process these - fall through
+    } else if (event.level === 'Information') {
+      // Skip non-critical events
       return;
+    }
+
+    // Rate-based suppression for high-frequency events (e.g., .NET Runtime 1022: suppress <20/hr)
+    const rateKey = `${event.source}:${event.id}`;
+    const now = Date.now();
+    const oneHourMs = 3600000;
+    const rateEntry = this.eventRateCounters.get(rateKey);
+    if (rateEntry) {
+      if (now - rateEntry.windowStart > oneHourMs) {
+        // Reset window
+        this.eventRateCounters.set(rateKey, { count: 1, windowStart: now });
+      } else {
+        rateEntry.count++;
+        // .NET Runtime 1022: suppress until >20/hr threshold
+        if (event.source === '.NET Runtime' && event.id === 1022 && rateEntry.count < 20) {
+          this.logger.debug('.NET Runtime 1022 suppressed (below threshold)', { count: rateEntry.count });
+          return;
+        }
+      }
+    } else {
+      this.eventRateCounters.set(rateKey, { count: 1, windowStart: now });
+      // First occurrence of .NET Runtime 1022 — suppress (threshold is 20)
+      if (event.source === '.NET Runtime' && event.id === 1022) {
+        this.logger.debug('.NET Runtime 1022 suppressed (below threshold)', { count: 1 });
+        return;
+      }
     }
 
     // Extract additional data from event (like service names)

@@ -1866,7 +1866,8 @@ class OPSISAgentService {
         value: signal.value,
         threshold: signal.threshold,
         message: signal.message,
-        metadata: signal.metadata
+        metadata: signal.metadata,
+        details: signal.details || {}
       }
     }));
   }
@@ -4905,12 +4906,26 @@ if ($success) {
 
     // Frequency batching: send telemetry at logarithmic thresholds (10/50/100) without re-escalating
     if (stateChange.isBatch) {
+      const resourceState = this.stateTracker.getResourceState(resourceId);
+      const firstSeen = resourceState?.stateChangedAt || new Date().toISOString();
+      const elapsedMs = Date.now() - new Date(firstSeen).getTime();
+      const elapsedMinutes = Math.max(1, elapsedMs / 60000);
+      const frequency = stateChange.frequency || 0;
+      const eventsPerMinute = Math.round((frequency / elapsedMinutes) * 100) / 100;
+
       signal = {
         ...signal,
         metadata: {
           ...signal.metadata,
           occurrence_count: stateChange.frequency,
           is_batch: true
+        },
+        details: {
+          ...signal.details,
+          event_count: stateChange.frequency,
+          first_seen: firstSeen,
+          events_per_minute: eventsPerMinute,
+          occurrence_count: stateChange.frequency
         },
         message: `${signal.message} (occurred ${stateChange.frequency} times)`
       } as SystemSignal;
@@ -4939,10 +4954,20 @@ if ($success) {
         tenant_id: this.deviceInfo.tenant_id,
         signal_id: signal.id,
         resource_id: resourceId,
+        category: signal.category,
+        metric: signal.metric,
+        message: signal.message,
         previous_state: stateChange.fromState,
         current_state: stateChange.toState,
         duration_seconds: Math.round(durationMs / 1000),
-        resolution_method: 'self_healed'
+        resolution_method: 'self_healed',
+        details: {
+          ...(signal.details || {}),
+          resolved_signal_id: signal.id,
+          was_severity: stateChange.fromState,
+          duration_seconds: Math.round(durationMs / 1000),
+          current_value: signal.value
+        }
       }));
 
       // Auto-close matching open tickets
@@ -4994,6 +5019,11 @@ if ($success) {
           ...signal.metadata,
           flapTransitionCount: stateChange.transitionCount,
           originalSignalId: signal.id
+        },
+        details: {
+          ...signal.details,
+          flap_transition_count: stateChange.transitionCount,
+          original_signal_id: signal.id
         }
       } as SystemSignal;
     }
@@ -5010,7 +5040,15 @@ if ($success) {
           if (!Array.isArray(bitsQueue)) bitsQueue = [bitsQueue];
           signal = {
             ...signal,
-            metadata: { ...signal.metadata, bitsQueue }
+            metadata: { ...signal.metadata, bitsQueue },
+            details: {
+              ...signal.details,
+              enrichment: {
+                bits_jobs: JSON.stringify(bitsQueue),
+                events_last_hour: signal.metadata?.occurrence_count || 1,
+                service_status: 'Unknown'
+              }
+            }
           } as SystemSignal;
         }
       } catch (e: any) {
