@@ -227,7 +227,13 @@ export class SystemMonitor {
             threshold: 50,
             message: `Process ${proc.name} consuming ${proc.cpu.toFixed(1)}% CPU`,
             timestamp: new Date(),
-            metadata: { processName: proc.name, pid: proc.pid },
+            metadata: {
+              processName: proc.name,
+              pid: proc.pid,
+              process_path: proc.path,
+              process_company: proc.company,
+              command_line: proc.command_line
+            },
             eventId: 2003,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -252,18 +258,20 @@ export class SystemMonitor {
     }
   }
 
-  private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number}>> {
+  private async getTopCPUProcesses(): Promise<Array<{name: string, pid: number, cpu: number, path?: string, company?: string, command_line?: string}>> {
     try {
-      // Use Get-Counter for actual real-time CPU percentage per process (not cumulative CPU time)
       const { stdout } = await execAsync(
-        `powershell -Command "$cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors; Get-Process | Where-Object {$_.Id -ne 0} | Sort-Object CPU -Descending | Select-Object -First 5 Name,Id,@{N='CPUPercent';E={[math]::Round(($_.CPU / ((Get-Date) - $_.StartTime).TotalSeconds) * 100 / $cpuCores, 2)}} -ErrorAction SilentlyContinue | ConvertTo-Json"`,
+        `powershell -NoProfile -Command "$cpuCores = (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors; $cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Id -ne 0} | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; CPUPercent=[math]::Round(($_.CPU / ((Get-Date) - $_.StartTime).TotalSeconds) * 100 / $cpuCores, 2); Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
         { timeout: 15000 }
       );
       const processes = JSON.parse(stdout || '[]');
       return Array.isArray(processes) ? processes.map(p => ({
         name: p.Name || 'Unknown',
         pid: p.Id || 0,
-        cpu: p.CPUPercent || 0
+        cpu: p.CPUPercent || 0,
+        path: p.Path || undefined,
+        company: p.Company || undefined,
+        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined
       })) : [];
     } catch {
       return [];
@@ -348,7 +356,13 @@ export class SystemMonitor {
             threshold: 2000,
             message: `Process ${proc.name} using ${proc.memoryMB.toFixed(0)}MB memory`,
             timestamp: new Date(),
-            metadata: { processName: proc.name, pid: proc.pid },
+            metadata: {
+              processName: proc.name,
+              pid: proc.pid,
+              process_path: proc.path,
+              process_company: proc.company,
+              command_line: proc.command_line
+            },
             eventId: 2012,
             eventSource: 'OPSIS-SystemMonitor'
           });
@@ -361,17 +375,20 @@ export class SystemMonitor {
     }
   }
 
-  private async getTopMemoryProcesses(): Promise<Array<{name: string, pid: number, memoryMB: number}>> {
+  private async getTopMemoryProcesses(): Promise<Array<{name: string, pid: number, memoryMB: number, path?: string, company?: string, command_line?: string}>> {
     try {
       const { stdout } = await execAsync(
-        'powershell -Command "Get-Process | Where-Object {$_.WS -gt 0} | Sort-Object WS -Descending | Select-Object -First 5 Name,Id,@{N=\'WS\';E={$_.WS}} | ConvertTo-Json"',
+        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.WS -gt 0} | Sort-Object WS -Descending | Select-Object -First 5 | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; WS=$_.WS; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
         { timeout: 10000 }
       );
       const processes = JSON.parse(stdout || '[]');
       return Array.isArray(processes) ? processes.map(p => ({
         name: p.Name || 'Unknown',
         pid: p.Id || 0,
-        memoryMB: (p.WS || 0) / 1024 / 1024
+        memoryMB: (p.WS || 0) / 1024 / 1024,
+        path: p.Path || undefined,
+        company: p.Company || undefined,
+        command_line: p.CommandLine ? p.CommandLine.substring(0, 500) : undefined
       })) : [];
     } catch {
       return [];
@@ -804,7 +821,7 @@ export class SystemMonitor {
     try {
       // Check for hung/not responding processes
       const { stdout } = await execAsync(
-        'powershell -Command "Get-Process | Where-Object {$_.Responding -eq $false} | Select-Object Name,Id,StartTime | ConvertTo-Json"',
+        `powershell -NoProfile -Command "$cim = @{}; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { $cim[$_.ProcessId] = $_ }; Get-Process | Where-Object {$_.Responding -eq $false} | ForEach-Object { $c = $cim[$_.Id]; [PSCustomObject]@{ Name=$_.ProcessName; Id=$_.Id; StartTime=$_.StartTime; Path=$_.Path; Company=$_.Company; CommandLine=if($c){$c.CommandLine} } } | ConvertTo-Json"`,
         { timeout: 15000 }
       );
 
@@ -824,7 +841,10 @@ export class SystemMonitor {
             metadata: {
               processName: proc.Name,
               pid: proc.Id,
-              startTime: proc.StartTime
+              startTime: proc.StartTime,
+              process_path: proc.Path || undefined,
+              process_company: proc.Company || undefined,
+              command_line: proc.CommandLine ? proc.CommandLine.substring(0, 500) : undefined
             },
             eventId: 2060,
             eventSource: 'OPSIS-SystemMonitor'
