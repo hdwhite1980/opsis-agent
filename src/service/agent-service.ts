@@ -4903,6 +4903,63 @@ if ($success) {
       return;
     }
 
+    // Frequency batching: send telemetry at logarithmic thresholds (10/50/100) without re-escalating
+    if (stateChange.isBatch) {
+      signal = {
+        ...signal,
+        metadata: {
+          ...signal.metadata,
+          occurrence_count: stateChange.frequency,
+          is_batch: true
+        },
+        message: `${signal.message} (occurred ${stateChange.frequency} times)`
+      } as SystemSignal;
+      this.sendTelemetry(signal);
+      return;
+    }
+
+    // Resolution detection: issue self-healed (state returned to normal)
+    if (stateChange.isResolution) {
+      const durationMs = stateChange.fromState
+        ? Date.now() - new Date(this.stateTracker.getResourceState(resourceId)?.stateChangedAt || Date.now()).getTime()
+        : 0;
+
+      this.logger.info('Issue auto-resolved — resource returned to normal', {
+        resourceId,
+        previousState: stateChange.fromState,
+        currentState: stateChange.toState,
+        durationSeconds: Math.round(durationMs / 1000)
+      });
+
+      // Notify server
+      this.safeSend(JSON.stringify({
+        type: 'issue_resolved',
+        timestamp: new Date().toISOString(),
+        device_id: this.deviceInfo.device_id,
+        tenant_id: this.deviceInfo.tenant_id,
+        signal_id: signal.id,
+        resource_id: resourceId,
+        previous_state: stateChange.fromState,
+        current_state: stateChange.toState,
+        duration_seconds: Math.round(durationMs / 1000),
+        resolution_method: 'self_healed'
+      }));
+
+      // Auto-close matching open tickets
+      const tickets = this.ticketDb.getTickets();
+      for (const ticket of tickets) {
+        if (ticket.status === 'resolved' || ticket.status === 'failed') continue;
+        if ((ticket.signature_id && ticket.signature_id.toLowerCase().includes(resourceId.replace(/^(service|process|disk|network|metric):/, '').toLowerCase())) ||
+            (ticket.description && ticket.description.toLowerCase().includes(resourceId.replace(/^(service|process|disk|network|metric):/, '').toLowerCase()))) {
+          this.ticketDb.closeTicket(ticket.ticket_id, 'Auto-resolved: resource returned to normal state', 'success', 'fixed');
+          this.logger.info('Ticket auto-closed by resolution', { ticketId: ticket.ticket_id, resourceId });
+        }
+      }
+
+      this.sendTelemetry(signal);
+      return; // No remediation needed — issue resolved itself
+    }
+
     // Environment Intelligence: trigger incremental scan on service/network state changes
     if (stateChange.isNewState && (resourceType === 'service' || resourceType === 'network')) {
       const envSection = resourceType === 'service' ? 'services' : 'network';
@@ -4939,6 +4996,26 @@ if ($success) {
           originalSignalId: signal.id
         }
       } as SystemSignal;
+    }
+
+    // BITS queue enrichment: if signal is BITS-related, gather queue status before sending
+    if (signal.metadata?.bitsRelated) {
+      try {
+        const bitsResult = securePowerShell(
+          `Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | Select-Object DisplayName, JobState, BytesTransferred, BytesTotal | ConvertTo-Json -Compress`,
+          { timeout: 10000 }
+        );
+        if (bitsResult.success && bitsResult.stdout?.trim()) {
+          let bitsQueue = JSON.parse(bitsResult.stdout);
+          if (!Array.isArray(bitsQueue)) bitsQueue = [bitsQueue];
+          signal = {
+            ...signal,
+            metadata: { ...signal.metadata, bitsQueue }
+          } as SystemSignal;
+        }
+      } catch (e: any) {
+        this.logger.debug('BITS queue enrichment failed', { error: e.message });
+      }
     }
 
     // Stream telemetry to server in real-time

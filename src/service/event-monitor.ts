@@ -838,20 +838,38 @@ ConvertTo-Json -Depth 3
   private extractEventData(event: EventLogEntry): Record<string, any> {
     const data: Record<string, any> = {};
 
-    // Extract service name from Event ID 7034, 7031, 7036 messages
+    // Extract service name and failure type from Event ID 7034, 7031, 7036
     if ([7034, 7031, 7036].includes(event.id)) {
       const serviceNameMatch = event.message.match(/The (.+?) service/i);
       if (serviceNameMatch) {
         data.serviceName = serviceNameMatch[1].trim();
         this.logger.debug('Extracted service name', { serviceName: data.serviceName });
       }
+      data.serviceFailureType = event.id === 7034 ? 'unexpected_termination'
+        : event.id === 7031 ? 'crash_recovery_attempt' : 'state_change';
     }
 
-    // Extract application name from crash events (1000, 1001)
+    // Extract crash details from application crash events (1000, 1001)
     if ([1000, 1001].includes(event.id)) {
       const appNameMatch = event.message.match(/Faulting application name: (.+?),/i);
       if (appNameMatch) {
         data.applicationName = appNameMatch[1].trim();
+      }
+      const moduleMatch = event.message.match(/Faulting module name: (.+?),/i);
+      if (moduleMatch) {
+        data.faultingModule = moduleMatch[1].trim();
+      }
+      const moduleVersionMatch = event.message.match(/Faulting module version: (.+?),/i);
+      if (moduleVersionMatch) {
+        data.faultingModuleVersion = moduleVersionMatch[1].trim();
+      }
+      const exceptionMatch = event.message.match(/Exception code: (0x[0-9a-fA-F]+)/i);
+      if (exceptionMatch) {
+        data.exceptionCode = exceptionMatch[1];
+      }
+      const appPathMatch = event.message.match(/Faulting application path: (.+)/i);
+      if (appPathMatch) {
+        data.faultingApplicationPath = appPathMatch[1].trim();
       }
     }
 
@@ -861,6 +879,11 @@ ConvertTo-Json -Depth 3
       if (driveMatch) {
         data.driveLetter = driveMatch[1];
       }
+    }
+
+    // Flag BITS-related events for queue status enrichment
+    if (event.source === 'BITS' || (event.id >= 16384 && event.source === 'Microsoft-Windows-Bits-Client')) {
+      data.bitsRelated = true;
     }
 
     return data;

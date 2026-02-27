@@ -105,6 +105,9 @@ export interface ProcessInfo {
   thread_count: number;
   handle_count: number;
   start_time?: string;
+  path?: string;
+  company?: string;
+  command_line?: string;
 }
 
 export interface ProcessorInfo {
@@ -1124,10 +1127,16 @@ export class Primitives {
             }
           }
         }
+        $cimProcs = @{}
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+          $cimProcs[$_.ProcessId] = $_
+        }
         Get-Process | Sort-Object CPU -Descending | Select-Object -First ${count} |
         ForEach-Object {
           $pn = $_.ProcessName.ToLower()
           $cpuPct = if ($cpuMap.ContainsKey($pn)) { $cpuMap[$pn] } else { 0 }
+          $cim = $cimProcs[$_.Id]
+          $cmdLine = if ($cim -and $cim.CommandLine) { $cim.CommandLine.Substring(0, [math]::Min($cim.CommandLine.Length, 500)) } else { $null }
           [PSCustomObject]@{
             name = $_.ProcessName
             pid = $_.Id
@@ -1136,6 +1145,9 @@ export class Primitives {
             thread_count = $_.Threads.Count
             handle_count = $_.HandleCount
             start_time = if ($_.StartTime) { $_.StartTime.ToString('o') } else { $null }
+            path = if ($_.Path) { $_.Path } elseif ($cim) { $cim.ExecutablePath } else { $null }
+            company = $_.Company
+            command_line = $cmdLine
           }
         } | ConvertTo-Json -Compress
       `;

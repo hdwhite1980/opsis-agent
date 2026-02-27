@@ -40,6 +40,9 @@ export interface StateChangeEvent {
   isNewState: boolean;
   isFlap?: boolean;
   transitionCount?: number;
+  isResolution?: boolean;  // State returned to normal — issue self-healed
+  isBatch?: boolean;       // Frequency batch threshold hit (10/50/100)
+  frequency?: number;      // How many times this state has been seen
 }
 
 export interface SeverityEscalationConfig {
@@ -154,9 +157,23 @@ export class StateTracker {
 
     existing.lastCheckedAt = now.toISOString();
 
-    // Same state — deduplicate
+    // Same state — deduplicate with frequency batching
     if (existing.currentState === currentState) {
       existing.signalCount++;
+
+      // Send at logarithmic thresholds: 10th, 50th, 100th, then every 100
+      const batchThresholds = [10, 50, 100];
+      if (batchThresholds.includes(existing.signalCount) ||
+          (existing.signalCount > 100 && existing.signalCount % 100 === 0)) {
+        return {
+          resourceId, resourceType,
+          fromState: currentState, toState: currentState,
+          changedAt: now, isNewState: false,
+          isBatch: true,
+          frequency: existing.signalCount
+        };
+      }
+
       return null;
     }
 
@@ -178,6 +195,11 @@ export class StateTracker {
       }
     }
 
+    // Detect resolution: state returned to normal from an abnormal state
+    const normalStates = ['running', 'ok', 'normal', 'info'];
+    const isResolution = normalStates.includes(currentState.toLowerCase()) &&
+                         !normalStates.includes(fromState.toLowerCase());
+
     // Normal state change
     existing.previousState = fromState;
     existing.currentState = currentState;
@@ -192,7 +214,8 @@ export class StateTracker {
     return {
       resourceId, resourceType,
       fromState, toState: currentState,
-      changedAt: now, isNewState: true
+      changedAt: now, isNewState: true,
+      isResolution
     };
   }
 
