@@ -3907,6 +3907,56 @@ if ($success) {
     } else {
       this.logger.info('Target already in exclusion list', { target, category });
     }
+
+    // Close any open tickets that match the excluded target
+    this.closeTicketsForExclusion(target, category);
+  }
+
+  /**
+   * When a target is excluded, retroactively close any open tickets that match it.
+   * Matches by signature_id, description text, or service/process name in the ticket.
+   */
+  private closeTicketsForExclusion(target: string, category: 'services' | 'processes' | 'signatures'): void {
+    const targetLower = target.toLowerCase();
+    const reason = `Excluded from monitoring (${category}: ${target})`;
+    let closed = 0;
+
+    const tickets = this.ticketDb.getTickets();
+    for (const ticket of tickets) {
+      if (ticket.status === 'resolved' || ticket.status === 'failed') continue;
+
+      let matches = false;
+
+      if (category === 'signatures') {
+        // Match signature_id directly or in description
+        if (ticket.signature_id && ticket.signature_id.toLowerCase() === targetLower) {
+          matches = true;
+        } else if (ticket.description && ticket.description.toLowerCase().includes(targetLower)) {
+          matches = true;
+        }
+      } else {
+        // For services/processes, match in signature_id or description
+        if (ticket.signature_id && ticket.signature_id.toLowerCase().includes(targetLower)) {
+          matches = true;
+        } else if (ticket.description && ticket.description.toLowerCase().includes(targetLower)) {
+          matches = true;
+        }
+      }
+
+      if (matches) {
+        this.ticketDb.closeTicket(ticket.ticket_id, reason, 'success', 'ignored');
+        this.logger.info('Ticket closed by exclusion', {
+          ticketId: ticket.ticket_id,
+          target,
+          category
+        });
+        closed++;
+      }
+    }
+
+    if (closed > 0) {
+      this.logger.info('Exclusion retroactively closed open tickets', { target, category, count: closed });
+    }
   }
 
   private isIgnoreInstruction(playbook: PlaybookTask): { isIgnore: boolean; reason: string } {
@@ -4446,6 +4496,9 @@ if ($success) {
     } catch (error) {
       this.logger.error('Failed to save ignore list', error);
     }
+
+    // Close any open tickets matching this signature
+    this.closeTicketsForExclusion(signature, 'signatures');
   }
 
   private shouldIgnoreSignature(signature: string): boolean {
