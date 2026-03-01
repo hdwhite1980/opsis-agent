@@ -419,7 +419,9 @@ const CORE_PROTECTED_SERVICES: ReadonlySet<string> = new Set([
   'rpcss', 'dcomlaunch', 'lsm', 'samss', 'eventlog',
   'plugplay', 'power', 'winmgmt', 'cryptsvc', 'bits',
   'lanmanserver', 'lanmanworkstation', 'schedule', 'w32time',
-  'dnscache', 'dhcp', 'netlogon', 'wuauserv', 'trustedinstaller'
+  'dnscache', 'dhcp', 'netlogon', 'wuauserv', 'trustedinstaller',
+  'windefend', 'mpssvc', 'wscsvc', 'seclogon', 'bfe',
+  'sens', 'nsi', 'profisvc', 'gpsvc'
 ]);
 
 // Tier 2: Server-managed protections (MSP-defined, pushed via config-update)

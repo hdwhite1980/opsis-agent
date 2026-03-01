@@ -573,9 +573,13 @@ class OPSISAgentService {
         }
         return JSON.parse(data);
       }
-    } catch (err) {
+    } catch (err: any) {
       if (this.logger) {
-        this.logger.error('Error loading config, using defaults', err);
+        this.logger.error('SECURITY WARNING: Config file corrupted or tampered — falling back to safe defaults', err, {
+          configPath: this.configPath,
+          errorType: err?.name || 'unknown',
+          detail: err?.message || String(err)
+        });
       }
     }
 
@@ -5137,11 +5141,12 @@ if ($success) {
     // NEW: Generate signature from system signal
     const signature = this.signatureGenerator.generateFromSystemSignal(signal, this.deviceInfo);
 
-    // Apply correlation-based confidence boost
+    // Apply correlation-based confidence boost (capped at configured threshold to prevent bypass)
+    const maxConfidence = this.config.confidenceThreshold || 75;
     if (correlation?.action.confidenceBoost) {
-      signature.confidence_local = correlation.action.confidenceBoost;
+      signature.confidence_local = Math.min(correlation.action.confidenceBoost, maxConfidence);
     } else if (correlation?.action.confidenceDelta) {
-      signature.confidence_local = Math.min(100, signature.confidence_local + correlation.action.confidenceDelta);
+      signature.confidence_local = Math.min(maxConfidence, signature.confidence_local + correlation.action.confidenceDelta);
     }
 
     this.logger.info('System signature generated', {

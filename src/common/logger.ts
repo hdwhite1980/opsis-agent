@@ -80,8 +80,8 @@ export class Logger {
     const timestamp = new Date().toISOString();
     const levelName = LogLevel[level];
 
-    // Sanitize message to remove sensitive data
-    const sanitizedMessage = sanitizeLogData(message) as string;
+    // Sanitize message to remove sensitive data and prevent log injection
+    const sanitizedMessage = (sanitizeLogData(message) as string).replace(/[\r\n]+/g, ' ');
     let logLine = `[${timestamp}] [${levelName}] [${this.component}] ${sanitizedMessage}`;
 
     if (data) {
@@ -91,8 +91,8 @@ export class Logger {
     }
 
     if (error) {
-      // Sanitize error message and stack trace
-      const errorMessage = sanitizeLogData(error.message || String(error)) as string;
+      // Sanitize error message and stack trace, strip injected newlines
+      const errorMessage = (sanitizeLogData(error.message || String(error)) as string).replace(/[\r\n]+/g, ' ');
       logLine += `\n  Error: ${errorMessage}`;
       if (error.stack && level >= LogLevel.ERROR) {
         // Only include stack traces for ERROR and above, and sanitize them

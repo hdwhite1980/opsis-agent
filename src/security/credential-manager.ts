@@ -13,8 +13,13 @@ try {
   keytar = require('keytar');
 } catch (error) {
   keytarLoadError = error as Error;
-  // Log once at startup - will be enforced when credentials are actually needed
-  console.error('SECURITY: keytar module failed to load - secure credential storage unavailable');
+  // Log prominently at startup — credential operations will throw at runtime
+  console.error('========================================');
+  console.error('SECURITY WARNING: keytar module failed to load');
+  console.error('Secure credential storage (Windows Credential Manager) is UNAVAILABLE.');
+  console.error('Ensure Visual C++ Redistributable is installed and keytar.node is present.');
+  console.error(`Load error: ${(error as Error).message}`);
+  console.error('========================================');
 }
 
 /**

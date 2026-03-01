@@ -133,7 +133,7 @@ export class SignatureGenerator {
   
   private generateHash(data: any): string {
     const normalized = JSON.stringify(data, Object.keys(data).sort());
-    return crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 16);
+    return crypto.createHash('sha256').update(normalized).digest('hex').substring(0, 32);
   }
   
   private extractMessagePattern(message: string): string {

@@ -12,7 +12,7 @@ export interface CorrelationResult {
 
 export interface CorrelationAction {
   type: 'boost_confidence' | 'suggest_playbook' | 'enrich_escalation';
-  confidenceBoost?: number;   // Absolute value to set confidence to (e.g. 95)
+  confidenceBoost?: number;   // Absolute value to set confidence to (capped by caller's threshold)
   confidenceDelta?: number;   // Additive delta (e.g. +25)
   suggestedPlaybook?: string;
   escalationNote?: string;

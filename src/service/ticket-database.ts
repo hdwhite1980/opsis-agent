@@ -37,6 +37,7 @@ export class TicketDatabase {
   private logger: Logger;
   private dbPath: string;
   private nextId: number = 1;
+  private writeLock: Promise<void> = Promise.resolve();
 
   constructor(logger: Logger, dbPath: string) {
     this.logger = logger;
@@ -105,6 +106,19 @@ export class TicketDatabase {
     }
   }
 
+  // Serialize all write operations to prevent race conditions on concurrent mutations
+  private async withWriteLock<T>(fn: () => T): Promise<T> {
+    const prev = this.writeLock;
+    let resolve: () => void;
+    this.writeLock = new Promise<void>(r => { resolve = r; });
+    await prev;
+    try {
+      return fn();
+    } finally {
+      resolve!();
+    }
+  }
+
   private save(): void {
     try {
       const data = JSON.stringify({
@@ -120,22 +134,19 @@ export class TicketDatabase {
   }
 
   public createTicket(ticket: Ticket): string {
-    try {
-      ticket.id = this.nextId++;
-      this.tickets.push(ticket);
-      this.save();
+    // Synchronous mutation — safe under withWriteLock from callers,
+    // but also safe standalone since Node.js is single-threaded for sync ops
+    ticket.id = this.nextId++;
+    this.tickets.push(ticket);
+    this.save();
 
-      this.logger.info('Ticket created', {
-        ticketId: ticket.ticket_id,
-        type: ticket.type,
-        status: ticket.status
-      });
+    this.logger.info('Ticket created', {
+      ticketId: ticket.ticket_id,
+      type: ticket.type,
+      status: ticket.status
+    });
 
-      return ticket.ticket_id;
-    } catch (error) {
-      this.logger.error('Error creating ticket', error);
-      throw error;
-    }
+    return ticket.ticket_id;
   }
 
   public getTickets(limit: number = 100): Ticket[] {
@@ -249,41 +260,35 @@ export class TicketDatabase {
     }
   }
 
-  public deleteAllTickets(): number {
-    try {
+  public async deleteAllTickets(): Promise<number> {
+    return this.withWriteLock(() => {
       const count = this.tickets.length;
       this.tickets = [];
       this.nextId = 1;
       this.save();
       this.logger.info('All tickets deleted', { count });
       return count;
-    } catch (error) {
-      this.logger.error('Error deleting all tickets', error);
-      return 0;
-    }
+    });
   }
 
-  public deleteOldTickets(olderThanDays: number = 1): number {
-    try {
+  public async deleteOldTickets(olderThanDays: number = 1): Promise<number> {
+    return this.withWriteLock(() => {
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
-      
+
       const beforeCount = this.tickets.length;
       this.tickets = this.tickets.filter(t => {
         return new Date(t.timestamp) > cutoffDate;
       });
       const deleted = beforeCount - this.tickets.length;
-      
+
       if (deleted > 0) {
         this.save();
       }
 
       this.logger.info('Old tickets deleted', { count: deleted, olderThanDays });
       return deleted;
-    } catch (error) {
-      this.logger.error('Error deleting old tickets', error);
-      return 0;
-    }
+    });
   }
 
   public getStatistics(): {

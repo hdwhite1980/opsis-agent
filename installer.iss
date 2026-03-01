@@ -95,8 +95,8 @@ Name: "{autodesktop}\OPSIS Control Panel"; Filename: "http://localhost:19851"; I
 [Run]
 ; === SECURITY HARDENING ===
 
-; 1. Set PowerShell execution policy (required for agent monitoring commands)
-Filename: "powershell.exe"; Parameters: "-Command ""Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force"""; StatusMsg: "Configuring PowerShell execution policy..."; Flags: runhidden waituntilterminated shellexec
+; 1. PowerShell execution policy: NOT set globally. The agent uses -ExecutionPolicy Bypass
+;    on each invocation so no machine-wide policy change is needed.
 
 ; 2. Defender exclusions are now applied in PrepareToInstall() before files are copied.
 ;    Re-apply here in case PrepareToInstall path differed (e.g. user changed install dir).
@@ -191,8 +191,18 @@ begin
   if not IsVCRedistInstalled() then
   begin
     if FileExists(ExpandConstant('{tmp}\vc_redist.x64.exe')) then
+    begin
+      // SECURITY: Verify Authenticode signature before executing to prevent TOCTOU substitution
+      Exec('powershell.exe', '-NoProfile -Command "if ((Get-AuthenticodeSignature ''' + ExpandConstant('{tmp}\vc_redist.x64.exe') + ''').Status -ne ''Valid'') { exit 1 }"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      if ResultCode <> 0 then
+      begin
+        Result := 'Visual C++ Redistributable failed signature verification. The file may have been tampered with. Please re-download from https://aka.ms/vs/17/release/vc_redist.x64.exe';
+        Exit;
+      end;
       Exec(ExpandConstant('{tmp}\vc_redist.x64.exe'), '/install /quiet /norestart', '',
         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
     if not IsVCRedistInstalled() then
     begin
       Result := 'Visual C++ Redistributable could not be installed. Please install it manually from https://aka.ms/vs/17/release/vc_redist.x64.exe and re-run this installer.';
