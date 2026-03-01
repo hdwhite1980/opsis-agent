@@ -5,7 +5,8 @@
     "TrustedInstaller",
     "msiserver",
     "AppIDSvc",
-    "SageService"
+    "SageService",
+    "WslInstaller"
   ],
   "processes": [
     "Sage50"

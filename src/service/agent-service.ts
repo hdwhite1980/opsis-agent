@@ -4747,7 +4747,8 @@ if ($success) {
 
     // Gate 2: State tracking deduplication
     const resourceId = `event:${event.source}:${event.id}`;
-    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, undefined, { eventId: event.id, source: event.source });
+    const eventSeverity = event.level === 'Error' || event.level === 'Critical' ? 'critical' : 'warning';
+    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, eventSeverity, { eventId: event.id, source: event.source });
     if (!stateChange) {
       this.logger.debug('Event state unchanged, suppressing', { resourceId });
       return;
@@ -4837,10 +4838,19 @@ if ($success) {
    * UPDATED: Handle system issues with signature system
    */
   private handleSystemIssue(signal: SystemSignal): void {
+    // Gate -1: Skip service signals with no service name — they can't be deduped or actioned
+    if (signal.category === 'services' && !signal.metadata?.serviceName) {
+      this.logger.debug('Signal suppressed — service signal has no service name', { signal_id: signal.id });
+      return;
+    }
+
     // Gate 0: Exclusion list check — skip signals for excluded services/processes/signatures
+    // All comparisons are case-insensitive to prevent mismatches (e.g. "WslInstaller" vs "wslinstaller")
     const exclusions = this.loadExclusionsFile();
+    const excludedServicesLower = exclusions.services.map((s: string) => s.toLowerCase());
+    const excludedProcessesLower = exclusions.processes.map((s: string) => s.toLowerCase());
     if (signal.category === 'services' && signal.metadata?.serviceName) {
-      if (exclusions.services.includes(signal.metadata.serviceName)) {
+      if (excludedServicesLower.includes(signal.metadata.serviceName.toLowerCase())) {
         this.logger.debug('Signal suppressed by exclusion list (service)', {
           service: signal.metadata.serviceName, signal_id: signal.id
         });
@@ -4848,7 +4858,7 @@ if ($success) {
       }
     }
     if (signal.category === 'processes' && signal.metadata?.processName) {
-      if (exclusions.processes.includes(signal.metadata.processName)) {
+      if (excludedProcessesLower.includes(signal.metadata.processName.toLowerCase())) {
         this.logger.debug('Signal suppressed by exclusion list (process)', {
           process: signal.metadata.processName, signal_id: signal.id
         });
@@ -5601,7 +5611,8 @@ if ($success) {
   private handleEscalationNeeded(event: EventLogEntry, reason: string): void {
     // Gate 1: State tracking deduplication — suppress repeated escalations for unchanged events
     const resourceId = `event:${event.source}:${event.id}`;
-    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, undefined, { eventId: event.id, source: event.source });
+    const eventSeverity = event.level === 'Error' || event.level === 'Critical' ? 'critical' : 'warning';
+    const stateChange = this.stateTracker.checkState(resourceId, 'service', event.level, eventSeverity, { eventId: event.id, source: event.source });
     if (!stateChange) {
       this.logger.debug('Legacy escalation suppressed — event state unchanged', { resourceId });
       return;
@@ -6509,7 +6520,11 @@ if ($success) {
   // ============================================
 
   private deriveResourceId(signal: SystemSignal): string {
-    if (signal.category === 'services') return `service:${signal.metadata?.serviceName || signal.id}`;
+    if (signal.category === 'services') {
+      const name = signal.metadata?.serviceName;
+      if (!name) return `service:unknown:${signal.id}`;
+      return `service:${name}`;
+    }
     if (signal.category === 'performance' && signal.metadata?.processName) return `process:${signal.metadata.processName}`;
     if (signal.category === 'storage') return `disk:${signal.metadata?.drive || signal.id}`;
     if (signal.category === 'network') return `network:${signal.metadata?.adapter || signal.id}`;
