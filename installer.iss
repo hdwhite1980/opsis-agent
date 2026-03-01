@@ -242,14 +242,19 @@ begin
   Sleep(500);
 
   // Offer to clear old tickets on upgrade/reinstall
-  if FileExists(AppPath + '\data\tickets.json') then
+  // Use PowerShell Test-Path because the data directory has restrictive ACLs
+  // (SYSTEM + Admins only) and Inno Setup's FileExists() may not use the elevated token
+  Exec('powershell.exe', '-NoProfile -Command "if (Test-Path ''' + AppPath + '\data\tickets.json'') { exit 0 } else { exit 1 }"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
   begin
     if MsgBox('An existing ticket database was found.' + #13#10 + #13#10 +
       'Would you like to clear all old tickets?' + #13#10 +
       'This is recommended when upgrading to remove false alerts from previous versions.',
       mbConfirmation, MB_YESNO) = IDYES then
     begin
-      DeleteFile(AppPath + '\data\tickets.json');
+      Exec('powershell.exe', '-NoProfile -Command "Remove-Item -Force ''' + AppPath + '\data\tickets.json''"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;
