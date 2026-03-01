@@ -230,6 +230,18 @@ begin
   // Also kill any lingering opsis-agent-service.exe process
   Exec('taskkill.exe', '/F /IM opsis-agent-service.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(500);
+
+  // Offer to clear old tickets on upgrade/reinstall
+  if FileExists(AppPath + '\data\tickets.json') then
+  begin
+    if MsgBox('An existing ticket database was found.' + #13#10 + #13#10 +
+      'Would you like to clear all old tickets?' + #13#10 +
+      'This is recommended when upgrading to remove false alerts from previous versions.',
+      mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      DeleteFile(AppPath + '\data\tickets.json');
+    end;
+  end;
 end;
 
 procedure InitializeWizard;
@@ -459,13 +471,22 @@ begin
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  AppPath: string;
 begin
-  if CurUninstallStep = usPostUninstall then
+  // Use usUninstall (before Inno removes files) so runtime-generated files are still reachable.
+  // The [UninstallRun] section has already stopped and removed the service by this point.
+  if CurUninstallStep = usUninstall then
   begin
+    AppPath := ExpandConstant('{app}');
+
+    // Give WinSW a moment to fully release file handles after service stop
+    Sleep(2000);
+
     if MsgBox('Do you want to keep your logs and configuration data?', mbConfirmation, MB_YESNO) = IDNO then
     begin
-      DelTree(ExpandConstant('{app}\data'), True, True, True);
-      DelTree(ExpandConstant('{app}\logs'), True, True, True);
+      DelTree(AppPath + '\data', True, True, True);
+      DelTree(AppPath + '\logs', True, True, True);
     end;
   end;
 end;
