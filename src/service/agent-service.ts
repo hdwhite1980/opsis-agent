@@ -2591,7 +2591,28 @@ class OPSISAgentService {
           break;
 
         case 'config-update':
-          this.updateConfig(data.config);
+          // SECURITY: Only accept known config fields with valid types from server
+          if (data.config && typeof data.config === 'object') {
+            const allowed: Record<string, string> = {
+              autoConnect: 'boolean', autoUpdate: 'boolean', autoRemediation: 'boolean',
+              preActionNotifications: 'boolean', confidenceThreshold: 'number',
+              updateCheckInterval: 'number'
+            };
+            const safeConfig: Partial<AgentConfig> = {};
+            for (const [key, expectedType] of Object.entries(allowed)) {
+              if (key in data.config && typeof data.config[key] === expectedType) {
+                (safeConfig as any)[key] = data.config[key];
+              }
+            }
+            // Bound numeric values
+            if (typeof safeConfig.confidenceThreshold === 'number') {
+              safeConfig.confidenceThreshold = Math.max(0, Math.min(100, safeConfig.confidenceThreshold));
+            }
+            if (typeof safeConfig.updateCheckInterval === 'number') {
+              safeConfig.updateCheckInterval = Math.max(1, Math.min(1440, safeConfig.updateCheckInterval));
+            }
+            this.updateConfig(safeConfig);
+          }
           // Handle protected applications list from server
           if (data.protected_applications) {
             this.saveProtectedApplications(data.protected_applications);
@@ -6175,6 +6196,10 @@ if ($success) {
       if (params && Object.keys(params).length > 0) {
         const paramString = Object.entries(params)
           .map(([key, value]) => {
+            // SECURITY: Validate param key — alphanumeric only, no injection
+            if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(key)) {
+              throw new Error(`Invalid PowerShell parameter key: ${key}`);
+            }
             const sanitized = String(value).replace(/'/g, "''");
             return `-${key} '${sanitized}'`;
           })
@@ -6226,6 +6251,10 @@ if ($success) {
     }
   }
 
+  private static readonly VALID_REG_TYPES = new Set([
+    'REG_SZ', 'REG_EXPAND_SZ', 'REG_DWORD', 'REG_QWORD', 'REG_BINARY', 'REG_MULTI_SZ', 'REG_NONE'
+  ]);
+
   private async executeRegistryAction(action: string, params: Record<string, any>): Promise<void> {
     const { key, valueName, valueData, valueType } = params;
 
@@ -6234,14 +6263,19 @@ if ($success) {
       throw new Error(`Invalid registry key path: ${key}`);
     }
 
+    // SECURITY: Validate valueType against allowlist to prevent injection
+    if (valueType && !OPSISAgentService.VALID_REG_TYPES.has(valueType)) {
+      throw new Error(`Invalid registry value type: ${valueType}`);
+    }
+
     // Escape double quotes in values
     const safeValueName = String(valueName).replace(/"/g, '\\"');
     const safeValueData = valueData != null ? String(valueData).replace(/"/g, '\\"') : '';
 
     if (action === 'set') {
-      await execAsync(`reg add "${key}" /v "${safeValueName}" /t ${valueType} /d "${safeValueData}" /f`);
+      await execFileAsync('reg.exe', ['add', key, '/v', String(valueName), '/t', valueType, '/d', String(valueData ?? ''), '/f'], { timeout: 30000 });
     } else if (action === 'delete') {
-      await execAsync(`reg delete "${key}" /v "${safeValueName}" /f`);
+      await execFileAsync('reg.exe', ['delete', key, '/v', String(valueName), '/f'], { timeout: 30000 });
     }
   }
 

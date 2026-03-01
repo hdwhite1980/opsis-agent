@@ -1734,7 +1734,7 @@
                 box.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#FEF2F2;color:#DC2626;padding:8px 12px;font-size:11px;z-index:99999;max-height:120px;overflow-y:auto;font-family:monospace;border-top:2px solid #FCA5A5;';
                 document.body.appendChild(box);
             }
-            box.innerHTML = Object.entries(debugErrors).map(([k, v]) => k + ': ' + v).join('<br>');
+            box.innerHTML = Object.entries(debugErrors).map(([k, v]) => escapeHtml(k) + ': ' + escapeHtml(v)).join('<br>');
         }
         function clearDebugErrors() {
             Object.keys(debugErrors).forEach(k => delete debugErrors[k]);
@@ -1915,11 +1915,11 @@
                             <line x1="12" y1="17" x2="12.01" y2="17"></line>
                         </svg>
                         <div class="alert-content">
-                            <div class="alert-title">${alert.title || alert.service + ' Issue'}</div>
-                            <div class="alert-message">${alert.message || ''}</div>
+                            <div class="alert-title">${escapeHtml(alert.title || alert.service + ' Issue')}</div>
+                            <div class="alert-message">${escapeHtml(alert.message || '')}</div>
                             <div class="alert-meta">
-                                <span class="alert-provider-badge">${providerLabel}</span>
-                                ${alert.affectedServices ? '<span>Affected: ' + alert.affectedServices.join(', ') + '</span>' : ''}
+                                <span class="alert-provider-badge">${escapeHtml(providerLabel)}</span>
+                                ${alert.affectedServices ? '<span>Affected: ' + alert.affectedServices.map(s => escapeHtml(s)).join(', ') + '</span>' : ''}
                                 ${time ? '<span>' + time + '</span>' : ''}
                                 ${eta ? '<span>' + eta + '</span>' : ''}
                             </div>
@@ -2119,11 +2119,11 @@
                 </div>
                 <div class="ticket-detail" id="detail-${gid}">
                     <div class="detail-meta">
-                        <span>ID: ${ticket.ticket_id}</span>
+                        <span>ID: ${escapeHtml(ticket.ticket_id)}</span>
                         <span>Created: ${formatTimestamp(ticket.timestamp || ticket.created_at)}</span>
-                        ${ticket.computer_name ? '<span>Host: ' + ticket.computer_name + '</span>' : ''}
-                        ${ticket.signature_id ? '<span>Sig: ' + ticket.signature_id + '</span>' : ''}
-                        ${ticket.action_type ? '<span>Action: ' + ticket.action_type.replace(/_/g, ' ') + '</span>' : ''}
+                        ${ticket.computer_name ? '<span>Host: ' + escapeHtml(ticket.computer_name) + '</span>' : ''}
+                        ${ticket.signature_id ? '<span>Sig: ' + escapeHtml(ticket.signature_id) + '</span>' : ''}
+                        ${ticket.action_type ? '<span>Action: ' + escapeHtml(ticket.action_type.replace(/_/g, ' ')) + '</span>' : ''}
                     </div>
                 </div>`;
         }
@@ -2497,8 +2497,8 @@
                 }
                 return `
                     <div class="correlation-card ${confCls}">
-                        <div class="correlation-title">${c.category || key}</div>
-                        <div class="correlation-detail">${c.recommendedAction || 'Investigation recommended'}</div>
+                        <div class="correlation-title">${escapeHtml(c.category || key)}</div>
+                        <div class="correlation-detail">${escapeHtml(c.recommendedAction || 'Investigation recommended')}</div>
                         ${failHtml}
                         <span class="correlation-confidence" style="background:${confColor}15;color:${confColor};">${confPct}% confidence</span>
                     </div>`;
@@ -2517,10 +2517,10 @@
                 return `
                     <div class="action-card">
                         <div class="action-header">
-                            <span class="action-title">${p.signalId || p.patternId}</span>
-                            <span class="urgency-badge ${urgCls}">${p.urgency || 'low'}</span>
+                            <span class="action-title">${escapeHtml(p.signalId || p.patternId)}</span>
+                            <span class="urgency-badge ${urgCls}">${escapeHtml(p.urgency || 'low')}</span>
                         </div>
-                        <div class="action-reasoning">${p.recommendation || ''}</div>
+                        <div class="action-reasoning">${escapeHtml(p.recommendation || '')}</div>
                         <div style="font-size:10px;color:#9CA3AF;">
                             ${p.occurrenceCount || 0} occurrences &middot; ${trendIcon} ${p.trend || 'stable'} &middot; ${(p.frequency || 0).toFixed(1)}/day
                         </div>
@@ -2574,10 +2574,10 @@
                 return `
                     <div class="action-card">
                         <div class="action-header">
-                            <span class="action-title">${a.title || 'Action'}</span>
-                            <span class="urgency-badge ${urgCls}">${a.urgency || 'low'}</span>
+                            <span class="action-title">${escapeHtml(a.title || 'Action')}</span>
+                            <span class="urgency-badge ${urgCls}">${escapeHtml(a.urgency || 'low')}</span>
                         </div>
-                        <div class="action-reasoning">${a.reasoning || ''}</div>
+                        <div class="action-reasoning">${escapeHtml(a.reasoning || '')}</div>
                     </div>`;
             }).join('');
         }

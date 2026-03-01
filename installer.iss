@@ -129,7 +129,7 @@ Filename: "powershell.exe"; Parameters: "-Command ""if (-not [System.Diagnostics
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\store-apikey.ps1"" -ConfigPath ""{app}\data\agent.config.json"""; StatusMsg: "Securing API credentials..."; Flags: runhidden waituntilterminated shellexec
 
 ; 9. Generate IPC authentication secret for GUI-to-service communication
-Filename: "powershell.exe"; Parameters: "-Command ""$secret = [System.Convert]::ToBase64String((1..32 | ForEach-Object {{ [byte](Get-Random -Minimum 0 -Maximum 256) }})); $regPath = 'HKLM:\SOFTWARE\OPSIS\Agent'; if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}; Set-ItemProperty -Path $regPath -Name 'IPCSecret' -Value $secret"""; StatusMsg: "Generating IPC authentication secret..."; Flags: runhidden waituntilterminated shellexec
+Filename: "powershell.exe"; Parameters: "-Command ""$rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new(); $bytes = New-Object byte[] 32; $rng.GetBytes($bytes); $rng.Dispose(); $secret = [System.Convert]::ToBase64String($bytes); $regPath = 'HKLM:\SOFTWARE\OPSIS\Agent'; if (-not (Test-Path $regPath)) {{ New-Item -Path $regPath -Force | Out-Null }}; Set-ItemProperty -Path $regPath -Name 'IPCSecret' -Value $secret"""; StatusMsg: "Generating IPC authentication secret..."; Flags: runhidden waituntilterminated shellexec
 
 ; === SERVICE INSTALLATION ===
 ; Service install/start is handled in CurStepChanged(ssPostInstall) for better error capture.

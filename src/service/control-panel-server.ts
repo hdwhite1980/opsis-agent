@@ -81,9 +81,10 @@ export class ControlPanelServer {
     this.server.on('upgrade', (req, socket, head) => {
       if (req.url === '/ws') {
         // SECURITY: Verify Origin header to prevent cross-site WebSocket hijacking
+        // Origin is required — reject if missing (non-browser clients don't need the GUI)
         const origin = req.headers.origin;
-        if (origin && !origin.match(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/)) {
-          this.logger.warn('Control panel WebSocket rejected: invalid origin', { origin });
+        if (!origin || !origin.match(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/)) {
+          this.logger.warn('Control panel WebSocket rejected: missing or invalid origin', { origin: origin || '(none)' });
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
           socket.destroy();
           return;
