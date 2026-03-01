@@ -969,7 +969,15 @@ export class EventMonitor {
     }
   }
 
+  private static readonly ALLOWED_LOG_NAMES = ['System', 'Application', 'Security'];
+
   private async checkLog(logName: string): Promise<void> {
+    // SECURITY: Only allow known log names to prevent injection via interpolation
+    if (!EventMonitor.ALLOWED_LOG_NAMES.includes(logName)) {
+      this.logger.error('SECURITY: Blocked invalid log name', { logName });
+      return;
+    }
+
     try {
       // Calculate hours back from now
       const now = new Date();

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import * as crypto from 'crypto';
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import WebSocket from 'ws';
 import { getServiceLogger, Logger } from '../common/logger';
@@ -60,6 +60,7 @@ import {
 } from '../security';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Protected processes and services that must NEVER be killed/stopped
 const PROTECTED_PROCESSES: ReadonlySet<string> = new Set([
@@ -1126,6 +1127,12 @@ class OPSISAgentService {
       const { serviceName } = data;
       this.logger.info('IPC: Received suppress-service request', { serviceName });
 
+      // SECURITY: Validate service name before use in commands
+      try { this.validateServiceName(serviceName); } catch (e: any) {
+        this.ipcServer.sendToClient(socket, { type: 'suppress-service-result', data: { success: false, error: e.message } });
+        return;
+      }
+
       // Check if service is safe to stop
       if (!OPSISAgentService.SAFE_TO_STOP_SERVICES.has(serviceName)) {
         this.ipcServer.sendToClient(socket, {
@@ -1136,8 +1143,8 @@ class OPSISAgentService {
       }
 
       try {
-        // Stop the service
-        await execAsync(`powershell -NoProfile -Command "Stop-Service -Name '${serviceName}' -Force"`, { timeout: 30000 });
+        // Stop the service (execFileAsync avoids shell injection)
+        await execFileAsync('powershell.exe', ['-NoProfile', '-Command', `Stop-Service -Name '${serviceName}' -Force`], { timeout: 30000 });
 
         // Add to suppressed list
         this.suppressedServices.add(serviceName);
@@ -1160,11 +1167,17 @@ class OPSISAgentService {
       const { serviceName, startService } = data;
       this.logger.info('IPC: Received unsuppress-service request', { serviceName, startService });
 
+      // SECURITY: Validate service name before use in commands
+      try { this.validateServiceName(serviceName); } catch (e: any) {
+        this.ipcServer.sendToClient(socket, { type: 'unsuppress-service-result', data: { success: false, error: e.message } });
+        return;
+      }
+
       this.suppressedServices.delete(serviceName);
 
       if (startService) {
         try {
-          await execAsync(`powershell -NoProfile -Command "Start-Service -Name '${serviceName}'"`, { timeout: 30000 });
+          await execFileAsync('powershell.exe', ['-NoProfile', '-Command', `Start-Service -Name '${serviceName}'`], { timeout: 30000 });
           this.ipcServer.sendToClient(socket, {
             type: 'unsuppress-service-result',
             data: { success: true, serviceName, status: 'unsuppressed_and_started' }
@@ -1670,11 +1683,18 @@ class OPSISAgentService {
     let wsUrl = this.deviceInfo.websocket_url || null;
     if (!wsUrl && this.config.serverUrl) {
       let base = this.config.serverUrl;
-      // Normalize to ws:// URL
-      if (base.startsWith('http')) {
-        base = base.replace(/^http/, 'ws');
+      // SECURITY: Normalize to wss:// (encrypted) — API key is sent in headers
+      if (base.startsWith('https')) {
+        base = base.replace(/^https/, 'wss');
+      } else if (base.startsWith('http')) {
+        base = base.replace(/^http/, 'wss');
       } else if (!base.startsWith('ws')) {
-        base = 'ws://' + base;
+        base = 'wss://' + base;
+      }
+      // Only allow unencrypted ws:// for localhost development
+      if (base.startsWith('ws://') && !base.match(/^ws:\/\/(localhost|127\.0\.0\.1)/)) {
+        this.logger.warn('SECURITY: Upgrading insecure ws:// to wss:// for non-localhost server');
+        base = base.replace(/^ws:\/\//, 'wss://');
       }
       wsUrl = base.replace(/\/$/, '') + '/api/agent/ws/' + this.deviceInfo.device_id;
     }
@@ -6173,14 +6193,17 @@ if ($success) {
     return stdout;
   }
 
-  // FIXED: Use PowerShell for service actions (handles both service names and display names)
-  private async executeServiceAction(action: string, params: Record<string, any>): Promise<void> {
-    const { serviceName } = params;
+  // SECURITY: Validate service name — strict alphanumeric + hyphen/underscore/period only
+  private validateServiceName(name: string): string {
+    if (!name || typeof name !== 'string') throw new Error('Service name required');
+    if (!/^[\w\-\.]+$/.test(name)) throw new Error(`Invalid service name: contains disallowed characters`);
+    if (name.length > 256) throw new Error('Service name too long');
+    return name;
+  }
 
-    // Validate service name against safe pattern
-    if (!/^[\w\s\-\.]+$/.test(serviceName)) {
-      throw new Error(`Invalid service name: ${serviceName}`);
-    }
+  // FIXED: Use execFileAsync to avoid shell injection, strict service name validation
+  private async executeServiceAction(action: string, params: Record<string, any>): Promise<void> {
+    const serviceName = this.validateServiceName(params.serviceName);
 
     // Block actions on protected services (OS-critical)
     if (isProtectedService(serviceName) && (action === 'stop' || action === 'restart')) {
@@ -6195,12 +6218,11 @@ if ($success) {
     }
 
     if (action === 'restart') {
-      // Use PowerShell Restart-Service which accepts both names and display names
-      await execAsync(`powershell -Command "Restart-Service -Name '${serviceName}' -Force -ErrorAction Stop"`);
+      await execFileAsync('powershell.exe', ['-NoProfile', '-Command', `Restart-Service -Name '${serviceName}' -Force -ErrorAction Stop`], { timeout: 30000 });
     } else if (action === 'start') {
-      await execAsync(`powershell -Command "Start-Service -Name '${serviceName}' -ErrorAction Stop"`);
+      await execFileAsync('powershell.exe', ['-NoProfile', '-Command', `Start-Service -Name '${serviceName}' -ErrorAction Stop`], { timeout: 30000 });
     } else if (action === 'stop') {
-      await execAsync(`powershell -Command "Stop-Service -Name '${serviceName}' -Force -ErrorAction Stop"`);
+      await execFileAsync('powershell.exe', ['-NoProfile', '-Command', `Stop-Service -Name '${serviceName}' -Force -ErrorAction Stop`], { timeout: 30000 });
     }
   }
 
@@ -6226,17 +6248,46 @@ if ($success) {
   private async executeFileAction(action: string, params: Record<string, any>): Promise<void> {
     const { path: filePath, content, destination } = params;
 
+    // SECURITY: Restrict file operations to allowed directories only
+    const allowedDirs = [
+      path.join(process.cwd(), 'data'),
+      path.join(process.cwd(), 'logs'),
+    ];
+    const resolvedPath = this.validateSafePath(filePath, allowedDirs);
+
     if (action === 'create') {
-      fs.writeFileSync(filePath, content);
+      fs.writeFileSync(resolvedPath, content);
     } else if (action === 'delete') {
-      fs.unlinkSync(filePath);
+      fs.unlinkSync(resolvedPath);
     } else if (action === 'copy') {
-      fs.copyFileSync(filePath, destination);
+      const resolvedDest = this.validateSafePath(destination, allowedDirs);
+      fs.copyFileSync(resolvedPath, resolvedDest);
     }
   }
 
+  private validateSafePath(inputPath: string, allowedBaseDirs: string[]): string {
+    if (!inputPath || typeof inputPath !== 'string') {
+      throw new Error('Invalid path: must be a non-empty string');
+    }
+    if (inputPath.includes('\0')) {
+      throw new Error('Invalid path: contains null bytes');
+    }
+    const resolved = path.resolve(inputPath);
+    const isAllowed = allowedBaseDirs.some(baseDir => {
+      const normalizedBase = path.resolve(baseDir);
+      return resolved.startsWith(normalizedBase + path.sep) || resolved === normalizedBase;
+    });
+    if (!isAllowed) {
+      this.logger.error('SECURITY: Path traversal blocked', { inputPath, resolved });
+      throw new Error(`Path traversal blocked: path is outside allowed directories`);
+    }
+    return resolved;
+  }
+
   private async executeWMIQuery(query: string, params: Record<string, any>): Promise<void> {
-    const psScript = `Get-WmiObject -Query "${query}"`;
+    // SECURITY: Use single quotes (literal string in PowerShell) to prevent $() and backtick injection
+    const safeQuery = query.replace(/'/g, "''");
+    const psScript = `Get-WmiObject -Query '${safeQuery}'`;
     await this.executePowerShell(psScript, params, 30000);
   }
 
